@@ -5875,7 +5875,20 @@ async def websocket_endpoint(websocket: WebSocket):
                 
                 if msg_type == 'input':
                     input_data = {k: v for k, v in message.items() if k != 'type'}
-                    await session.handle_input(input_data)
+                    logger.debug(
+                        "[WS->SESSION][input] session=%s subtype=%s keys=%s",
+                        session_id,
+                        input_data.get('subtype') or input_data.get('event') or input_data.get('type'),
+                        sorted(k for k in input_data.keys() if k not in {'text'}),
+                    )
+                    try:
+                        await session.handle_input(input_data)
+                    except Exception:
+                        logger.exception(
+                            "[WS->SESSION][input-failed] session=%s subtype=%s",
+                            session_id,
+                            input_data.get('subtype') or input_data.get('event') or input_data.get('type'),
+                        )
                 
                 elif msg_type == 'heartbeat':
                     # Client heartbeat - update activity and respond

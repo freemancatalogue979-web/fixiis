@@ -19,11 +19,12 @@ Architecture (see MIGRATION_SELENIUMBASE.md)
   ``driver.uc_gui_click_captcha()`` via the launcher thread, max 2 attempts,
   best-effort.
 
-The whole backend is opt-in via ``BROWSER_BACKEND=sb`` (config
-``browser_backend``); anything on this path failing loudly falls back to the
-Playwright path with an error log (see session.py / pcm_manager.py call
-sites).  SeleniumBase is imported lazily inside the launcher thread so this
-module stays importable without the dependency installed.
+The whole backend is selected via ``BROWSER_BACKEND=sb`` (config
+``browser_backend``).  A selected SB session fails loudly on launch/attach
+errors instead of opening a second, unrelated Playwright browser; use
+``BROWSER_BACKEND=pw`` for the explicit rollback path.  SeleniumBase is
+imported lazily inside the launcher thread so this module stays importable
+without the dependency installed.
 """
 from __future__ import annotations
 
@@ -260,43 +261,85 @@ def _key_def(key: str) -> Dict[str, Any]:
     return {"key": key, "code": key, "windowsVirtualKeyCode": 0, "nativeVirtualKeyCode": 0}
 
 
-async def _safe_input_send(session: "_CDPSession", method: str, params: Dict[str, Any]) -> None:
-    """Input forwarding must never raise: a CDP param error on one keystroke
-    must not bubble into session teardown (which would kill the browser)."""
+async def _safe_input_send(session: "_CDPSession", method: str, params: Dict[str, Any]) -> bool:
+    """Send a CDP input command and report whether Chrome accepted it.
+
+    The old helper swallowed every exception and returned ``None``.  That
+    made a broken SB input channel indistinguishable from a successful key or
+    mouse event: the WebSocket message arrived, but the renderer never saw
+    it.  Callers still get the non-fatal behaviour we want for individual
+    events, while they can now fall back to Selenium's native W3C input path
+    and the log contains the actual CDP error.
+    """
     try:
         await session.send(method, params)
+        return True
     except Exception as exc:
-        logger.debug("[SB] %s failed (swallowed): %s", method, exc)
+        logger.warning("[SB][CDP-INPUT] %s rejected: %s", method, exc)
+        return False
 
 
 class _Keyboard:
+    """Playwright-shaped keyboard with a Selenium-native input fallback.
+
+    UC keeps a WebDriver/CDP session attached to the same renderer.  On some
+    Chrome/UC combinations Chrome accepts ``Input.dispatchKeyEvent`` on our
+    browser-level CDP socket but does not route the event to the focused
+    renderer.  WebDriver W3C actions go through the session SeleniumBase owns
+    and are the reliable path in that situation.
+    """
+
     def __init__(self, page: "SBPage") -> None:
         self._page = page
         self._mods = 0
 
-    async def _dispatch(self, etype: str, key: str) -> None:
+    async def _dispatch_cdp(self, etype: str, key: str) -> bool:
         kd = _key_def(key)
         kd["type"] = etype
         kd["modifiers"] = self._mods
-        await _safe_input_send(self._page._session, "Input.dispatchKeyEvent", kd)
+        return await _safe_input_send(self._page._session, "Input.dispatchKeyEvent", kd)
+
+    async def _native(self, etype: str, key: str) -> bool:
+        handle = self._page._ctx._handle
+        if handle is None:
+            return False
+        try:
+            return await handle.native_key_action(self._page._target_id, etype, key)
+        except Exception as exc:
+            logger.warning("[SB][W3C-INPUT] key %s %s failed: %s", etype, key, exc)
+            return False
 
     async def down(self, key: str) -> None:
+        # Keep the CDP modifier bitfield correct for the fallback path.
         if key in _MOD_BITS:
             self._mods |= _MOD_BITS[key]
-        kd = _key_def(key)
-        etype = "keyDown" if "text" in kd else "rawKeyDown"
-        await self._dispatch(etype, key)
+        if await self._native("keyDown", key):
+            return
+        await self._dispatch_cdp("keyDown" if "text" in _key_def(key) else "rawKeyDown", key)
 
     async def up(self, key: str) -> None:
+        # CDP keyUp should still carry the modifier being released; clear it
+        # only after the native/CDP dispatch has been attempted.
+        if await self._native("keyUp", key):
+            if key in _MOD_BITS:
+                self._mods &= ~_MOD_BITS[key] & 0xF
+            return
+        await self._dispatch_cdp("keyUp", key)
         if key in _MOD_BITS:
             self._mods &= ~_MOD_BITS[key] & 0xF
-        await self._dispatch("keyUp", key)
 
     async def press(self, key: str) -> None:
         await self.down(key)
         await self.up(key)
 
     async def insert_text(self, text: str) -> None:
+        handle = self._page._ctx._handle
+        if handle is not None:
+            try:
+                if await handle.native_insert_text(self._page._target_id, text):
+                    return
+            except Exception as exc:
+                logger.warning("[SB][W3C-INPUT] insert text failed: %s", exc)
         await _safe_input_send(self._page._session, "Input.insertText", {"text": text})
 
     async def type(self, text: str, delay: float = 0) -> None:
@@ -307,6 +350,8 @@ class _Keyboard:
 
 
 class _Mouse:
+    """Mouse adapter that prefers native Selenium W3C pointer actions."""
+
     def __init__(self, page: "SBPage") -> None:
         self._page = page
         self._x = 0
@@ -315,24 +360,47 @@ class _Mouse:
 
     _BUTTON_BITS = {"left": 1, "right": 2, "middle": 4, "back": 8, "forward": 16}
 
+    async def _native(self, action: str, button: str = "left", delta_x: float = 0,
+                      delta_y: float = 0) -> bool:
+        handle = self._page._ctx._handle
+        if handle is None:
+            return False
+        try:
+            return await handle.native_pointer_action(
+                self._page._target_id, action, self._x, self._y,
+                button=button, delta_x=delta_x, delta_y=delta_y,
+            )
+        except Exception as exc:
+            logger.warning("[SB][W3C-INPUT] mouse %s failed: %s", action, exc)
+            return False
+
     async def move(self, x: float, y: float) -> None:
-        self._x, self._y = x, y
+        self._x, self._y = float(x), float(y)
+        if await self._native("move"):
+            return
         await _safe_input_send(self._page._session, "Input.dispatchMouseEvent", {
-            "type": "mouseMoved", "x": x, "y": y,
+            "type": "mouseMoved", "x": self._x, "y": self._y,
             "button": "none", "buttons": self._buttons, "pointerType": "mouse",
         })
 
     async def down(self, button: str = "left", click_count: int = 1) -> None:
         bit = self._BUTTON_BITS.get(button, 1)
-        await _safe_input_send(self._page._session, "Input.dispatchMouseEvent", {
+        if await self._native("down", button=button):
+            self._buttons |= bit
+            return
+        ok = await _safe_input_send(self._page._session, "Input.dispatchMouseEvent", {
             "type": "mousePressed", "x": self._x, "y": self._y,
             "button": button, "buttons": self._buttons | bit,
             "clickCount": click_count, "pointerType": "mouse",
         })
-        self._buttons |= bit
+        if ok:
+            self._buttons |= bit
 
     async def up(self, button: str = "left") -> None:
         bit = self._BUTTON_BITS.get(button, 1)
+        if await self._native("up", button=button):
+            self._buttons &= ~bit
+            return
         await _safe_input_send(self._page._session, "Input.dispatchMouseEvent", {
             "type": "mouseReleased", "x": self._x, "y": self._y,
             "button": button, "buttons": self._buttons & ~bit,
@@ -341,24 +409,10 @@ class _Mouse:
         self._buttons &= ~bit
 
     async def click(self, x: float, y: float, button: str = "left", delay: float = 0) -> None:
-        """Dispatch a real browser pointer click.
-
-        ``element.click()`` is not equivalent to Playwright's ``page.click``:
-        it skips the pointer/mouse press sequence and therefore misses sites
-        that bind activation on pointerdown/mousedown or perform their own
-        hit-testing.  This path deliberately uses raw CDP input so SB has the
-        same event ordering as Playwright.
-
-        Robustness contract: if ``mousePressed`` succeeds but ``mouseReleased``
-        (or anything between) raises, the page MUST NOT be left in a
-        half-pressed state, and the exception MUST still surface so the caller
-        can decide whether to retry.  We do this by pairing press/release in
-        a try/finally that always sends a release when the local button bit
-        is set, and by NOT swallowing press/release errors — Playwright's
-        equivalent raises too, and the actionability loop in SBPage.click
-        is what handles the retry.
-        """
+        """Dispatch one complete pointer click, preferring WebDriver actions."""
         self._x, self._y = float(x), float(y)
+        if await self._native("click", button=button):
+            return
         bit = self._BUTTON_BITS.get(button, 1)
         await self._page._session.send("Input.dispatchMouseEvent", {
             "type": "mouseMoved", "x": self._x, "y": self._y,
@@ -374,8 +428,6 @@ class _Mouse:
             if delay:
                 await asyncio.sleep(delay / 1000.0)
         finally:
-            # Always pair the release; surface any error so the caller can
-            # see why the click failed instead of silently swallowing it.
             await self._page._session.send("Input.dispatchMouseEvent", {
                 "type": "mouseReleased", "x": self._x, "y": self._y,
                 "button": button, "buttons": self._buttons & ~bit,
@@ -384,6 +436,8 @@ class _Mouse:
             self._buttons &= ~bit
 
     async def wheel(self, delta_x: float, delta_y: float) -> None:
+        if await self._native("wheel", delta_x=delta_x, delta_y=delta_y):
+            return
         await _safe_input_send(self._page._session, "Input.dispatchMouseEvent", {
             "type": "mouseWheel", "x": self._x, "y": self._y,
             "deltaX": delta_x, "deltaY": delta_y,
@@ -626,25 +680,33 @@ class SBPage:
     async def evaluate(self, expression: str, arg: Any = None) -> Any:
         expr = expression if isinstance(expression, str) else str(expression)
         if _js_is_function(expr):
-            # Function-form (arrow / function keyword): call with the arg,
-            # Playwright evaluate(fn, arg) semantics.
-            res = await self._session.send("Runtime.callFunctionOn", {
-                "functionDeclaration": expr,
-                "awaitPromise": True,
-                "returnByValue": True,
-                "arguments": [{"value": arg}],
-            }, timeout=60)
+            # Runtime.callFunctionOn is tempting here, but it requires an
+            # executionContextId/objectId on Chrome versions used by UC.  The
+            # old adapter omitted both, so every arrow-function evaluation
+            # (including focus/actionability probes) could fail while the
+            # exception was hidden by callers.  Evaluate an explicit
+            # invocation in the page's main world instead.  JSON arguments are
+            # deliberately embedded rather than passed as a remote object so
+            # this works for primitive and structured Playwright-style args.
+            try:
+                js_arg = json.dumps(arg, ensure_ascii=False, separators=(",", ":"))
+            except (TypeError, ValueError):
+                js_arg = "null"
+            function_expr = expr.strip()
+            if function_expr.endswith(";"):
+                function_expr = function_expr[:-1].rstrip()
+            expression_to_run = f"({function_expr})({js_arg})"
         else:
-            # Plain expression or IIFE: Runtime.evaluate — the ONLY path
-            # that correctly EXECUTES IIFE strings.  (callFunctionOn on an
-            # IIFE calls the IIFE's *result*, blowing up immediately — this
-            # silently killed the delta observer and interaction trigger on
-            # the SB backend.)
-            res = await self._session.send("Runtime.evaluate", {
-                "expression": expr,
-                "awaitPromise": True,
-                "returnByValue": True,
-            }, timeout=60)
+            # Plain expressions and IIFEs must be evaluated as expressions;
+            # calling an IIFE through Runtime.callFunctionOn invokes its
+            # return value instead of the IIFE itself.
+            expression_to_run = expr
+        res = await self._session.send("Runtime.evaluate", {
+            "expression": expression_to_run,
+            "awaitPromise": True,
+            "returnByValue": True,
+            "userGesture": True,
+        }, timeout=60)
         if not isinstance(res, dict):
             return None
         exc = res.get("exceptionDetails")
@@ -693,6 +755,24 @@ class SBPage:
     # ---- selector/input helpers ------------------------------------------
 
     async def click(self, selector: str, timeout: float = 3000, **_kw: Any) -> None:
+        # Prefer SeleniumBase/ChromeDriver's trusted element click.  It uses
+        # the exact WebDriver renderer session that UC owns and therefore
+        # delivers pointerdown/mousedown/up/click even when a second CDP
+        # client is attached.  The CDP actionability path below remains a
+        # fallback for environments where Selenium cannot resolve the target
+        # handle (and for the adapter harness).
+        handle = self._ctx._handle
+        if handle is not None:
+            try:
+                if await handle.native_click_selector(self._target_id, selector):
+                    logger.debug(
+                        "[SB][CLICK-native] target=%s selector=%s",
+                        self._target_id, selector,
+                    )
+                    return
+            except Exception as exc:
+                logger.debug("[SB][CLICK-native] selector=%s failed: %s", selector, exc)
+
         deadline = time.monotonic() + timeout / 1000.0
         point: Optional[Dict[str, float]] = None
         in_iframe: bool = False
@@ -878,6 +958,13 @@ class SBPage:
         )
 
     async def focus(self, selector: str) -> None:
+        handle = self._ctx._handle
+        if handle is not None:
+            try:
+                if await handle.native_focus_selector(self._target_id, selector):
+                    return
+            except Exception as exc:
+                logger.debug("[SB][FOCUS-native] selector=%s failed: %s", selector, exc)
         await self.evaluate(
             "(sel) => { const el = document.querySelector(sel); if (el && el.focus) el.focus(); }",
             selector,
@@ -1082,6 +1169,11 @@ class SBContext:
         # exists, so we never drive an invisible adopted tab while a restored
         # tab sits in the foreground.
         self._startup_page_ids: List[str] = []
+        # Target.createTarget emits Target.targetCreated before new_page()
+        # finishes attaching.  Reserve targets here so the lifecycle listener
+        # does not attach the same tab a second time (two CDP sessions on one
+        # page made focus and native-target mapping nondeterministic).
+        self._attaching_page_ids: Set[str] = set()
         self._mobile = mobile
         self._pixel_ratio = pixel_ratio
         self._listeners: Dict[str, List[Callable]] = {}
@@ -1112,7 +1204,11 @@ class SBContext:
         tid = (res or {}).get("targetId")
         if not tid:
             raise RuntimeError("SB Target.createTarget returned no targetId")
-        page = await self._browser._attach_page(tid, self)
+        self._attaching_page_ids.add(tid)
+        try:
+            page = await self._browser._attach_page(tid, self)
+        finally:
+            self._attaching_page_ids.discard(tid)
         if self._startup_page_ids:
             # Our target exists now — close the pre-existing page targets and
             # bring ours to the foreground.  Best-effort: never fatal.
@@ -1160,7 +1256,9 @@ class SBContext:
 
     async def _on_target_created(self, target_id: str, opener_id: Optional[str]) -> None:
         # A popup/new tab that isn't one of ours yet -> adopt + emit 'page'.
-        if any(p._target_id == target_id for p in self.pages):
+        # new_page() reserves its own target while it is attaching; do not
+        # create a duplicate SBPage for the Target.targetCreated event.
+        if target_id in self._attaching_page_ids or any(p._target_id == target_id for p in self.pages):
             return
         try:
             page = await self._browser._attach_page(target_id, self, opener_id=opener_id)
@@ -1346,6 +1444,11 @@ class SBHandle:
         self._debugger_host: str = "127.0.0.1"
         self._ex: Optional[concurrent.futures.ThreadPoolExecutor] = None
         self._stopped = False
+        # ChromeDriver/Selenium objects are thread-affine.  Keep every native
+        # action on the same worker that created the Driver; using a second
+        # executor worker can make an otherwise valid action target a stale
+        # WebDriver session or the wrong tab.
+        self._target_window_handles: Dict[str, str] = {}
 
     # ---- sync side (runs inside the executor thread) ----
 
@@ -1416,7 +1519,7 @@ class SBHandle:
             logger.debug("[SB] uc_gui_click_captcha failed: %s", exc)
             return False
 
-    # ---- chromedriver W3C Actions fallback ----
+    # ---- chromedriver W3C Actions input path ----
     #
     # WHY THIS EXISTS: When SeleniumBase UC launches Chrome through
     # undetected-chromedriver, the resulting Chrome process has TWO
@@ -1451,72 +1554,268 @@ class SBHandle:
     # websocket).  This costs one round-trip per click and is only
     # invoked when CDP clicks fail.
 
-    def _w3c_actions_click_sync(self, target_id: str, x: float, y: float, button: str = "left") -> bool:
-        """Synchronous W3C Actions click via chromedriver.  Returns True on
-        HTTP 200 / no error from chromedriver, False on any exception.
-        Designed to be run inside ``_ex`` so the chromedriver HTTP call
-        does not block the asyncio loop.
+    def _switch_to_target_sync(self, target_id: str) -> bool:
+        """Switch ChromeDriver to the CDP target represented by ``target_id``.
+
+        ChromeDriver normally exposes a page handle as ``CDwindow-<targetId>``
+        while CDP exposes the bare target id.  Older ChromeDriver builds expose
+        the bare id, so accept both forms and remember the successful mapping.
+        Crucially, do not silently choose the last tab when there are several:
+        that was the source of input being sent to the visible/restored Google
+        tab while CDP drove a different page.
         """
+        drv = self.driver
+        if drv is None:
+            return False
         try:
-            drv = self.driver
-            if drv is None:
-                return False
-            cmd = getattr(drv, "command_executor", None)
-            if cmd is None:
-                return False
-            # Make sure chromedriver's current window is the page we are
-            # actually targeting.  Driver-level click would do this for us
-            # via ``switch_to_window``; since we already have coordinates
-            # we have to do it explicitly.
-            try:
-                handles = drv.window_handles  # property, triggers GET /window/handles
-            except Exception:
-                handles = []
-            if handles and target_id:
-                # CDP targetId IS the chromedriver window handle for the
-                # same target (chromedriver 114+ exposes
-                # ``chrome.webContents.identifier`` as the handle).
-                if target_id in handles:
-                    try:
-                        drv.switch_to.window(target_id)
-                    except Exception:
-                        pass
-                else:
-                    # Fall back to last handle (most recently opened).
-                    try:
-                        drv.switch_to.window(handles[-1])
-                    except Exception:
-                        pass
-            button_map = {"left": 0, "middle": 1, "right": 2}
-            b = button_map.get(button, 0)
-            actions_payload = {
-                "actions": [{
-                    "type": "pointer",
-                    "id": "mouse",
-                    "parameters": {"pointerType": "mouse"},
-                    "actions": [
-                        {"type": "pointerMove", "duration": 0, "x": float(x), "y": float(y)},
-                        {"type": "pointerDown", "duration": 0, "button": b},
-                        {"type": "pause", "duration": 30},
-                        {"type": "pointerUp", "duration": 0, "button": b},
-                    ],
-                }],
-            }
-            # Selenium's ``RemoteConnection.execute`` sends
-            # ``POST /session/{sid}/{command}`` with body ``params``.
-            # Selenium 4.x renamed it to ``execute_request``; support
-            # both for compatibility.
-            executor = getattr(cmd, "execute_request", None) or getattr(cmd, "execute", None)
-            if executor is None:
-                return False
-            try:
-                resp = executor("actions", actions_payload)
-            except TypeError:
-                # Older selenium signature: execute(command, params_dict)
-                resp = executor("actions", actions_payload)
-            return resp is None or not (isinstance(resp, dict) and resp.get("status"))
+            handles = list(drv.window_handles or [])
         except Exception as exc:
-            logger.debug("[SB][W3C-CLICK] chromedriver actions failed: %s", exc)
+            logger.warning("[SB][W3C-INPUT] cannot read window handles: %s", exc)
+            return False
+        if not handles:
+            return False
+
+        known = self._target_window_handles.get(target_id)
+        candidates = [target_id]
+        if target_id and not target_id.startswith("CDwindow-"):
+            candidates.append("CDwindow-" + target_id)
+        if known:
+            candidates.insert(0, known)
+        chosen = next((h for h in candidates if h in handles), None)
+
+        # Some ChromeDriver versions return a handle with a different prefix,
+        # but retain the target id as a suffix.  This is still an exact match,
+        # unlike guessing the last handle.
+        if chosen is None and target_id:
+            chosen = next((h for h in handles if str(h).endswith(str(target_id))), None)
+        if chosen is None and len(handles) == 1:
+            chosen = handles[0]
+        if chosen is None:
+            logger.warning(
+                "[SB][W3C-INPUT] target %s is not represented by driver handles %s",
+                target_id, handles,
+            )
+            return False
+        try:
+            current = getattr(drv, "current_window_handle", None)
+            if current != chosen:
+                drv.switch_to.window(chosen)
+            self._target_window_handles[target_id] = chosen
+            return True
+        except Exception as exc:
+            logger.warning("[SB][W3C-INPUT] switch to target %s failed: %s", target_id, exc)
+            return False
+
+    @staticmethod
+    def _wd_key_value(key: str) -> str:
+        """Translate a DOM/Playwright key name to a WebDriver key value."""
+        special = {
+            "Null": "\ue000", "Cancel": "\ue001", "Help": "\ue002",
+            "Backspace": "\ue003", "Tab": "\ue004", "Clear": "\ue005",
+            "Return": "\ue006", "Enter": "\ue007", "Shift": "\ue008",
+            "Control": "\ue009", "Alt": "\ue00a", "Pause": "\ue00b",
+            "Escape": "\ue00c", "Space": "\ue00d", "PageUp": "\ue00e",
+            "PageDown": "\ue00f", "End": "\ue010", "Home": "\ue011",
+            "ArrowLeft": "\ue012", "ArrowUp": "\ue013",
+            "ArrowRight": "\ue014", "ArrowDown": "\ue015",
+            "Insert": "\ue016", "Delete": "\ue017", "Semicolon": ";",
+            "Equals": "=", "Meta": "\ue03d", "Command": "\ue03d",
+            "Spacebar": "\ue00d",
+        }
+        if key in special:
+            return special[key]
+        if len(key) == 2 and key.startswith("F") and key[1].isdigit():
+            n = int(key[1])
+            if 1 <= n <= 9:
+                return chr(0xE030 + n)
+        if len(key) == 3 and key.startswith("F") and key[1:].isdigit():
+            n = int(key[1:])
+            if 10 <= n <= 12:
+                return chr(0xE030 + n)
+        return key
+
+    @staticmethod
+    def _action_ok(response: Any) -> bool:
+        """Interpret Selenium's several success response shapes."""
+        if response is None:
+            return True
+        if not isinstance(response, dict):
+            return True
+        if response.get("status") not in (None, 0, "0", "success"):
+            return False
+        value = response.get("value")
+        if isinstance(value, dict) and value.get("error"):
+            return False
+        return True
+
+    def _execute_actions_sync(self, payload: Dict[str, Any]) -> bool:
+        drv = self.driver
+        if drv is None:
+            return False
+        try:
+            # WebDriver.execute() uses the W3C command map and works across
+            # Selenium 4 releases.  Keep the command string as a fallback for
+            # SeleniumBase versions that do not expose execute publicly.
+            executor = getattr(drv, "execute", None)
+            if executor is not None:
+                return self._action_ok(executor("actions", payload))
+            cmd = getattr(drv, "command_executor", None)
+            raw = getattr(cmd, "execute", None) if cmd is not None else None
+            if raw is None:
+                return False
+            return self._action_ok(raw("actions", payload))
+        except Exception as exc:
+            logger.warning("[SB][W3C-INPUT] actions command failed: %s", exc)
+            return False
+
+    def _native_pointer_action_sync(self, target_id: str, action: str,
+                                    x: float, y: float, button: str = "left",
+                                    delta_x: float = 0, delta_y: float = 0) -> bool:
+        """Send one native W3C pointer/wheel action to a specific target."""
+        if not self._switch_to_target_sync(target_id):
+            return False
+        button_map = {"left": 0, "middle": 1, "right": 2, "back": 3, "forward": 4}
+        b = button_map.get(button, 0)
+        pointer_steps: List[Dict[str, Any]] = []
+        if action in ("move", "down", "up", "click"):
+            pointer_steps.append({
+                "type": "pointerMove", "duration": 0,
+                "x": int(round(x)), "y": int(round(y)), "origin": "viewport",
+            })
+            if action in ("down", "click"):
+                pointer_steps.append({"type": "pointerDown", "duration": 0, "button": b})
+            if action in ("up", "click"):
+                pointer_steps.append({"type": "pointerUp", "duration": 0, "button": b})
+            payload = {"actions": [{
+                "type": "pointer", "id": "sb-pointer",
+                "parameters": {"pointerType": "mouse"},
+                "actions": pointer_steps,
+            }]}
+        elif action == "wheel":
+            payload = {"actions": [{
+                "type": "wheel", "id": "sb-wheel", "actions": [{
+                    "type": "scroll", "x": int(round(x)), "y": int(round(y)),
+                    "deltaX": int(round(delta_x)), "deltaY": int(round(delta_y)),
+                    "duration": 0, "origin": "viewport",
+                }],
+            }]}
+        else:
+            return False
+        return self._execute_actions_sync(payload)
+
+    def _native_key_action_sync(self, target_id: str, action: str, key: str) -> bool:
+        if not self._switch_to_target_sync(target_id):
+            return False
+        if action not in ("keyDown", "keyUp"):
+            return False
+        payload = {"actions": [{
+            "type": "key", "id": "sb-keyboard",
+            "actions": [{"type": action, "value": self._wd_key_value(key)}],
+        }]}
+        return self._execute_actions_sync(payload)
+
+    def _native_insert_text_sync(self, target_id: str, text: str) -> bool:
+        if not self._switch_to_target_sync(target_id):
+            return False
+        try:
+            active = self.driver.switch_to.active_element
+            active.send_keys(text)
+            return True
+        except Exception as exc:
+            logger.warning("[SB][W3C-INPUT] active element text failed: %s", exc)
+            return False
+
+    def _native_focus_selector_sync(self, target_id: str, selector: str) -> bool:
+        if not self._switch_to_target_sync(target_id):
+            return False
+        try:
+            element = self.driver.find_element("css selector", selector)
+            self.driver.execute_script("arguments[0].focus();", element)
+            return True
+        except Exception as exc:
+            logger.debug("[SB][W3C-INPUT] focus selector %s failed: %s", selector, exc)
+            return False
+
+    def _native_click_selector_sync(self, target_id: str, selector: str) -> bool:
+        """Click a selector through ChromeDriver/SeleniumBase's trusted path."""
+        if not self._switch_to_target_sync(target_id):
+            return False
+        try:
+            element = self.driver.find_element("css selector", selector)
+            try:
+                self.driver.execute_script(
+                    "arguments[0].scrollIntoView({block:'center', inline:'center'});",
+                    element,
+                )
+            except Exception:
+                pass
+            element.click()
+            return True
+        except Exception as exc:
+            logger.debug("[SB][W3C-CLICK] selector %s failed: %s", selector, exc)
+            return False
+
+    def _w3c_actions_click_sync(self, target_id: str, x: float, y: float,
+                                button: str = "left") -> bool:
+        """Compatibility wrapper used by the SBPage click recovery path."""
+        return self._native_pointer_action_sync(target_id, "click", x, y, button=button)
+
+    async def native_pointer_action(self, target_id: str, action: str,
+                                    x: float, y: float, button: str = "left",
+                                    delta_x: float = 0, delta_y: float = 0) -> bool:
+        if self._ex is None or self._stopped:
+            return False
+        loop = asyncio.get_running_loop()
+        try:
+            return await asyncio.wait_for(loop.run_in_executor(
+                self._ex, self._native_pointer_action_sync, target_id, action,
+                float(x), float(y), button, float(delta_x), float(delta_y)), 10)
+        except Exception as exc:
+            logger.warning("[SB][W3C-INPUT] native pointer wrapper failed: %s", exc)
+            return False
+
+    async def native_key_action(self, target_id: str, action: str, key: str) -> bool:
+        if self._ex is None or self._stopped:
+            return False
+        loop = asyncio.get_running_loop()
+        try:
+            return await asyncio.wait_for(loop.run_in_executor(
+                self._ex, self._native_key_action_sync, target_id, action, key), 10)
+        except Exception as exc:
+            logger.warning("[SB][W3C-INPUT] native key wrapper failed: %s", exc)
+            return False
+
+    async def native_insert_text(self, target_id: str, text: str) -> bool:
+        if self._ex is None or self._stopped:
+            return False
+        loop = asyncio.get_running_loop()
+        try:
+            return await asyncio.wait_for(loop.run_in_executor(
+                self._ex, self._native_insert_text_sync, target_id, text), 10)
+        except Exception as exc:
+            logger.warning("[SB][W3C-INPUT] native text wrapper failed: %s", exc)
+            return False
+
+    async def native_focus_selector(self, target_id: str, selector: str) -> bool:
+        if self._ex is None or self._stopped:
+            return False
+        loop = asyncio.get_running_loop()
+        try:
+            return await asyncio.wait_for(loop.run_in_executor(
+                self._ex, self._native_focus_selector_sync, target_id, selector), 10)
+        except Exception as exc:
+            logger.warning("[SB][W3C-INPUT] native focus wrapper failed: %s", exc)
+            return False
+
+    async def native_click_selector(self, target_id: str, selector: str) -> bool:
+        if self._ex is None or self._stopped:
+            return False
+        loop = asyncio.get_running_loop()
+        try:
+            return await asyncio.wait_for(loop.run_in_executor(
+                self._ex, self._native_click_selector_sync, target_id, selector), 10)
+        except Exception as exc:
+            logger.warning("[SB][W3C-CLICK] native click wrapper failed: %s", exc)
             return False
 
     def _quit_sync(self) -> None:
@@ -1557,9 +1856,10 @@ class SBHandle:
         """Launch the UC browser and resolve its debug endpoint."""
         _t0 = time.monotonic()
         if self._ex is None:
-            # max_workers=2: a wedged sync SB call (e.g. captcha click) must not
-            # starve driver.quit() behind a full single-worker queue.
-            self._ex = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="sb-driver")
+            # SeleniumBase/ChromeDriver is thread-affine.  Do not let actions
+            # hop between executor workers; that can make input appear to be
+            # accepted while it is sent to a stale driver session.
+            self._ex = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="sb-driver")
         loop = asyncio.get_running_loop()
         chosen = self._free_port()
         await loop.run_in_executor(self._ex, self._launch_sync, chosen)

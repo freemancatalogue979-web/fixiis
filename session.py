@@ -276,11 +276,13 @@ async def clear_all_keylogs() -> bool:
 
 
 def log(msg):
-    pass  # Disabled for performance - no logging overhead
+    # Keep the legacy call sites, but do not make operational failures
+    # invisible.  The old no-op hid every SB input exception.
+    logger.debug("[session] %s", msg)
 
 
 def log_error(msg):
-    pass  # Disabled for performance - no logging overhead
+    logger.error("[session] %s", msg)
 
 
 @dataclass
@@ -437,6 +439,7 @@ class NeoStreamingSession:
         # Input state (Part 6)
         self.inputs_enabled = True
         self._capture_first_input_task: Optional[asyncio.Task] = None
+        self._input_handoff_logged = False
         
         # Use explicit is_mobile flag from client (more reliable than UA detection)
         # Fall back to UA detection if not provided
@@ -599,7 +602,13 @@ class NeoStreamingSession:
             # (MIGRATION_SELENIUMBASE.md): SB launches/stealths/lifecycles
             # real Chrome; our async CDP adapter (sb_backend) stands in for
             # the Playwright (browser, context) pair with the same shape.
-            # Any failure falls back to the Playwright path with an error log.
+            #
+            # This selection is deliberately strict.  Starting an SB Chrome,
+            # failing to attach, and then silently creating a second Playwright
+            # Chrome made the visible window look alive while input/capture was
+            # being sent to another backend.  If SB is selected, report the
+            # launch/attach failure and stop this session; use
+            # BROWSER_BACKEND=pw explicitly to opt into the legacy path.
             if not self.browser and _sb_backend_enabled():
                 try:
                     from sb_backend import launch_for_session
@@ -621,11 +630,22 @@ class NeoStreamingSession:
                         proxy_url=_sb_proxy,
                     )
                     self.browser, self.context = _sb_browser, _sb_browser.contexts[0]
-                    logger.debug(f"[SB] session {self.session_id}: SeleniumBase UC backend active")
+                    logger.info(
+                        "[SB] session=%s backend=seleniumbase-cdp active profile=%s",
+                        self.session_id, _profile_dir,
+                    )
                 except Exception as _sb_exc:
-                    logger.error(f"[SB] SeleniumBase backend failed, falling back to Playwright: {_sb_exc}")
+                    # No Playwright fallback here: it would invalidate every
+                    # diagnostic about the SB input path and can leave the
+                    # operator looking at a different browser window.
+                    logger.exception(
+                        "[SB] session=%s backend startup/attach failed; "
+                        "session refused (set BROWSER_BACKEND=pw for rollback): %s",
+                        self.session_id, _sb_exc,
+                    )
                     self.browser = None
                     self.context = None
+                    return False
             # Create browser - use the unified Playwright launcher for mobile
             # and desktop. Both use the client's CSS logical viewport
             # verbatim (1 CSS px = 1 surface px).
@@ -2144,15 +2164,35 @@ class NeoStreamingSession:
     async def handle_input(self, input_data: Dict):
         """Handle remote-browser input using the client CSS pixel coordinates directly."""
         if not self.is_active or not self.page:
+            logger.warning(
+                "[INPUT][drop] session=%s active=%s page=%s",
+                self.session_id, self.is_active, bool(self.page),
+            )
             return
 
         if not self.inputs_enabled:
+            logger.warning("[INPUT][drop] session=%s inputs_enabled=False", self.session_id)
             return
 
         event = ''
         try:
             self.last_activity = time.time()
             self._sync_dom_capture()
+            active_page = self.get_active_page()
+            backend_name = getattr(active_page, "_backend_name", type(active_page).__name__ if active_page else "none")
+            if not self._input_handoff_logged:
+                logger.warning(
+                    "[INPUT][handoff] session=%s backend=%s websocket->session->page connected",
+                    self.session_id, backend_name,
+                )
+                self._input_handoff_logged = True
+            logger.debug(
+                "[INPUT][recv] session=%s backend=%s event=%s keys=%s",
+                self.session_id,
+                backend_name,
+                input_data.get('subtype') or input_data.get('event') or input_data.get('type'),
+                sorted(k for k in input_data.keys() if k not in {'text'}),
+            )
 
             if self.is_sleeping:
                 await self.wake()
@@ -2356,9 +2396,20 @@ class NeoStreamingSession:
         except Exception as e:
             error_msg = str(e)
             if "Unknown key" in error_msg or "Unidentified" in error_msg:
-                pass
+                logger.warning(
+                    "[INPUT][key-rejected] session=%s backend=%s event=%s error=%s",
+                    self.session_id,
+                    getattr(self.get_active_page(), "_backend_name", "unknown"),
+                    event,
+                    error_msg,
+                )
             else:
-                log_error(f"Input error ({event}): {e}")
+                logger.exception(
+                    "[INPUT][failed] session=%s backend=%s event=%s",
+                    self.session_id,
+                    getattr(self.get_active_page(), "_backend_name", "unknown"),
+                    event,
+                )
 
     async def handle_click(self, selector: Optional[str] = None, mid: Optional[str] = None):
         if self.dom_capture:
@@ -2396,10 +2447,13 @@ class NeoStreamingSession:
                 try:
                     safe_mid = re.sub(r'[^0-9A-Za-z_\-]', '', str(mid))
                     if safe_mid:
-                        focused = bool(await self.page.evaluate(
-                            "(()=>{const el=document.querySelector('[data-mid=\"" + safe_mid + "\"]');"
-                            "if(el&&el.focus){el.focus();return true}return false})()"
-                        ))
+                        mid_selector = f'[data-mid="{safe_mid}"]'
+                        # The SB adapter can focus through ChromeDriver's
+                        # trusted renderer session.  This avoids relying on a
+                        # CDP Runtime.evaluate call merely to establish the
+                        # active element before native key actions.
+                        await self.page.focus(mid_selector)
+                        focused = True
                 except Exception:
                     focused = False
             if not focused and selector:

@@ -5,7 +5,8 @@
 > dedicated single-thread executor (sync API isolated from asyncio); our own async raw-CDP client +
 > Playwright-shaped adapters (`SBPage`/`SBContext`/`SBBrowser`) drive it — custom stealth scripts and
 > playwright-stealth are bypassed on this path by design (P4). Cutovers: PCM pilot (P1) and sessions (P3),
-> both with loud-fallback to Playwright on any launch error. P2: `ARCHIVE_FORMAT=mhtml` via CDP
+> both strict when SB is explicitly selected (no hidden Playwright browser after an SB attach failure).
+> P2: `ARCHIVE_FORMAT=mhtml` via CDP
 > `Page.captureSnapshot`. P5: `CAPTCHA_MODE=auto` probes for checkbox-class challenges after navigations
 > and runs `driver.uc_gui_click_captcha()` (≤2 attempts). Keywords verified byte-for-byte against
 > installed seleniumbase **4.53.7** (chromium_arg comma-join, window_size kwarg, DevToolsActivePort
@@ -24,14 +25,15 @@
 > (2) every attached target registers into `SBContext.pages` (tabs/popups/listeners were invisible
 > before); (3) attach enables `DOM.enable` / `Page.setBypassCSP` / lifecycle events (best-effort);
 > (4) **no-leak guarantee**: if attach fails after UC Chrome opens, the driver+Chrome are stopped
-> BEFORE the loud Playwright fallback (previously an orphaned SB window stayed open while the app
-> drove a different browser — the exact reported symptom); (5) executor bumped to 2 workers and the
-> "CDP endpoint didn't answer" error now names the probed ports + fallback fate. Harness grew to
+> before the selected backend reports failure (previously an orphaned SB window stayed open while the app
+> drove a different browser — the exact reported symptom); (5) the driver executor remains single-threaded and the
+> "CDP endpoint didn't answer" error now names the probed ports + selected-backend fate. Harness grew to
 > **39 asserts** (property surface, registration, attach domains, no-leak path) — **ATTACH ROBUSTNESS (DevToolsActivePort unreadable on live box):** the debug
 endpoint now comes from chromedriver's own `debuggerAddress` capability (deterministic,
 no file guessing), with DevToolsActivePort polled ~8s as fallback (UC's re-attach dance
-rewrites it late).  Both missing => loud error + Playwright fallback; port guessing
-stays banned (that's how PCM latched onto the wrong browser).
+rewrites it late).  Both missing => loud error and a refused SB session when SB is selected
+(`BROWSER_BACKEND=pw` is the explicit rollback); port guessing stays banned
+(stopping PCM from latching onto the wrong browser).
 **LIVE-VERIFY ROUND 2 (report: PCM attached to the wrong browser; windows only show
 google.com; stream OK but client gets no DOM):** three independent defects, all fixed:
 (1) **port guessing removed** — with a known profile we now trust DevToolsActivePort
@@ -203,7 +205,7 @@ and exercises screencast + input + rebuilds.
 | UC mode reconnect cycles (driver↔browser) break attached CDP clients | our CDP socket is browser-level, not WebDriver; add re-attach watchdog (pattern exists in PCM adopt logic) |
 | Extensions under UC (SingleFile) | sidestep via `Page.captureSnapshot` MHTML; extension optional |
 | Headless hosts | UC needs a display: Windows headed = fine; Linux → SB auto-Xvfb |
-| Behavior drift (mouse/keyboard fidelity) | input already goes through CDP `Input.dispatch*` — unchanged path |
+| Behavior drift (mouse/keyboard fidelity) | SB prefers Selenium/ChromeDriver W3C pointer/key actions on the same UC target, with CDP `Input.dispatch*` as a fallback; failures are logged |
 | Dependency weight | SB pulls selenium + UC; net-neutral once Playwright dropped |
 
 ## 10. Config additions

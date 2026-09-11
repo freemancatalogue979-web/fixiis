@@ -396,7 +396,9 @@ class PCMManager:
                 # SeleniumBase UC backend (MIGRATION_SELENIUMBASE.md): PCM is
                 # the migration pilot.  SB launches/stealths real Chrome; the
                 # sb_backend adapter supplies the Playwright-shaped
-                # (browser, context).  Failure falls back with an error log.
+                # (browser, context).  An explicit PCM_BROWSER_BACKEND=sb is
+                # strict so a failed attach cannot silently switch the admin
+                # view to another Playwright browser.
                 try:
                     from sb_backend import browser_backend as _sb_be
                     # PCM default = Playwright: the SingleFile extension
@@ -422,10 +424,15 @@ class PCMManager:
                         _launched_sb = True
                         logger.debug(f"[PCM][SB] SeleniumBase UC backend active ({self._mode})")
                     except Exception as _sb_exc:
-                        logger.error(f"[PCM][SB] launch failed, Playwright fallback: {_sb_exc}")
+                        logger.exception(
+                            "[PCM][SB] launch/attach failed; PCM session refused "
+                            "(unset PCM_BROWSER_BACKEND or set it to pw for rollback): %s",
+                            _sb_exc,
+                        )
                         self._browser = None
                         self._context = None
                         self._sb_handle = None
+                        return None
                 if not _launched_sb:
                     self._browser, self._context = await bm.create_browser(
                         self._session_id,
