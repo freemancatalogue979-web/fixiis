@@ -2503,17 +2503,23 @@ class BrowserManager:
         # Set to False to use Playwright (default behavior)
         self.use_direct_chrome = getattr(config, 'use_direct_chrome', False)  # Default to Playwright
         
-        # Initialize Xvfb for Linux headless servers.
-        # Start Xvfb BEFORE deciding headless, so a Linux VPS runs HEADED on
-        # a virtual display (indistinguishable from a real monitor). Headless
-        # is only the last resort when Xvfb is unavailable.
+        # Initialize Xvfb for Linux headless servers. SeleniumBase owns a
+        # private Xvfb process per browser, so do not eagerly create the shared
+        # BrowserManager display when SB is selected; Playwright/direct-Chrome
+        # paths still start this manager lazily when they actually need it.
         self._xvfb = get_xvfb_manager()
-        # Warm the Xvfb screen off-thread: on a bare Linux VPS the binary is
-        # usually missing; a daemon thread installs it (if possible) while the
-        # server boots, so the first PCM/session launch can create its
-        # virtual screen and run headed immediately.
-        if sys.platform.startswith('linux') and not os.environ.get('DISPLAY') \
-                and not os.environ.get('WAYLAND_DISPLAY'):
+        _backend_hint = os.environ.get('BROWSER_BACKEND', '').strip().lower()
+        if not _backend_hint:
+            _backend_hint = os.environ.get('PCM_BROWSER_BACKEND', '').strip().lower()
+        if not _backend_hint:
+            _backend_hint = str(getattr(config, 'browser_backend', '') or '').strip().lower()
+        _sb_owns_display = _backend_hint in ('sb', 'seleniumbase', 'uc')
+        # Warm package installation off-thread, but never start the shared
+        # display on the SB path. This lets SB create the Xvfb it owns at the
+        # exact browser launch boundary.
+        if (not _sb_owns_display and sys.platform.startswith('linux')
+                and not os.environ.get('DISPLAY')
+                and not os.environ.get('WAYLAND_DISPLAY')):
             try:
                 if not self._xvfb.ensure_checked():
                     import threading as _threading
@@ -2522,7 +2528,7 @@ class BrowserManager:
             except Exception:
                 pass
         initial_mode = PlatformRuntime.resolve()['mode']
-        if initial_mode == PlatformRuntime.MODE_XVFB:
+        if initial_mode == PlatformRuntime.MODE_XVFB and not _sb_owns_display:
             self._xvfb.start()
         resolved = PlatformRuntime.resolve()
         self._launch_mode = resolved['mode']
