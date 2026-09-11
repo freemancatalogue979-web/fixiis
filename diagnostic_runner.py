@@ -113,9 +113,8 @@ async def run_diagnostic(mobile_device: str = None, urls=None, headless: bool = 
             "Mozilla/5.0 (Linux; Android 15; Pixel 7) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/147.0.0.0 Mobile Safari/537.36"
             if mobile_device == "pixel_7" else
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X) "
-            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 "
-            "Mobile/22D72 Safari/604.1"
+            "Mozilla/5.0 (Linux; Android 15; Pixel 7) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/147.0.0.0 Mobile Safari/537.36"
             if mobile_device == "iphone_14_pro" else
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
@@ -126,11 +125,8 @@ async def run_diagnostic(mobile_device: str = None, urls=None, headless: bool = 
         "pixel_ratio": 2.625 if mobile_device == "pixel_7" else
                        3.0 if mobile_device == "iphone_14_pro" else 1.0,
         "is_mobile": is_mobile,
-        "platform": "Linux; Android 15" if mobile_device == "pixel_7" else
-                    "iPhone" if mobile_device == "iphone_14_pro" else
-                    "Win32",
-        "oscpu": "Linux; Android 15" if mobile_device == "pixel_7" else
-                 "CPU OS 18_3 like Mac OS X" if mobile_device == "iphone_14_pro" else
+        "platform": "Linux; Android 15" if mobile_device in ("pixel_7", "iphone_14_pro") else "Win32",
+        "oscpu": "Linux; Android 15" if mobile_device in ("pixel_7", "iphone_14_pro") else
                  "Windows NT 10.0; Win64; x64",
         "cpu_cores": 8,
         "memory": 8 if is_mobile else 16,
@@ -139,11 +135,8 @@ async def run_diagnostic(mobile_device: str = None, urls=None, headless: bool = 
         "timezone_offset": 240,  # EDT = UTC-4
         "language": locale,
         "country": "US",
-        "webgl_vendor": "ARM" if mobile_device == "pixel_7" else
-                        "Apple Inc." if mobile_device == "iphone_14_pro" else
-                        "Google Inc. (NVIDIA)",
-        "webgl_renderer": "Mali G78" if mobile_device == "pixel_7" else
-                          "Apple GPU" if mobile_device == "iphone_14_pro" else
+        "webgl_vendor": "Google Inc." if mobile_device in ("pixel_7", "iphone_14_pro") else "Google Inc. (NVIDIA)",
+        "webgl_renderer": "Mali G78" if mobile_device in ("pixel_7", "iphone_14_pro") else
                           "ANGLE (NVIDIA, NVIDIA GeForce GTX 1050 Ti Direct3D11 vs_5_0 ps_5_0)",
         "fonts": ["Roboto", "Noto Sans", "Helvetica Neue", "Arial", "Times New Roman"] if is_mobile
                  else ["Segoe UI", "Arial", "Times New Roman", "Calibri", "Consolas"],

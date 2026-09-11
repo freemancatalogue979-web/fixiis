@@ -346,7 +346,17 @@ class NeoStreamingSession:
                  city: str = None, zip_code: str = None):
         self.session_id = session_id
         self.websocket = websocket
-        self.user_agent = user_agent
+        self._apple_mobile_client = False
+        try:
+            from browser_manager import (
+                is_apple_mobile_user_agent,
+                normalize_mobile_user_agent,
+            )
+            self._apple_mobile_client = is_apple_mobile_user_agent(user_agent)
+            self.user_agent = normalize_mobile_user_agent(user_agent) or (user_agent or '')
+        except Exception:
+            # Keep session construction independent of optional browser deps.
+            self.user_agent = user_agent or ''
         self.config = config
         self.gpu_manager = gpu_manager
         
@@ -444,11 +454,11 @@ class NeoStreamingSession:
         # Use explicit is_mobile flag from client (more reliable than UA detection)
         # Fall back to UA detection if not provided
         if is_mobile is not None:
-            self.is_mobile = bool(is_mobile)
+            self.is_mobile = bool(is_mobile) or self._apple_mobile_client
         else:
-            # Detect if client is mobile based on user agent - fallback
-            self.is_mobile = bool(user_agent and any(mobile_id in user_agent.lower() 
-                for mobile_id in ['android', 'webos', 'iphone', 'ipad', 'ipod', 
+            # Detect if client is mobile based on the normalized UA - fallback.
+            self.is_mobile = bool(self.user_agent and any(mobile_id in self.user_agent.lower()
+                for mobile_id in ['android', 'webos', 'iphone', 'ipad', 'ipod',
                                 'blackberry', 'iemobile', 'opera mini', 'opera mobi']))
         
         # Resize debounce - prevents flash during page navigation

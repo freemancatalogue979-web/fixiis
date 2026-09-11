@@ -2021,6 +2021,13 @@ async def _launch_stack(profile_dir: Optional[str], viewport: Dict[str, Any],
                         mobile: bool, pixel_ratio: float,
                         headless: bool) -> SBBrowser:
     """Shared launch: driver thread + CDP client + context + initial tab."""
+    try:
+        from browser_manager import is_apple_mobile_user_agent, normalize_mobile_user_agent
+        if is_apple_mobile_user_agent(user_agent):
+            user_agent = normalize_mobile_user_agent(user_agent)
+            mobile = True
+    except Exception:
+        pass
     handle = SBHandle(profile_dir=profile_dir, viewport=viewport, user_agent=user_agent,
                       proxy_url=proxy_url, mobile=mobile, pixel_ratio=pixel_ratio,
                       headless=headless)

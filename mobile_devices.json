@@ -1,21 +1,21 @@
 {
   "iphone_14_pro": {
-    "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Mobile/22D72 Safari/604.1",
+    "user_agent": "Mozilla/5.0 (Linux; Android 15; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Mobile Safari/537.36",
     "viewport": {
       "width": 393,
       "height": 852
     },
     "is_mobile": true,
     "has_touch": true,
-    "platform": "iPhone",
-    "cpu_cores": 6,
-    "memory": 6,
+    "platform": "Linux; Android 15",
+    "cpu_cores": 8,
+    "memory": 8,
     "max_touch_points": 5,
-    "webgl_vendor": "Apple Inc.",
-    "webgl_renderer": "Apple GPU",
+    "webgl_vendor": "Google Inc.",
+    "webgl_renderer": "Mali G78",
     "fonts": [
-      "SF Pro Display",
-      "SF Pro Text",
+      "Roboto",
+      "Noto Sans",
       "Helvetica Neue",
       "Arial",
       "Times New Roman"
@@ -23,22 +23,22 @@
     "screen_height": 800
   },
   "iphone_14": {
-    "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Mobile/22D72 Safari/604.1",
+    "user_agent": "Mozilla/5.0 (Linux; Android 15; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Mobile Safari/537.36",
     "viewport": {
       "width": 390,
       "height": 844
     },
     "is_mobile": true,
     "has_touch": true,
-    "platform": "iPhone",
-    "cpu_cores": 6,
-    "memory": 4,
+    "platform": "Linux; Android 15",
+    "cpu_cores": 8,
+    "memory": 8,
     "max_touch_points": 5,
-    "webgl_vendor": "Apple Inc.",
-    "webgl_renderer": "Apple GPU",
+    "webgl_vendor": "Google Inc.",
+    "webgl_renderer": "Mali G78",
     "fonts": [
-      "SF Pro Display",
-      "SF Pro Text",
+      "Roboto",
+      "Noto Sans",
       "Helvetica Neue",
       "Arial",
       "Times New Roman"

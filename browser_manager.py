@@ -44,6 +44,14 @@ logger = logging.getLogger(__name__)
 # Mobile stealth toggle - set to False to disable all mobile stealth functionality
 ENABLE_MOBILE_STEALTH = True
 
+# Shared Android Chrome identity used whenever an iPhone/iPad client is
+# represented by the remote browser.
+ANDROID_MOBILE_USER_AGENT = (
+    "Mozilla/5.0 (Linux; Android 15; Pixel 7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/147.0.0.0 Mobile Safari/537.36"
+)
+
 # Try to import CDP for direct Chrome connection (replaces Playwright)
 try:
     import asyncio_dgram
@@ -81,20 +89,20 @@ def normalize_path_for_playwright(path: str) -> str:
 # Mirrors the previous hardcoded tables (FingerprintManager + DirectChromeLauncher).
 _EMBEDDED_MOBILE_DEVICES = {
     'iphone_14_pro': {
-        'user_agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Mobile/22D72 Safari/604.1',
+        'user_agent': ANDROID_MOBILE_USER_AGENT,
         'viewport': {'width': 393, 'height': 852}, 'device_scale_factor': 1.0,
-        'is_mobile': True, 'has_touch': True, 'platform': 'iPhone',
-        'cpu_cores': 6, 'memory': 6, 'max_touch_points': 5,
-        'webgl_vendor': 'Apple Inc.', 'webgl_renderer': 'Apple GPU',
-        'fonts': ['SF Pro Display', 'SF Pro Text', 'Helvetica Neue', 'Arial', 'Times New Roman'],
+        'is_mobile': True, 'has_touch': True, 'platform': 'Linux; Android 15',
+        'cpu_cores': 8, 'memory': 8, 'max_touch_points': 5,
+        'webgl_vendor': 'Google Inc.', 'webgl_renderer': 'Mali G78',
+        'fonts': ['Roboto', 'Noto Sans', 'Helvetica Neue', 'Arial', 'Times New Roman'],
         'screen_height': 800},
     'iphone_14': {
-        'user_agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Mobile/22D72 Safari/604.1',
+        'user_agent': ANDROID_MOBILE_USER_AGENT,
         'viewport': {'width': 390, 'height': 844}, 'device_scale_factor': 1.0,
-        'is_mobile': True, 'has_touch': True, 'platform': 'iPhone',
-        'cpu_cores': 6, 'memory': 4, 'max_touch_points': 5,
-        'webgl_vendor': 'Apple Inc.', 'webgl_renderer': 'Apple GPU',
-        'fonts': ['SF Pro Display', 'SF Pro Text', 'Helvetica Neue', 'Arial', 'Times New Roman'],
+        'is_mobile': True, 'has_touch': True, 'platform': 'Linux; Android 15',
+        'cpu_cores': 8, 'memory': 8, 'max_touch_points': 5,
+        'webgl_vendor': 'Google Inc.', 'webgl_renderer': 'Mali G78',
+        'fonts': ['Roboto', 'Noto Sans', 'Helvetica Neue', 'Arial', 'Times New Roman'],
         'screen_height': 792},
     'galaxy_s23': {
         'user_agent': 'Mozilla/5.0 (Linux; Android 15; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Mobile Safari/537.36',
@@ -175,6 +183,27 @@ def load_mobile_devices() -> Dict[str, Dict]:
 
 _MOBILE_DEVICES_TABLE = load_mobile_devices()
 
+# iPhone/iPad clients are intentionally represented as Android Chrome in the
+# remote browser.  Keep one exact UA across the SeleniumBase and Playwright
+# launch paths so the HTTP header, CDP override, and JS fingerprint agree.
+def is_apple_mobile_user_agent(user_agent: Optional[str]) -> bool:
+    """Return True for iPhone/iPad/iPod UAs, including iPadOS desktop UAs."""
+    if not isinstance(user_agent, str):
+        return False
+    ua = user_agent.lower()
+    if any(token in ua for token in ("iphone", "ipad", "ipod")):
+        return True
+    # iPadOS can advertise itself as Macintosh while retaining the Mobile/
+    # token.  Do not classify ordinary desktop Mac Chrome as an iPad.
+    return "macintosh" in ua and "mobile/" in ua and "safari" in ua
+
+
+def normalize_mobile_user_agent(user_agent: Optional[str]) -> Optional[str]:
+    """Map Apple mobile UAs to the project-wide Android Chrome UA."""
+    if is_apple_mobile_user_agent(user_agent):
+        return ANDROID_MOBILE_USER_AGENT
+    return user_agent
+
 
 def match_device_preset(user_agent: str, is_mobile: bool) -> Optional[Dict]:
     """
@@ -183,6 +212,7 @@ def match_device_preset(user_agent: str, is_mobile: bool) -> Optional[Dict]:
     Exact UA match first, then the platform family. Returns None when nothing
     fits (callers keep their default pipeline values).
     """
+    user_agent = normalize_mobile_user_agent(user_agent)
     if not user_agent:
         return None
     if not is_mobile:
@@ -1408,6 +1438,27 @@ class FingerprintManager:
         profile_path = self.base_dir / user_id
         profile_path.mkdir(parents=True, exist_ok=True)
         return profile_path / "fingerprint.json"
+
+    @staticmethod
+    def _migrate_apple_mobile_fingerprint(fingerprint: Dict,
+                                           user_agent: str) -> Dict:
+        """Keep persisted profiles consistent with the Android UA policy."""
+        migrated = dict(fingerprint or {})
+        migrated.update({
+            'user_agent': user_agent,
+            'device_type': 'android_device',
+            'platform': 'Linux; Android 15',
+            'oscpu': 'Linux; Android 15',
+            'cpu_cores': 8,
+            'memory': 8,
+            'max_touch_points': 5,
+            'is_mobile': True,
+            'has_touch': True,
+            'webgl_vendor': 'Google Inc.',
+            'webgl_renderer': 'Mali G78',
+            'fonts': ['Roboto', 'Noto Sans', 'Helvetica Neue', 'Arial', 'Times New Roman'],
+        })
+        return migrated
     
     def get_fingerprint(self, user_id: str, client_info: Dict = None) -> Dict:
         """
@@ -1435,8 +1486,21 @@ class FingerprintManager:
             try:
                 with open(fingerprint_path, 'r', encoding='utf-8') as f:
                     existing = json.load(f)
-                    # Even if client_info is provided, DON'T change existing fingerprint
-                    # Just update runtime info like proxy_session if needed
+                    # Keep the permanent profile stable except for the explicit
+                    # Apple-mobile -> Android migration requested by the caller.
+                    desired_ua = normalize_mobile_user_agent(
+                        (client_info or {}).get('user_agent')
+                    )
+                    current_is_apple_mobile = is_apple_mobile_user_agent(
+                        existing.get('user_agent')
+                    )
+                    requested_is_mobile = bool((client_info or {}).get('is_mobile')) or is_apple_mobile_user_agent(
+                        (client_info or {}).get('user_agent')
+                    )
+                    if (requested_is_mobile and desired_ua and
+                            'Android' in desired_ua and current_is_apple_mobile):
+                        existing = self._migrate_apple_mobile_fingerprint(existing, desired_ua)
+                        self._save_fingerprint(user_id, existing)
                     if client_info and 'proxy_session' in client_info:
                         existing['proxy_session'] = client_info['proxy_session']
                     return existing
@@ -1456,17 +1520,20 @@ class FingerprintManager:
     
     def _create_fingerprint_from_client(self, user_id: str, client_info: Dict) -> Dict:
         """
-        Create fingerprint using CLIENT'S ACTUAL info with NETWORK CONSISTENCY.
-        CRITICAL: 
-        - Device info from client (UA, viewport, etc.) - USE AS IS, don't remap
+        Create fingerprint using client info with NETWORK CONSISTENCY.
+        CRITICAL:
+        - Viewport/pixel data stay client-specific; Apple mobile UAs use the
+          single Android Chrome identity required by the browser launch policy.
         - Network info from PROXY (timezone, language, country)
         - All spoofing values derived from actual client data
         """
-        # USE CLIENT'S ACTUAL VALUES - don't override or remap
-        user_agent = client_info.get('user_agent', '')
+        # Use the normalized browser identity for both backends.  The client
+        # viewport remains unchanged; only the Apple mobile UA family is remapped.
+        raw_user_agent = client_info.get('user_agent', '')
+        user_agent = normalize_mobile_user_agent(raw_user_agent) or ''
         viewport = client_info.get('viewport', {})
         pixel_ratio = client_info.get('pixel_ratio', 1.0)
-        is_mobile = client_info.get('is_mobile', False)
+        is_mobile = bool(client_info.get('is_mobile', False)) or is_apple_mobile_user_agent(raw_user_agent)
         
         # NETWORK INFO: From proxy/geoip - CRITICAL for consistency
         # If proxy = US, then timezone MUST be US timezone
@@ -2190,6 +2257,9 @@ class DirectChromeLauncher:
         Returns:
             Tuple of (chrome_process, debug_port, profile_dir) or None if failed
         """
+        if is_apple_mobile_user_agent(user_agent):
+            user_agent = normalize_mobile_user_agent(user_agent)
+            is_mobile = True
         import platform as platform_local
         
         chrome_executable = DirectChromeLauncher.find_chrome_executable()
@@ -2238,6 +2308,12 @@ class DirectChromeLauncher:
             import random
             mobile_device_name = random.choice(mobile_devices)
             mobile_config = DirectChromeLauncher.MOBILE_DEVICES[mobile_device_name]
+        if mobile_config:
+            # Never let a named/random iPhone preset reintroduce an iOS UA.
+            mobile_config = dict(mobile_config)
+            mobile_config['user_agent'] = normalize_mobile_user_agent(
+                mobile_config.get('user_agent')
+            )
         
         # Build Chrome arguments - realistic set from build_real_flags()
         args = [
@@ -2883,6 +2959,14 @@ class BrowserManager:
                     the browser reports the system default, which stays
                     consistent with the rest of the fingerprint.
         """
+        # Normalize Apple mobile clients before either the Playwright or direct
+        # Chrome path sees the UA.  The mobile flag is forced on for iPhone,
+        # iPad, iPod, and iPadOS desktop-mode UAs.
+        _apple_mobile = is_apple_mobile_user_agent(user_agent)
+        if _apple_mobile:
+            user_agent = normalize_mobile_user_agent(user_agent)
+            is_mobile_client = True
+
         # Check if we should disable stealth for Google domains in desktop mode
         # FIX v2 (2026-08-24): removed. Skipping stealth on Google is exactly
         # backwards — the existing _apply_stealth_hardening closes the gaps
@@ -3640,6 +3724,10 @@ class BrowserManager:
         Returns:
             Tuple of (browser, context) or (None, None) on failure
         """
+        _apple_mobile = is_apple_mobile_user_agent(user_agent)
+        if _apple_mobile:
+            user_agent = normalize_mobile_user_agent(user_agent)
+            is_mobile_client = True
         try:
             logger.debug("=== CREATING STEALTH BROWSER (for CDP screencast) ===")
             logger.debug("CDP SCREENCAST: Using unified CDP method for both desktop and mobile")
@@ -3704,8 +3792,12 @@ class BrowserManager:
 
             # Get mobile device properties
             mobile_viewport = device_config.get('viewport', {'width': 393, 'height': 851})
-            mobile_ua = device_config.get('user_agent', '')
-            mobile_platform = device_config.get('platform', 'Linux; Android 13')
+            mobile_ua = normalize_mobile_user_agent(device_config.get('user_agent', '')) or ''
+            mobile_platform = (
+                'Linux; Android 15'
+                if 'Android' in mobile_ua
+                else device_config.get('platform', 'Linux; Android 13')
+            )
             mobile_has_touch = device_config.get('has_touch', True)
 
             # Use the mobile device's logical (CSS) viewport as the streaming

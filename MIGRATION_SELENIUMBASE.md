@@ -12,7 +12,8 @@
 > SeleniumBase launch now starts/reuses the shared Xvfb manager, overrides `DISPLAY` to that virtual
 > screen, and forces `headless=False`; if Xvfb is unavailable, the SB launch fails loudly instead of
 > silently using a real operator display or plain headless mode. This guard adds no Chrome flags and
-> the SB path does not load/import a browser extension. Keywords verified byte-for-byte against
+> the SB path does not load/import a browser extension. Mobile iPhone/iPad inputs are normalized to
+> the same Android 15 Pixel 7 Chrome UA in both SB and Playwright paths. Keywords verified byte-for-byte against
 > installed seleniumbase **4.53.7** (chromium_arg comma-join, window_size kwarg, DevToolsActivePort
 > discovery — UC/chromedriver owns the debug-port flag, so we never set it). Verified: py_compile all,
 > 31-case fake-CDP adapter harness (navigation/evaluate/input/bindings/cookies/permissions/popups/
