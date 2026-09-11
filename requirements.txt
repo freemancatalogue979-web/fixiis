@@ -1,0 +1,39 @@
+# Neo Browser Stream - Dependencies
+# Performance-optimized streaming server
+
+# Web Framework
+fastapi==0.109.2
+uvicorn[standard]==0.27.1
+slowapi==0.1.9
+
+# Authentication & Security
+bcrypt==4.1.2
+PyJWT==2.8.0
+
+# HTTP Client
+httpx==0.26.0
+
+# Browser Automation - UPDATED to latest for Chrome 147+ compatibility
+playwright==1.50.0
+playwright-stealth==2.0.3  # Latest version - fixes deprecated pkg_resources
+
+# SeleniumBase UC backend (BROWSER_BACKEND=sb) — real-Chrome stealth launch
+# + lifecycle + captcha helpers; Playwright above stays as fallback backend
+seleniumbase>=4.34.0,<5
+
+# System Monitoring
+psutil==5.9.8
+
+# WebRTC Support (for advanced streaming)
+aiortc==1.9.0
+
+# Video Processing (for hardware encoding)
+opencv-python-headless==4.9.0.80
+numpy==2.0.0
+
+# Async Libraries
+asyncio-dgram==2.1.2
+
+# Recaptcha (if using)
+# recaptcha==0.1  # Optional - uncomment if needed
+brotli>=1.0.9

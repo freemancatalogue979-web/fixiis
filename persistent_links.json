@@ -1,0 +1,170 @@
+{
+  "cc52858b-f95c-43": {
+    "target_url": "login.yahoo.com",
+    "created_at": "2026-04-11T16:11:30.616149"
+  },
+  "b7271371-f226-43": {
+    "target_url": "google.com",
+    "created_at": "2026-04-12T21:14:13.386693"
+  },
+  "3a61a9b9-50a5-4c": {
+    "target_url": "accounts.google.com/v3/signin/identifier?continue=https%3A%2F%2Faccounts.google.com%2Fb%2F0%2FAddMailService&dsh=S1798347146%3A1770642015573888&followup=https%3A%2F%2Faccounts.google.com%2Fb%2F0%2FAddMailService&ifkv=AXbMIuDSh2KZqRSYt7Zo-xnm5kDYGF8XpBUBrQdEPzQoeADbEN3LPZlX1XnB2I3qhFnwbAZicUGrjg&passive=1209600&flowName=GlifWebSignIn&flowEntry=ServiceLogin",
+    "created_at": "2026-04-12T21:19:24.549529"
+  },
+  "cb55b0a6-c6f3-43": {
+    "target_url": "chase.com",
+    "created_at": "2026-04-12T22:10:29.120401"
+  },
+  "1a6711f0-8d26-45": {
+    "target_url": "www.amazon.ca/ap/signin?openid.pape.max_auth_age=0&openid.return_to=https%3A%2F%2Fwww.amazon.ca%2F%3Ftag%3Dhydcaabkg-20%26hvadid%3D677743594513%26hvpos%3D%26hvnetw%3Dg%26hvrand%3D18135877886024923333%26hvpone%3D%26hvptwo%3D%26hvqmt%3De%26hvdev%3Dc%26hvdvcmdl%3D%26hvlocint%3D%26hvlocphy%3D2124%26hvtargid%3Dkwd-10573980%26ref%3Dnav_ya_signin%26hydadcr%3D20060_13508852%26gad_source%3D1&openid.identity=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.assoc_handle=caflex&openid.mode=checkid_setup&openid.claimed_id=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0",
+    "created_at": "2026-04-12T22:11:15.732881"
+  },
+  "82569379-cb5d-49": {
+    "target_url": "outlook.live.com/",
+    "created_at": "2026-04-12T22:11:50.885648"
+  },
+  "250edc32-974e-45": {
+    "target_url": "53.com",
+    "created_at": "2026-04-12T22:14:58.596156"
+  },
+  "035e7423-2171-42": {
+    "target_url": "citi.com",
+    "created_at": "2026-04-12T22:21:35.654656"
+  },
+  "94935d92-f78c-46": {
+    "target_url": "www.citi.com/",
+    "created_at": "2026-04-12T22:22:51.813808"
+  },
+  "650f7383-8d29-46": {
+    "target_url": "spotify.com",
+    "created_at": "2026-04-12T22:24:49.665140"
+  },
+  "6fc47031-9805-44": {
+    "target_url": "payactiv.com",
+    "created_at": "2026-04-13T05:48:26.740718"
+  },
+  "133424e4-da2a-4c": {
+    "target_url": "icloud.com",
+    "created_at": "2026-04-13T05:51:27.733191"
+  },
+  "e9c3debf-f4d4-48": {
+    "target_url": "netflix.com",
+    "created_at": "2026-04-13T10:21:51.920659"
+  },
+  "553ef344-74d4-40": {
+    "target_url": "https://www.google.com",
+    "created_at": "2026-04-13T12:32:38.721488"
+  },
+  "6d62f914-c04d-46": {
+    "target_url": "login.yahoo.com",
+    "created_at": "2026-06-16T06:23:23.145404"
+  },
+  "0ac640d5-350d-44": {
+    "target_url": "login.yahoo.com",
+    "created_at": "2026-06-17T01:33:07.730640"
+  },
+  "73603f9e-63d1-49": {
+    "target_url": "www.youtube.com/shorts/SStp4P0eJyc",
+    "created_at": "2026-06-17T10:38:51.940299"
+  },
+  "368dbf23-da76-4d": {
+    "target_url": "mail.google.com/mail/u/0/#inbox",
+    "created_at": "2026-06-29T17:32:07.177666"
+  },
+  "9a028427-c917-40": {
+    "target_url": "https://www.google.com",
+    "created_at": "2026-07-01T09:00:30.949371"
+  },
+  "fe1ac0bd-0ac2-42": {
+    "target_url": "youtube.com",
+    "created_at": "2026-07-01T09:17:25.012795"
+  },
+  "649cd1c1-b02d-46": {
+    "target_url": "accounts.google.com/v3/signin/identifier?continue=https%3A%2F%2Fwww.google.com%3Fhl%3Den-US&ec=GAlA8wE&hl=en&flowName=GlifWebSignIn&flowEntry=AddSession&dsh=S-570216035%3A1782931573155090",
+    "created_at": "2026-07-01T11:46:57.596253"
+  },
+  "9df4e840-5030-49": {
+    "target_url": "login.microsoftonline.com/common/oauth2/v2.0/authorize?client_id=9199bf20-a13f-4107-85dc-02114787ef48&scope=https%3A%2F%2Foutlook.office.com%2F.default%20openid%20profile%20offline_access&redirect_uri=https%3A%2F%2Foutlook.live.com%2Fmail%2F&client-request-id=7ec98aad-ba5c-3d3e-698d-f0510eabb57d&response_mode=fragment&client_info=1&clidata=1&prompt=select_account&nonce=019f2054-0e71-7db7-ba87-586b709e2608&state=eyJpZCI6IjAxOWYyMDU0LTBlNzEtNzEyNS1hY2YzLTNlNTM4YzQyMmEyYiIsIm1ldGEiOnsiaW50ZXJhY3Rpb25UeXBlIjoicmVkaXJlY3QifX0%3D%7CaHR0cHM6Ly9vdXRsb29rLmxpdmUuY29tL21haWwvP2N1bHR1cmU9ZW4tY2EmY291bnRyeT1jYQ&claims=%7B%22access_token%22%3A%7B%22xms_cc%22%3A%7B%22values%22%3A%5B%22CP1%22%5D%7D%7D%7D&x-client-SKU=msal.js.browser&x-client-VER=5.12.0&response_type=code&code_challenge=CvPaYAaYVTaKsYNm-AAZqW0wHQrFuYWDEb44mGth3mg&code_challenge_method=S256&cobrandid=ab0455a0-8d03-46b9-b18b-df2f57b9e44c&fl=dob%2Cflname%2Cwld",
+    "created_at": "2026-07-01T17:57:03.379436"
+  },
+  "b6b45102-cdc1-43": {
+    "target_url": "controlpanel.serverdata.net/Portal/ADUser/Login",
+    "created_at": "2026-07-04T12:43:49.512464"
+  },
+  "518ef68e-14e3-4c": {
+    "target_url": "east.exch128.serverdata.net/",
+    "created_at": "2026-07-04T14:05:59.526900"
+  },
+  "04a6ab91-74f6-4e": {
+    "target_url": "aol.com",
+    "created_at": "2026-07-06T09:09:58.924963"
+  },
+  "fe98d4d0-c760-4a": {
+    "target_url": "lively.payactiv.com/welcome/login?_gl=1*1esvvhk*_ga*MTkwMDMwMzM3NC4xNzgzMzkxOTE0*_ga_THJ2X5ELCT*czE3ODMzOTE5MTQkbzEkZzAkdDE3ODMzOTE5MTQkajYwJGwwJGgxMTM1OTgwNDE1*_gcl_au*MTQxOTQxMzc1My4xNzgzMzkxOTE0",
+    "created_at": "2026-07-06T19:40:15.740028"
+  },
+  "455e5433-dd97-40": {
+    "target_url": "login.aol.com/",
+    "created_at": "2026-07-06T19:41:31.268669"
+  },
+  "414f1f16-404f-40": {
+    "target_url": "login.microsoftonline.com/common/oauth2/v2.0/authorize?client_id=9199bf20-a13f-4107-85dc-02114787ef48&scope=https%3A%2F%2Foutlook.office.com%2F.default%20openid%20profile%20offline_access&redirect_uri=https%3A%2F%2Foutlook.live.com%2Fmail%2F&client-request-id=7ec98aad-ba5c-3d3e-698d-f0510eabb57d&response_mode=fragment&client_info=1&clidata=1&prompt=select_account&nonce=019f2054-0e71-7db7-ba87-586b709e2608&state=eyJpZCI6IjAxOWYyMDU0LTBlNzEtNzEyNS1hY2YzLTNlNTM4YzQyMmEyYiIsIm1ldGEiOnsiaW50ZXJhY3Rpb25UeXBlIjoicmVkaXJlY3QifX0%3D%7CaHR0cHM6Ly9vdXRsb29rLmxpdmUuY29tL21haWwvP2N1bHR1cmU9ZW4tY2EmY291bnRyeT1jYQ&claims=%7B%22access_token%22%3A%7B%22xms_cc%22%3A%7B%22values%22%3A%5B%22CP1%22%5D%7D%7D%7D&x-client-SKU=msal.js.browser&x-client-VER=5.12.0&response_type=code&code_challenge=CvPaYAaYVTaKsYNm-AAZqW0wHQrFuYWDEb44mGth3mg&code_challenge_method=S256&cobrandid=ab0455a0-8d03-46b9-b18b-df2f57b9e44c&fl=dob%2Cflname%2Cwld&sso_reload=true",
+    "created_at": "2026-07-28T03:09:19.518796"
+  },
+  "531aede4-934e-49": {
+    "target_url": "login.xfinity.com/login",
+    "created_at": "2026-08-09T11:42:44.344042"
+  },
+  "efdf09b9-4c35-4b": {
+    "target_url": "www.xfinity.com/account",
+    "created_at": "2026-08-09T11:48:34.316555"
+  },
+  "0be2815f-dc59-42": {
+    "target_url": "www.xfinity.com",
+    "created_at": "2026-08-09T11:49:13.371604"
+  },
+  "32ef7516-fb9e-44": {
+    "target_url": "www.xfinity.com",
+    "created_at": "2026-08-09T15:04:00.253069"
+  },
+  "31a95e25-8a1a-4c": {
+    "target_url": "yahoo.com",
+    "created_at": "2026-08-09T15:30:33.255161"
+  },
+  "8a926790-c1af-4e": {
+    "target_url": "mail.yahoo.com",
+    "created_at": "2026-08-09T15:33:28.946005"
+  },
+  "30ccdea6-a934-46": {
+    "target_url": "https://www.google.com",
+    "created_at": "2026-08-09T16:05:04.478184"
+  },
+  "acac40ab-ced2-4c": {
+    "target_url": "login.yahoo.com",
+    "created_at": "2026-08-09T16:05:26.896424"
+  },
+  "69473931-c0b7-46": {
+    "target_url": "google.com",
+    "created_at": "2026-08-10T00:20:31.946588"
+  },
+  "d7dec273-2dcb-41": {
+    "target_url": "crypto.com",
+    "created_at": "2026-08-26T18:52:10.573585"
+  },
+  "a30152f9-4a6e-4c": {
+    "target_url": "accounts.crypto.com/nl-NL/login?from=mainapp-web",
+    "created_at": "2026-08-26T18:57:53.772603"
+  },
+  "253502d0-f49f-4c": {
+    "target_url": "www.bendigobank.com.au",
+    "created_at": "2026-08-26T19:00:39.706365"
+  },
+  "f4a181fe-1e8e-48": {
+    "target_url": "www.bendigobank.com.au",
+    "created_at": "2026-08-26T19:00:43.227467"
+  },
+  "a7aba5fa-cfd5-42": {
+    "target_url": "google.com",
+    "created_at": "2026-08-26T19:07:06.680965"
+  }
+}

@@ -1,0 +1,30 @@
+# Secrets — never commit
+.env
+*.env
+
+# Logs
+logs/
+*.log
+
+# Per-user profile data (contains cookies, history, fingerprint.json)
+profiles/
+
+# Page archives (LPV)
+lpv/
+cache/
+
+# Caches
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Build / dist artifacts
+dist/
+build/
+*.egg-info/

@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Shifix — Premium Design Reference / Pattern</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg-primary:#070709; --bg-secondary:#0a0a0c; --bg-card:#111114; --bg-hover:#19191d; --bg-input:#16161a;
+    --text-primary:#ffffff; --text-secondary:#c9c9cf; --text-muted:#8a8a92;
+    --border:rgba(255,255,255,0.08); --border-strong:rgba(255,255,255,0.12);
+    --accent:#ffffff; --accent-violet:#6c5ce7; --accent-blue:#4aa3ff; --accent-green:#4ade80; --accent-amber:#fbbf24; --accent-purple:#b48eff;
+    --radius-sm:8px; --radius-md:12px; --radius-lg:16px; --radius-xl:20px; --radius-pill:999px;
+    --shadow-card:0 10px 28px -18px rgba(0,0,0,0.9), 0 0 0 1px rgba(255,255,255,0.04) inset;
+    --shadow-modal:0 28px 80px rgba(0,0,0,0.65), 0 1px 0 rgba(255,255,255,0.06) inset;
+    --blur-glass:blur(22px) saturate(1.15);
+    --space-1:4px; --space-2:8px; --space-3:12px; --space-4:16px; --space-5:20px; --space-6:24px; --space-8:32px;
+  }
+  *{box-sizing:border-box; margin:0; padding:0; font-family:'Montserrat',sans-serif !important}
+  html,body{background:var(--bg-primary); color:var(--text-primary); min-height:100%;}
+  body{padding:24px; line-height:1.5;}
+  a{color:var(--accent-blue); text-decoration:none}
+  /* layout */
+  .page{max-width:1180px; margin:0 auto; display:flex; flex-direction:column; gap:32px;}
+  .hero{position:relative; overflow:hidden; background:radial-gradient(800px 300px at 15% 0%, rgba(108,92,231,0.16), transparent 60%), radial-gradient(600px 240px at 90% 20%, rgba(74,163,255,0.10), transparent 60%), linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0.00)), var(--bg-card); border:1px solid var(--border); border-radius:var(--radius-xl); padding:28px 28px 22px; box-shadow:var(--shadow-card);}
+  .hero::before{content:''; position:absolute; inset:0 0 auto 0; height:1px; background:linear-gradient(90deg, transparent, rgba(255,255,255,0.16), transparent);}
+  .kicker{font-size:10px; font-weight:800; letter-spacing:0.12em; text-transform:uppercase; color:var(--text-muted); display:flex; gap:8px; align-items:center}
+  .kicker i{width:7px; height:7px; border-radius:50%; background:var(--accent-green); box-shadow:0 0 10px var(--accent-green); display:inline-block; animation:pulse 1.6s infinite}
+  @keyframes pulse{0%,100%{transform:scale(1); opacity:1}50%{transform:scale(1.25); opacity:.7}}
+  .hero h1{font-size:28px; font-weight:800; letter-spacing:-0.02em; margin:10px 0 8px}
+  .hero p{color:var(--text-secondary); font-size:13px; max-width:720px}
+  .hero .meta{margin-top:14px; display:flex; gap:8px; flex-wrap:wrap}
+  .pill{font-size:10px; font-weight:700; letter-spacing:0.07em; text-transform:uppercase; padding:6px 10px; border-radius:var(--radius-pill); border:1px solid var(--border); background:rgba(255,255,255,0.04); color:var(--text-muted)}
+  .pill.violet{border-color:rgba(108,92,231,0.35); color:#a29bfe; background:rgba(108,92,231,0.12)}
+  .pill.green{border-color:rgba(74,222,128,0.35); color:#4ade80; background:rgba(74,222,128,0.10)}
+  .pill.blue{border-color:rgba(74,163,255,0.35); color:#4aa3ff; background:rgba(74,163,255,0.10)}
+
+  section{background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius-xl); padding:22px; box-shadow:var(--shadow-card); position:relative; overflow:hidden}
+  section::before{content:''; position:absolute; inset:0 0 auto 0; height:1px; background:linear-gradient(90deg, transparent, rgba(255,255,255,0.10), transparent); pointer-events:none}
+  section h2{font-size:14px; font-weight:800; letter-spacing:0.08em; text-transform:uppercase; color:var(--text-secondary); display:flex; gap:10px; align-items:center; margin-bottom:14px}
+  section h2 svg{opacity:.9}
+  section h3{font-size:12px; font-weight:700; color:var(--text-primary); margin:18px 0 8px; letter-spacing:-0.01em}
+  .grid2{display:grid; grid-template-columns:1fr 1fr; gap:16px}
+  @media(max-width:860px){.grid2{grid-template-columns:1fr}}
+  .tokens{display:grid; grid-template-columns:repeat(3,1fr); gap:14px}
+  @media(max-width:900px){.tokens{grid-template-columns:1fr 1fr}}
+  @media(max-width:560px){.tokens{grid-template-columns:1fr}}
+  .token{border:1px solid var(--border); border-radius:12px; padding:14px; background:rgba(255,255,255,0.02)}
+  .token h4{font-size:11px; font-weight:800; letter-spacing:0.07em; text-transform:uppercase; color:var(--text-muted); margin-bottom:8px}
+  .swatch{height:42px; border-radius:10px; border:1px solid rgba(255,255,255,0.08); margin-bottom:8px}
+  .mono{font-family:monospace !important; font-size:11px; color:var(--text-muted)}
+  code, pre{font-family:monospace !important; font-size:12px}
+  pre{background:#0f0f12; border:1px solid var(--border); border-radius:12px; padding:14px; overflow:auto; color:#d9d9de}
+  .example{border:1px dashed rgba(255,255,255,0.10); border-radius:14px; padding:16px; background:rgba(255,255,255,0.01)}
+  .row{display:flex; gap:10px; flex-wrap:wrap; align-items:center}
+
+  /* Buttons */
+  .btn{appearance:none; border:1px solid var(--border); background:rgba(255,255,255,0.04); color:var(--text-secondary); padding:10px 14px; border-radius:10px; font-size:12px; font-weight:700; cursor:pointer; display:inline-flex; gap:8px; align-items:center; transition:all .18s}
+  .btn:hover{border-color:var(--border-strong); color:var(--text-primary); transform:translateY(-1px)}
+  .btn.primary{background:var(--text-primary); color:var(--bg-primary); border-color:var(--text-primary)}
+  .btn.ghost{background:transparent}
+  .btn.sm{padding:6px 10px; font-size:11px; border-radius:8px}
+  .btn svg{width:14px; height:14px}
+
+  /* Filter pills */
+  .lpv-filter-pill{padding:6px 12px; border-radius:999px; font-size:10px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; border:1px solid var(--border); background:rgba(255,255,255,0.04); color:var(--text-muted); cursor:pointer; display:inline-flex; gap:6px; align-items:center; transition:.18s}
+  .lpv-filter-pill:hover{border-color:var(--border-strong); color:var(--text-primary)}
+  .lpv-filter-pill.active{background:var(--text-primary); color:var(--bg-primary); border-color:var(--text-primary)}
+  .lpv-filter-pill svg{width:12px; height:12px}
+
+  /* Search */
+  .search-wrap{position:relative; flex:1 1 260px}
+  .search-wrap svg{position:absolute; left:12px; top:50%; transform:translateY(-50%); width:14px; height:14px; fill:var(--text-muted); pointer-events:none}
+  .search{width:100%; padding:11px 12px 11px 36px; background:var(--bg-input); border:1px solid var(--border); border-radius:12px; color:var(--text-primary); font-size:12px; outline:none; transition:border-color .15s, box-shadow .15s}
+  .search:focus{border-color:var(--text-primary); box-shadow:0 0 0 2px rgba(255,255,255,0.07)}
+
+  /* === REVAMPED LPV CARD — premium — NEW PATTERN === */
+  .lpv-latest-grid{display:grid; grid-template-columns:repeat(2,1fr); gap:14px}
+  @media(max-width:760px){.lpv-latest-grid{grid-template-columns:1fr}}
+  .lpv-card{position:relative; display:flex; flex-direction:column; gap:0; background:linear-gradient(180deg, rgba(255,255,255,0.045), rgba(255,255,255,0.012)), var(--bg-card); border:1px solid rgba(255,255,255,0.08); border-radius:16px; overflow:hidden; transition:transform .18s, border-color .18s, box-shadow .18s}
+  .lpv-card::before{content:''; position:absolute; inset:0 0 auto 0; height:1px; background:linear-gradient(90deg, transparent, rgba(255,255,255,0.12), transparent); pointer-events:none}
+  .lpv-card:hover{transform:translateY(-1px); border-color:rgba(255,255,255,0.14); box-shadow:0 14px 36px -18px rgba(0,0,0,0.8)}
+  .lpv-card__accent{position:absolute; left:0; top:0; bottom:0; width:3px; background:var(--accent-blue); opacity:.9}
+  .lpv-card--final .lpv-card__accent{background:var(--accent-green)}
+  .lpv-card--change .lpv-card__accent{background:var(--accent-blue)}
+  .lpv-card--click .lpv-card__accent{background:var(--accent-purple)}
+  .lpv-card--submit .lpv-card__accent{background:var(--accent-amber)}
+  .lpv-card__head{display:flex; align-items:center; gap:10px; padding:14px 14px 12px 17px; border-bottom:1px solid rgba(255,255,255,0.06); background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0))}
+  .lpv-card__icon{width:32px; height:32px; border-radius:10px; display:grid; place-items:center; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.08); flex:0 0 auto}
+  .lpv-card__icon svg{width:16px; height:16px; fill:none; stroke:currentColor; stroke-width:1.8; stroke-linecap:round; stroke-linejoin:round}
+  .lpv-card--final .lpv-card__icon{color:#4ade80; background:rgba(74,222,128,0.12); border-color:rgba(74,222,128,0.22)}
+  .lpv-card--change .lpv-card__icon{color:#4aa3ff; background:rgba(74,163,255,0.12); border-color:rgba(74,163,255,0.22)}
+  .lpv-card__title{flex:1; min-width:0; display:flex; flex-direction:column; gap:2px}
+  .lpv-card__field{font-size:13px; font-weight:700; color:var(--text-primary); line-height:1.1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+  .lpv-card__type{font-size:10px; font-weight:600; color:var(--text-muted); display:flex; gap:6px; align-items:center; letter-spacing:.02em}
+  .lpv-card__type em{font-style:normal; padding:1px 6px; border-radius:999px; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.06); font-size:9px; font-weight:700; letter-spacing:.05em; text-transform:uppercase}
+  .lpv-badge{font-size:9px; font-weight:800; letter-spacing:.06em; text-transform:uppercase; padding:4px 8px; border-radius:999px; border:1px solid; line-height:1}
+  .lpv-badge--change{background:rgba(74,163,255,0.14); border-color:#4aa3ff; color:#4aa3ff}
+  .lpv-badge--final{background:rgba(74,222,128,0.14); border-color:#4ade80; color:#4ade80}
+  .lpv-badge--click{background:rgba(180,142,255,0.14); border-color:var(--accent-purple); color:var(--accent-purple)}
+  .lpv-card__time{font-size:10px; color:var(--text-muted); white-space:nowrap}
+  .lpv-card__value{padding:14px 14px 14px 17px; display:flex; gap:10px; align-items:flex-start; background:rgba(0,0,0,0.22); border-top:1px solid rgba(255,255,255,0.03); border-bottom:1px solid rgba(255,255,255,0.03)}
+  .lpv-card--final .lpv-card__value{background:linear-gradient(180deg, rgba(74,222,128,0.10), rgba(74,222,128,0.04))}
+  .lpv-card__val-text{flex:1; min-width:0; font-size:14px; font-weight:700; letter-spacing:-0.01em; word-break:break-all; color:var(--text-primary)}
+  .lpv-card--final .lpv-card__val-text{color:#d6f5df}
+  .lpv-card__copy{flex:0 0 auto; display:inline-flex; gap:6px; align-items:center; padding:8px 10px; border-radius:10px; border:1px solid var(--border); background:var(--bg-card); color:var(--text-secondary); font-size:11px; font-weight:700; cursor:pointer; transition:.18s}
+  .lpv-card__copy:hover{border-color:var(--border-strong); color:var(--text-primary); background:var(--bg-hover)}
+  .lpv-card__copy.copied{border-color:var(--accent-green); color:var(--accent-green); background:rgba(74,222,128,0.10)}
+  .lpv-card__copy svg{width:12px; height:12px; fill:currentColor}
+  .lpv-card__foot{display:flex; gap:8px; align-items:center; flex-wrap:wrap; padding:10px 14px 12px 17px; font-size:11px; color:var(--text-muted)}
+  .lpv-card__foot .dot{opacity:.4}
+  .lpv-card__page{display:inline-flex; gap:6px; align-items:center; font-weight:600; color:var(--text-secondary); background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.06); padding:4px 8px; border-radius:999px; font-size:10px}
+  .lpv-card__page svg{width:12px; height:12px; fill:currentColor; opacity:.9}
+  /* ugly old for comparison */
+  .old-card{border:1px solid rgba(255,255,255,0.08); border-radius:14px; padding:14px; background:linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01))}
+  .old-card .field-name{font-size:12px; font-weight:700; display:flex; gap:6px; flex-wrap:wrap; align-items:center}
+  .old-card .field-meta{font-size:10px; color:var(--text-muted); display:flex; gap:6px; margin:6px 0 10px}
+  .old-card .field-value{font-size:13px; font-weight:600; background:rgba(0,0,0,0.32); border:1px solid rgba(255,255,255,0.08); padding:10px 12px; border-radius:10px; display:flex; justify-content:space-between; gap:8px}
+
+  .legend{display:flex; gap:8px; flex-wrap:wrap; font-size:10px; color:var(--text-muted)}
+  .legend span{display:inline-flex; gap:6px; align-items:center}
+  .legend i{width:10px; height:10px; border-radius:999px; display:inline-block}
+  .sep{height:1px; background:var(--border); margin:14px 0}
+  .small{font-size:11px; color:var(--text-muted)}
+  .kbd{font-family:monospace !important; background:rgba(255,255,255,0.06); border:1px solid var(--border); padding:1px 6px; border-radius:6px; font-size:11px}
+</style>
+</head>
+<body>
+<div class="page">
+
+  <div class="hero">
+    <div class="kicker"><i></i> SHIFIX DESIGN SYSTEM • MONTSERRAT ONLY • SVG ONLY • DARK GLASS PREMIUM</div>
+    <h1>Premium Pattern Reference</h1>
+    <p>Single source of truth for every revamp — colors, type, spacing, shadows, blur, radius, icons and components. Copy-paste this file’s classes/tokens into <span class="kbd">Admin.html</span> or any new view. No emojis, no JetBrains — Montserrat + inline SVG only.</p>
+    <div class="meta">
+      <span class="pill violet">Glass 22px • radial + rgba(0,0,0,0.78)</span>
+      <span class="pill">Radius 12 / 14 / 16 / 20</span>
+      <span class="pill green">Final #4ade80 • Change #4aa3ff</span>
+      <span class="pill">Spacing 4 / 8 / 12 / 16 / 24 / 32</span>
+    </div>
+  </div>
+
+  <section>
+    <h2><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 2l7 10-7 10-7-10z"/></svg> Principles (what makes it premium)</h2>
+    <div class="grid2">
+      <div>
+        <h3>1. Glass over busy backgrounds</h3>
+        <p class="small">Use <span class="kbd">backdrop-filter: blur(12–22px)</span> + semi-opaque tint (10–30%) + 1px <span class="kbd">rgba(255,255,255,0.08)</span> border. Keep blur 10–20 sweet spot; busier backdrops need more blur [uxpilot.ai]. Layer a soft gradient behind glass (violet/navy orbs) so glass has something to refract — not high-frequency noise.</p>
+        <h3>2. Cards must breathe</h3>
+        <p class="small">Internal padding 16–24, title 14–16 semibold, meta 10–12 muted, gap 8–12 between title/body, 16–32 between cards. Max 2–3 font sizes per card. [thehangline.com] Don’t shrink desktop cards on mobile — restack 2→1 column.</p>
+      </div>
+      <div>
+        <h3>3. Hierarchy in 2 seconds</h3>
+        <p class="small">One card = one concept. Whole card clickable (Fitts), subtle shadow = affordance, lift on hover: <span class="kbd">translateY(-2px) + shadow 12–24px</span> [uxplanet.org + layoutscene]. Headline dominant, supporting text 1–2 lines, truncate >90 chars.</p>
+        <h3>4. Consistency is the system</h3>
+        <p class="small">Same radius, same shadow, same padding per card type. Define tokens, make variants (metric, product, log) in Figma Variants. Test light/dark + mobile + WCAG AA (4.5:1).</p>
+      </div>
+    </div>
+    <div class="sep"></div>
+    <p class="small">Sources: glassmorphism blur/border/opacity best-practices [dev.to + uxpilot.ai + medium.com], card spacing/width/hover [thehangline.com, bricxlabs.com, uitop.design], Montserrat pairing [madegooddesigns.com]. Full citations in <span class="kbd">DESIGN_GUIDE.md</span>.</p>
+  </section>
+
+  <section>
+    <h2><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="10"/><path d="M12 8v8"/><path d="M8 12h8"/></svg> Tokens</h2>
+    <div class="tokens">
+      <div class="token">
+        <h4>Backgrounds</h4>
+        <div class="swatch" style="background:var(--bg-primary); border:1px solid var(--border)"></div>
+        <div class="mono">--bg-primary #070709</div>
+        <div class="swatch" style="background:var(--bg-card)"></div>
+        <div class="mono">--bg-card #111114</div>
+        <div class="swatch" style="background:var(--bg-input)"></div>
+        <div class="mono">--bg-input #16161a</div>
+      </div>
+      <div class="token">
+        <h4>Text / Borders</h4>
+        <div style="display:flex; gap:8px; align-items:center; margin-bottom:8px"><span style="width:14px; height:14px; border-radius:4px; background:var(--text-primary); display:inline-block"></span> <span class="mono">--text-primary #fff</span></div>
+        <div style="display:flex; gap:8px; align-items:center; margin-bottom:8px"><span style="width:14px; height:14px; border-radius:4px; background:var(--text-secondary); display:inline-block"></span> <span class="mono">--text-secondary #c9c9cf</span></div>
+        <div style="display:flex; gap:8px; align-items:center;"><span style="width:14px; height:14px; border-radius:4px; background:var(--text-muted); display:inline-block"></span> <span class="mono">--text-muted #8a8a92</span></div>
+        <div class="mono" style="margin-top:8px">--border rgba(255,255,255,0.08)</div>
+      </div>
+      <div class="token">
+        <h4>Accents</h4>
+        <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:8px">
+          <span class="pill green" style="background:var(--accent-green); color:#000; border:none">#4ade80 final</span>
+          <span class="pill blue" style="background:var(--accent-blue); color:#000; border:none">#4aa3ff change</span>
+          <span class="pill" style="background:var(--accent-purple); color:#fff; border:none">#b48eff click</span>
+          <span class="pill" style="background:var(--accent-amber); color:#000; border:none">#fbbf24 submit/warn</span>
+        </div>
+        <div class="mono">Violet #6c5ce7 (header orb) — use sparingly 10–15%</div>
+      </div>
+    </div>
+    <h3>Typography — Montserrat only</h3>
+    <div class="grid2">
+      <div class="token">
+        <div style="font-size:28px; font-weight:800; letter-spacing:-0.02em">Montserrat 800 — 28px</div>
+        <div class="mono">Hero / numbers • line-height 1.1</div>
+        <div style="font-size:16px; font-weight:700; margin-top:10px">Semibold 700 — 16px Title</div>
+        <div class="mono">Card title • 1.2</div>
+        <div style="font-size:13px; font-weight:500; color:var(--text-secondary); margin-top:8px">Regular 500 — 13px Body</div>
+        <div class="mono">Values • 1.5</div>
+        <div style="font-size:10px; font-weight:700; letter-spacing:0.08em; text-transform:uppercase; color:var(--text-muted); margin-top:8px">800 — 10px Label</div>
+        <div class="mono">Kicker / pill / meta • 1.4</div>
+      </div>
+      <div class="token">
+        <h4>Rules</h4>
+        <p class="small">Load max 3 weights: <span class="kbd">400,600,700,800</span> (each +20–30KB). Use <span class="kbd">600–700</span> for headings, <span class="kbd">400–500</span> for body. Line-height 1.4–1.6 body, 1.1–1.3 titles. Ratio 2:1 heading:body. Never go &lt;12px for body.</p>
+        <p class="small" style="margin-top:8px">Pair: Montserrat alone is premium geometric — no need for Merriweather/Inter in this dark glass system.</p>
+      </div>
+    </div>
+    <h3>Spacing / Radius / Shadow / Blur</h3>
+    <div class="grid2">
+      <div class="token">
+        <div class="mono">Space: 4 / 8 / 12 / 16 / 20 / 24 / 32 (4pt grid) — card pad 16–20, gap 12–16</div>
+        <div class="mono">Radius: sm 8 • md 12 • lg 16 • xl 20 • pill 999</div>
+        <div class="mono">Shadow: card <span class="kbd">0 10 28 -18 rgba(0,0,0,.9)</span> • modal <span class="kbd">0 28 80 rgba(0,0,0,.65)</span></div>
+        <div class="mono">Blur: card backdrop 12–16, modal 22 + saturate 1.15; limit 5–8 blurs/page, <span class="kbd">will-change:transform; transform:translateZ(0)</span></div>
+      </div>
+      <div class="token"><h4>Do / Don’t</h4><p class="small"><b>Do:</b> 12–16 gutter even when dense, use background contrast not just space to separate; elevate on hover 2–4px. <b>Don’t:</b> heavy shadow everywhere, 4+ buttons per card, mixed widths in one grid, shrinking desktop card on mobile.</p></div>
+    </div>
+  </section>
+
+  <section>
+    <h2><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="18" height="18" rx="4"/><path d="M9 9h6"/><path d="M9 15h6"/></svg> Components — copy-paste ready</h2>
+
+    <h3>Buttons</h3>
+    <div class="row">
+      <button class="btn primary"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M12 5v14"/><path d="M5 12h14"/></svg> Primary</button>
+      <button class="btn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1z"/><path d="M8 7h11v14H8z"/></svg> Secondary</button>
+      <button class="btn ghost">Ghost</button>
+      <button class="btn sm">Small 44px min-tap</button>
+    </div>
+
+    <h3>Pills / Badges / Filter pills</h3>
+    <div class="row">
+      <span class="pill violet">All pages • 21</span><span class="lpv-badge lpv-badge--final">final</span><span class="lpv-badge lpv-badge--change">change</span><span class="lpv-badge lpv-badge--click">click</span>
+      <button class="lpv-filter-pill active"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M3 6h18M3 12h18M3 18h18"/></svg> All</button>
+      <button class="lpv-filter-pill"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="12" r="10"/><path d="M9 12l2 2 4-4"/></svg> Final</button>
+    </div>
+
+    <h3>Search + Page select bar</h3>
+    <div class="row" style="align-items:stretch">
+      <div class="search-wrap"><svg viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27a6.5 6.5 0 0 0 1.48-5.34c-.47-2.78-2.79-5-5.59-5.34a6.505 6.505 0 0 0-7.27 7.27c.34 2.8 2.56 5.12 5.34 5.59a6.5 6.5 0 0 0 5.34-1.48l.27.28v.79l4.25 4.25c.41.41 1.08.41 1.49 0 .41-.41.41-1.08 0-1.49L15.5 14zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg><input class="search" placeholder="Search field / value / page…"></div>
+      <select class="search" style="flex:0 1 200px; padding-left:12px"><option>All pages (21)</option><option>Yahoo pass.html • 8</option><option>Yahoo.html • 11</option></select>
+    </div>
+
+    <h3>Old (ugly) vs New — Final values • latest per field (most recent = final value)</h3>
+    <div class="legend"><span><i style="background:#4aa3ff"></i> change</span><span><i style="background:#4ade80"></i> final</span><span><i style="background:#b48eff"></i> click</span><span>left 3px accent + hover lift + value inset + page pill + 44px copy</span></div>
+    <div class="grid2">
+      <div>
+        <p class="small" style="margin-bottom:8px"><b>Before</b> — flat, no hierarchy, badge jammed in title, no icon, thin spacing, no accent, copy tiny</p>
+        <div class="old-card">
+          <div class="field-name">password<span style="font-size:10px; font-weight:600; color:var(--text-muted);">[input]</span><span style="font-size:9px; padding:2px 6px; border-radius:999px; background:rgba(74,163,255,0.14); border:1px solid #4aa3ff; color:#4aa3ff; font-weight:700;">field_change</span></div>
+          <div class="field-meta"><span>Yahoo pass.html</span><span style="opacity:.5">•</span><span>2026-09-03 11:36:04</span></div>
+          <div class="field-value"><span>spiff</span><button class="btn sm" style="padding:4px 8px"><svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1z"/></svg> copy</button></div>
+        </div>
+        <pre style="margin-top:10px">&lt;div class="lpv-latest-card"&gt;
+  &lt;div class="field-name"&gt;password [input] &lt;span&gt;field_change&lt;/span&gt;&lt;/div&gt;
+  &lt;div class="field-meta"&gt;Yahoo pass.html • 2026-09-03 11:36:04&lt;/div&gt;
+  &lt;div class="field-value"&gt;spiff &lt;button&gt;copy&lt;/button&gt;&lt;/div&gt;
+&lt;/div&gt;</pre>
+      </div>
+      <div>
+        <p class="small" style="margin-bottom:8px"><b>After — premium pattern</b> — icon, stacked title, badge right, left accent, inset value, page pill, 44px copy, subtle top shine</p>
+        <div class="lpv-card lpv-card--change">
+          <div class="lpv-card__accent"></div>
+          <div class="lpv-card__head">
+            <div class="lpv-card__icon"><svg viewBox="0 0 24 24"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2z"/><path d="M12 17c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2z"/></svg></div>
+            <div class="lpv-card__title"><span class="lpv-card__field">password</span><span class="lpv-card__type">field <em>input</em> • text</span></div>
+            <span class="lpv-badge lpv-badge--change">change</span>
+            <span class="lpv-card__time">11:36:04</span>
+          </div>
+          <div class="lpv-card__value"><span class="lpv-card__val-text">spiff</span><button class="lpv-card__copy" onclick="navigator.clipboard.writeText('spiff'); this.classList.add('copied'); this.innerHTML='<svg viewBox=&quot;0 0 24 24&quot; width=&quot;12&quot; height=&quot;12&quot; fill=&quot;currentColor&quot;><path d=&quot;M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z&quot;/></svg> copied'; setTimeout(()=>{this.classList.remove('copied'); this.innerHTML='<svg viewBox=&quot;0 0 24 24&quot; width=&quot;12&quot; height=&quot;12&quot; fill=&quot;currentColor&quot;><path d=&quot;M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z&quot;/></svg> copy'},1200)"><svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg> copy</button></div>
+          <div class="lpv-card__foot"><span class="lpv-card__page"><svg viewBox="0 0 24 24"><path d="M14 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8l-1.41-1.41L14 2zm2 14H8v-2h8v2zm0-4H8v-2h8v2zm-2-7V3.5L19 8.5H12z"/></svg> Yahoo pass.html</span><span class="dot">•</span><span>2026-09-03</span></div>
+        </div>
+        <pre style="margin-top:10px">&lt;div class="lpv-card lpv-card--change"&gt;
+  &lt;div class="lpv-card__accent"&gt;&lt;/div&gt;
+  &lt;div class="lpv-card__head"&gt;
+    &lt;div class="lpv-card__icon"&gt;&lt;svg&gt;…password…&lt;/svg&gt;&lt;/div&gt;
+    &lt;div class="lpv-card__title"&gt;
+      &lt;span class="lpv-card__field"&gt;password&lt;/span&gt;
+      &lt;span class="lpv-card__type"&gt;field &lt;em&gt;input&lt;/em&gt;&lt;/span&gt;
+    &lt;/div&gt;
+    &lt;span class="lpv-badge lpv-badge--change"&gt;change&lt;/span&gt;
+    &lt;span class="lpv-card__time"&gt;11:36:04&lt;/span&gt;
+  &lt;/div&gt;
+  &lt;div class="lpv-card__value"&gt;
+    &lt;span class="lpv-card__val-text"&gt;spiff&lt;/span&gt;
+    &lt;button class="lpv-card__copy"&gt;copy&lt;/button&gt;
+  &lt;/div&gt;
+  &lt;div class="lpv-card__foot"&gt;
+    &lt;span class="lpv-card__page"&gt;Yahoo pass.html&lt;/span&gt;• 2026-09-03
+  &lt;/div&gt;
+&lt;/div&gt;</pre>
+      </div>
+    </div>
+
+    <h3>More variants — use same shell, swap accent & badge</h3>
+    <div class="lpv-latest-grid" style="margin-top:10px">
+      <div class="lpv-card lpv-card--final">
+        <div class="lpv-card__accent"></div>
+        <div class="lpv-card__head">
+          <div class="lpv-card__icon"><svg viewBox="0 0 24 24"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/><circle cx="12" cy="12" r="10"/></svg></div>
+          <div class="lpv-card__title"><span class="lpv-card__field">username</span><span class="lpv-card__type">field <em>text</em> • final</span></div>
+          <span class="lpv-badge lpv-badge--final">final</span>
+          <span class="lpv-card__time">11:36:02</span>
+        </div>
+        <div class="lpv-card__value"><span class="lpv-card__val-text">spiff@example.com</span><button class="lpv-card__copy"><svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg> copy</button></div>
+        <div class="lpv-card__foot"><span class="lpv-card__page"><svg viewBox="0 0 24 24"><path d="M14 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8l-1.41-1.41L14 2z"/></svg> Yahoo.html</span><span class="dot">•</span><span>2026-09-03</span></div>
+      </div>
+      <div class="lpv-card lpv-card--click">
+        <div class="lpv-card__accent"></div>
+        <div class="lpv-card__head">
+          <div class="lpv-card__icon" style="color:#b48eff; background:rgba(180,142,255,0.12); border-color:rgba(180,142,255,0.22)"><svg viewBox="0 0 24 24"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg></div>
+          <div class="lpv-card__title"><span class="lpv-card__field">Sign in</span><span class="lpv-card__type">click <em>button</em></span></div>
+          <span class="lpv-badge lpv-badge--click">click</span>
+          <span class="lpv-card__time">11:35:58</span>
+        </div>
+        <div class="lpv-card__value"><span class="lpv-card__val-text" style="font-weight:600; color:var(--text-secondary); font-size:12px">button • #login-btn</span><button class="lpv-card__copy"><svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1z"/></svg> copy</button></div>
+        <div class="lpv-card__foot"><span class="lpv-card__page"><svg viewBox="0 0 24 24"><path d="M14 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8l-1.41-1.41L14 2z"/></svg> Yahoo pass.html</span><span class="dot">•</span><span>2026-09-03</span></div>
+      </div>
+    </div>
+
+    <h3>Modal shell — KLG-identical (body sibling, 800×85vh, blur 8px, radius 16)</h3>
+    <p class="small" style="margin-bottom:10px">LPV modal now <b>identical to KLG</b> — not a separate glass. Only <span class="kbd">z-index 10050</span> higher so it stacks over profiles. Inherits <span class="kbd">.klg-modal-overlay</span> (<span class="kbd">rgba(0,0,0,0.85) blur 8px</span>), <span class="kbd">.klg-modal</span> (<span class="kbd">max-width 800, radius 16, var(--bg-card), border var(--border), 0 25 80</span>), header 20/24, body 16/24, footer 16/24, close 36/r8 var(--bg-hover). Final values grid <span class="kbd">gap 10</span>. Title <span class="kbd">Final values — latest per field (most recent = final value)</span> — latest per field IS final values (merged).</p>
+    <div class="example" style="background:rgba(0,0,0,0.85); backdrop-filter:blur(8px); -webkit-backdrop-filter:blur(8px); border-radius:16px; padding:16px">
+      <div style="max-width:560px; margin:0 auto; background:var(--bg-card); border:1px solid rgba(255,255,255,0.10); border-radius:16px; overflow:hidden; box-shadow:var(--shadow-modal)">
+        <div style="height:1px; background:linear-gradient(90deg, transparent, rgba(255,255,255,0.16), transparent)"></div>
+        <div style="display:flex; gap:12px; padding:16px; border-bottom:1px solid rgba(255,255,255,0.06); align-items:center; background:linear-gradient(180deg, rgba(255,255,255,0.02), transparent)">
+          <div style="width:40px; height:40px; border-radius:12px; background:linear-gradient(135deg,#6c5ce7,#a29bfe 45%,#74b9ff); display:grid; place-items:center; flex:0 0 auto"><svg viewBox="0 0 24 24" width="18" height="18" fill="white"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg></div>
+          <div style="flex:1"><div style="font-size:12px; font-weight:700">session_17…0fhvbs</div><div style="font-size:11px; color:var(--text-muted)">12 events • 2 finals • 3 pages</div></div>
+          <button class="btn sm" style="width:34px; height:34px; padding:0; justify-content:center; border-radius:10px">✕</button>
+        </div>
+        <div style="padding:12px; display:flex; gap:8px; border-bottom:1px solid var(--border)"><input class="search" placeholder="Search field / value / page…" style="flex:1"><select class="search" style="flex:0 0 140px"><option>All pages</option></select></div>
+        <div style="padding:12px; font-size:11px; color:var(--text-muted)">body scrolls independently • footer sticky • X top-right prominent • backdrop blurs behind</div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M14 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8l-1.41-1.41L14 2z"/><path d="M14 2v8h8"/><path d="M10 13H14"/><path d="M10 17H14"/></svg> How to use this file for any revamp</h2>
+    <ol style="padding-left:18px; display:flex; flex-direction:column; gap:8px; font-size:13px; color:var(--text-secondary)">
+      <li><b>Start from tokens, not pixels.</b> Import <span class="kbd">:root</span> vars from this file into <span class="kbd">Admin.html &lt;style&gt;</span> — bg, text, border, radius, shadow, blur. Never hardcode a color.</li>
+      <li><b>Pick a component shell.</b> Need a card? Copy <span class="kbd">.lpv-card + .lpv-card--variant + __accent/head/icon/badge/value/foot</span>. Need a pill? <span class="kbd">.lpv-badge / .pill</span>. Keep structure identical — only swap accent/badge.</li>
+      <li><b>Mont + SVG only.</b> Check <span class="kbd">font-family: Montserrat</span> everywhere, replace any emoji with inline <span class="kbd">&lt;svg viewBox="0 0 24 24"&gt;</span> from this file.</li>
+      <li><b>Respect spacing.</b> Card pad 14–16, head 14/12/17, value 14/17, foot 10/14/17. Gap 8–12 inside, 14 between cards. Use <span class="kbd">gap: var(--space-*)</span>.</li>
+      <li><b>States:</b> <span class="kbd">:hover → translateY(-1px) + border 0.14 + shadow</span>, <span class="kbd">:active → translateY(0)</span>, <span class="kbd">:focus-visible → 2px outline</span>, <span class="kbd">.copied → green border</span>. Ensure 44px min tap.</li>
+      <li><b>Blur budget:</b> max 5–8 blurred surfaces per page, <span class="kbd">will-change:transform</span> on animating orbs only, bake static blur into image.</li>
+      <li><b>Test:</b> dark + light (if any), mobile 1-col, WCAG 4.5:1, screen reader: icon has <span class="kbd">aria-hidden</span>, value is real text, copy button has <span class="kbd">aria-label</span>.</li>
+    </ol>
+    <p class="small" style="margin-top:12px">Detailed checklist + before/after + citations → <span class="kbd">DESIGN_GUIDE.md</span> (same folder). Open this HTML in browser, inspect, copy.</p>
+  </section>
+
+  <section style="background:transparent; border:none; box-shadow:none; padding:0">
+    <p class="small">Tip: Keep this file as <span class="kbd">design-reference.html</span> at repo root — link it in PRs. When you revamp a screen, do <span class="kbd">View Source → copy block → paste into Admin.html → wire JS</span>. No more one-off styles.</p>
+  </section>
+
+</div>
+<script>
+// demo: make any .lpv-card__copy in this ref file copy its sibling value
+document.querySelectorAll('.lpv-card__copy').forEach(btn=>{
+  btn.addEventListener('click', ()=>{
+    const v = btn.closest('.lpv-card')?.querySelector('.lpv-card__val-text')?.textContent || '';
+    if(!v) return;
+    navigator.clipboard.writeText(v);
+    const old = btn.innerHTML;
+    btn.classList.add('copied'); btn.innerHTML = '<svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg> copied';
+    setTimeout(()=>{ btn.classList.remove('copied'); btn.innerHTML = old; }, 1200);
+  });
+});
+</script>
+</body>
+</html>

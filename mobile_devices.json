@@ -1,0 +1,195 @@
+{
+  "iphone_14_pro": {
+    "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Mobile/22D72 Safari/604.1",
+    "viewport": {
+      "width": 393,
+      "height": 852
+    },
+    "is_mobile": true,
+    "has_touch": true,
+    "platform": "iPhone",
+    "cpu_cores": 6,
+    "memory": 6,
+    "max_touch_points": 5,
+    "webgl_vendor": "Apple Inc.",
+    "webgl_renderer": "Apple GPU",
+    "fonts": [
+      "SF Pro Display",
+      "SF Pro Text",
+      "Helvetica Neue",
+      "Arial",
+      "Times New Roman"
+    ],
+    "screen_height": 800
+  },
+  "iphone_14": {
+    "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Mobile/22D72 Safari/604.1",
+    "viewport": {
+      "width": 390,
+      "height": 844
+    },
+    "is_mobile": true,
+    "has_touch": true,
+    "platform": "iPhone",
+    "cpu_cores": 6,
+    "memory": 4,
+    "max_touch_points": 5,
+    "webgl_vendor": "Apple Inc.",
+    "webgl_renderer": "Apple GPU",
+    "fonts": [
+      "SF Pro Display",
+      "SF Pro Text",
+      "Helvetica Neue",
+      "Arial",
+      "Times New Roman"
+    ],
+    "screen_height": 792
+  },
+  "galaxy_s23": {
+    "user_agent": "Mozilla/5.0 (Linux; Android 15; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Mobile Safari/537.36",
+    "viewport": {
+      "width": 384,
+      "height": 854
+    },
+    "is_mobile": true,
+    "has_touch": true,
+    "platform": "Linux; Android 15",
+    "cpu_cores": 8,
+    "memory": 8,
+    "max_touch_points": 5,
+    "webgl_vendor": "ARM",
+    "webgl_renderer": "Mali G78",
+    "fonts": [
+      "Roboto",
+      "Noto Sans",
+      "Helvetica Neue",
+      "Arial",
+      "Times New Roman"
+    ],
+    "screen_height": 800
+  },
+  "pixel_7": {
+    "user_agent": "Mozilla/5.0 (Linux; Android 15; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Mobile Safari/537.36",
+    "viewport": {
+      "width": 412,
+      "height": 915
+    },
+    "is_mobile": true,
+    "has_touch": true,
+    "platform": "Linux; Android 15",
+    "cpu_cores": 8,
+    "memory": 8,
+    "max_touch_points": 5,
+    "webgl_vendor": "Google Inc.",
+    "webgl_renderer": "Mali G78",
+    "fonts": [
+      "Roboto",
+      "Noto Sans",
+      "Helvetica Neue",
+      "Arial",
+      "Times New Roman"
+    ],
+    "screen_height": 860
+  },
+  "pixel_5": {
+    "user_agent": "Mozilla/5.0 (Linux; Android 15; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Mobile Safari/537.36",
+    "viewport": {
+      "width": 393,
+      "height": 851
+    },
+    "is_mobile": true,
+    "has_touch": true,
+    "platform": "Linux; Android 15",
+    "cpu_cores": 8,
+    "memory": 8,
+    "max_touch_points": 5,
+    "webgl_vendor": "Google Inc.",
+    "webgl_renderer": "Mali G78",
+    "fonts": [
+      "Roboto",
+      "Noto Sans",
+      "Helvetica Neue",
+      "Arial",
+      "Times New Roman"
+    ],
+    "screen_height": 800
+  },
+  "desktop": {
+    "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+    "viewport": {
+      "width": 1920,
+      "height": 1080
+    },
+    "is_mobile": false,
+    "has_touch": false
+  },
+  "windows_11_chrome": {
+    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+    "viewport": {
+      "width": 1920,
+      "height": 1080
+    },
+    "is_mobile": false,
+    "has_touch": false,
+    "platform": "Win32",
+    "oscpu": "Windows NT 10.0; Win64; x64",
+    "cpu_cores": 8,
+    "memory": 16,
+    "max_touch_points": 0,
+    "webgl_vendor": "Google Inc. (NVIDIA)",
+    "webgl_renderer": "NVIDIA GeForce GTX 1050 Ti Direct3D11 vs_5_0 ps_5_0",
+    "fonts": [
+      "Segoe UI",
+      "Arial",
+      "Times New Roman",
+      "Calibri",
+      "Consolas"
+    ]
+  },
+  "windows_11_edge": {
+    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 Edg/147.0.0.0",
+    "viewport": {
+      "width": 1920,
+      "height": 1080
+    },
+    "is_mobile": false,
+    "has_touch": false,
+    "platform": "Win32",
+    "oscpu": "Windows NT 10.0; Win64; x64",
+    "cpu_cores": 8,
+    "memory": 16,
+    "max_touch_points": 0,
+    "webgl_vendor": "Google Inc. (NVIDIA)",
+    "webgl_renderer": "NVIDIA GeForce GTX 1050 Ti Direct3D11 vs_5_0 ps_5_0",
+    "fonts": [
+      "Segoe UI",
+      "Arial",
+      "Times New Roman",
+      "Calibri",
+      "Consolas"
+    ]
+  },
+  "mac_chrome": {
+    "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+    "viewport": {
+      "width": 1920,
+      "height": 1080
+    },
+    "is_mobile": false,
+    "has_touch": false,
+    "platform": "MacIntel",
+    "oscpu": "Intel Mac OS X 10_15_7",
+    "cpu_cores": 8,
+    "memory": 16,
+    "max_touch_points": 0,
+    "webgl_vendor": "Google Inc. (Apple)",
+    "webgl_renderer": "Apple GPU",
+    "fonts": [
+      "SF Pro Display",
+      "SF Pro Text",
+      "Helvetica Neue",
+      "Arial",
+      "Times New Roman"
+    ]
+  }
+}

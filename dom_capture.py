@@ -1,0 +1,3420 @@
+"""DOM capture engine for remote browser sessions.
+
+Design
+------
+Two-tier live-mirror pipeline (see MIGRATION_LIVE_MIRROR.md):
+
+1. **Fast capture** (default, ``DOM_CAPTURE_MODE=fast``): a single
+   CSP-immune ``page.evaluate`` serializes the live DOM in-page
+   (live form state materialized, open shadow roots emitted as
+   declarative shadow DOM, same-origin canvases as data-URL images).
+   External asset URLs are rewritten server-side to the
+   content-addressed ``/assets/<hash>`` cache (fetch-once, immutable)
+   so recaptures render from the browser HTTP cache.  Interaction
+   recaptures skip the legacy load/networkidle settle entirely.
+
+2. **Legacy SingleFile** (``DOM_CAPTURE_MODE=singlefile``): the
+   bundled MV3 SingleFile extension inlines every asset into one
+   self-contained document.  Kept for archive flows (PCM page
+   manager / LPV store) where self-containment is the point, and as
+   the automatic fallback whenever the fast serializer comes back
+   degenerate.
+
+Between full captures an in-page MutationObserver (``LIVE_DELTA=1``)
+streams compact DOM ops (``dom_patch`` frames) which the client
+applies in place instead of rebuilding the snapshot iframe.  Node
+identity is carried by ``data-mid`` stamps assigned during
+serialization (WeakMap + counter page-side).
+
+Captures coalesce (``SEND_COALESCE=1``): at most one capture in
+flight per session; overlapping triggers produce exactly one
+follow-up send with the latest reason.  Unchanged-DOM checksums
+(``DOM_CAPTURE_SKIP_UNCHANGED=1``) suppress no-op recaptures before
+paying for them.
+
+The caller drives capture timing: explicitly call ``send_page``
+when you want a fresh snapshot (initial, on navigation, on
+demand).  Event handlers (handle_click / handle_navigation /
+handle_keypress / handle_submit_form) just dispatch to
+Playwright; they do not auto-capture.
+"""
+from __future__ import annotations
+
+import asyncio
+import base64
+import hashlib
+import json
+import logging
+import os
+import re
+import shutil
+import subprocess
+import time
+from collections import OrderedDict
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urljoin
+
+# Shared JSON helper for CDP evaluation payloads.
+_json = json
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Configuration (env-overridable)
+# ---------------------------------------------------------------------------
+
+PRE_CAPTURE_WAIT: float = float(os.environ.get("DOM_CAPTURE_PRE_CAPTURE_WAIT", "0.05"))
+SINGLEFILE_TIMEOUT_S: int = int(os.environ.get("DOM_CAPTURE_SINGLEFILE_TIMEOUT_S", "60"))
+
+# Minimum interval between interaction-triggered recaptures.  This is
+# purely a flood-control knob; it does NOT decide whether a click is
+# "real" -- that decision is made in the page by _INTERACTION_TRIGGER_JS.
+INTERACTION_CAPTURE_MIN_INTERVAL_S: float = float(
+    os.environ.get("DOM_CAPTURE_INTERACTION_MIN_INTERVAL_S", "0.25")
+)
+
+# Snapshot-mode interaction recapture cadence (bigger: every recapture is a
+# full snapshot, so flood control matters more than freshness).
+SNAPSHOT_CAPTURE_MIN_INTERVAL_S: float = float(
+    os.environ.get("DOM_SNAPSHOT_MIN_INTERVAL_S", "0.7")
+)
+
+# Hosts that keep the live delta (DOM-mutation) pipeline.  Everything else
+# uses snapshot mode: full baked captures only, no delta observer, no live
+# subframe dependence -- the "page snapshot / mhtml-style" default the user
+# asked for (heavy sites keep deltas: google/netflix/comcast/...).
+_LIVE_DOM_HOSTS_RAW = os.environ.get(
+    "DOM_LIVE_HOSTS", "google.com,netflix.com,comcast.com,youtube.com,gstatic.com"
+)
+_LIVE_DOM_HOSTS = tuple(
+    h.strip().lower() for h in _LIVE_DOM_HOSTS_RAW.split(",") if h.strip()
+)
+
+
+def prefer_snapshot_for_url(url: str) -> bool:
+    """True when the given URL should use snapshot-only captures (default),
+    False for the (small) list of hosts that keep delta updates."""
+    if not url:
+        return True
+    try:
+        from urllib.parse import urlparse
+        host = (urlparse(url if "://" in url else "https://" + url).hostname or "").lower()
+    except Exception:
+        host = ""
+    if not host:
+        return True
+    for h in _LIVE_DOM_HOSTS:
+        if host == h or host.endswith("." + h):
+            return False
+    return True
+
+
+
+# ---------------------------------------------------------------------------
+# Fast-capture pipeline (see MIGRATION_LIVE_MIRROR.md)
+# ---------------------------------------------------------------------------
+#
+# Capture backend for the LIVE victim mirror:
+#   fast        — in-page serializer + asset-cache rewrite (default)
+#   singlefile  — legacy SingleFile extension round-trip (pre-overhaul)
+# Archive flows (PCM page manager, LPV store) keep SingleFile regardless:
+# self-containment is the point there, not latency.
+DOM_CAPTURE_MODE: str = os.environ.get("DOM_CAPTURE_MODE", "fast").strip().lower()
+
+# Coalesce interaction captures: at most one capture in flight per session;
+# triggers that arrive mid-capture set a dirty bit and produce exactly one
+# follow-up send carrying the latest reason.
+SEND_COALESCE: bool = os.environ.get("SEND_COALESCE", "1").strip().lower() not in ("0", "false", "no", "off")
+
+# Skip the capture entirely when the cheap DOM checksum hasn't moved since
+# the last send (hover/poll re-triggers become no-ops).
+SKIP_UNCHANGED: bool = os.environ.get("DOM_CAPTURE_SKIP_UNCHANGED", "1").strip().lower() not in ("0", "false", "no", "off")
+
+# Live-delta layer: in-page MutationObserver streams compact DOM ops between
+# full captures; client applies them in place instead of rebuilding the iframe.
+LIVE_DELTA: bool = os.environ.get("LIVE_DELTA", "1").strip().lower() not in ("0", "false", "no", "off")
+
+# Debug/rollback: force the legacy "load + networkidle + readyState" settle
+# on EVERY capture, including interaction recaptures.
+FULL_SETTLE: bool = os.environ.get("DOM_CAPTURE_FULL_SETTLE", "").strip().lower() in ("1", "true", "yes", "on")
+
+# Asset-cache fetcher bounds (server-side fetch-once rewrite).
+# Raised from 48 -> 256: the cap silently dropped assets from heavy pages
+# (yahoo: half the stylesheets just never got fetched — the mirror lost
+# "some of the CSS").  256 covers real-world pages; env to tune down.
+ASSET_MAX_PER_PAGE: int = int(os.environ.get("DOM_CAPTURE_ASSET_MAX_PER_PAGE", "256"))
+ASSET_FETCH_TIMEOUT_S: float = float(os.environ.get("DOM_CAPTURE_ASSET_TIMEOUT_S", "6"))
+ASSET_MAX_BYTES: int = int(os.environ.get("DOM_CAPTURE_ASSET_MAX_BYTES", str(12 * 1024 * 1024)))
+CACHE_MAX_ITEMS: int = int(os.environ.get("DOM_CAPTURE_CACHE_MAX_ITEMS", "4000"))
+CACHE_MAX_BYTES: int = int(os.environ.get("DOM_CAPTURE_CACHE_MAX_BYTES", str(192 * 1024 * 1024)))
+
+# Images this size or smaller are EMBEDDED as data: URIs in the captured
+# HTML (logos, icons, SVGs, GIFs) instead of pointing at /assets/<hash> —
+# the mirror renders them even when the client can't reach the /assets
+# route (reverse proxies that only forward /ws, offline viewers, copied
+# HTML artifacts).  Larger images keep the cache path so recaptures don't
+# re-ship megabytes.  0 disables embedding entirely.
+EMBED_MAX_BYTES: int = int(os.environ.get("DOM_CAPTURE_EMBED_MAX_BYTES", str(1024 * 1024)))
+
+# Stylesheets this size or smaller are INLINED as <style> blocks in the
+# captured HTML (after their inner url()/@import refs are rewritten) instead
+# of staying <link href="/assets/<hash>"> — mirrored pages keep their CSS
+# even when the client can't reach the /assets route (yahoo-class pages
+# render naked without it).  Larger stylesheets keep the cache path.
+# 0 disables CSS inlining (back to pure cache refs).
+# 3 MB covers virtually every real stylesheet (app bundles included) — mirrors
+# must get ALL the CSS, since the client may not reach the /assets route.
+CSS_EMBED_MAX_BYTES: int = int(os.environ.get("DOM_CAPTURE_CSS_EMBED_MAX_BYTES", str(3 * 1024 * 1024)))
+
+
+_CSS_STYLE_CLOSE_RE = re.compile(r"</style", re.IGNORECASE)
+
+
+def _inline_css_safe(css_text: str) -> str:
+    """Make CSS safe to drop inside a <style> element: the HTML parser must
+    never see a literal '</style' from CSS strings/comments."""
+    return _CSS_STYLE_CLOSE_RE.sub("<\\/style", css_text)
+
+
+# ---------------------------------------------------------------------------
+# SingleFile source loading
+# ---------------------------------------------------------------------------
+
+_SINGLEFILE_SOURCES: Optional[Dict[str, str]] = None
+
+
+def _find_singlefile_lib_dir() -> Optional[Path]:
+    env_override = os.environ.get("SINGLEFILE_LIB_DIR")
+    if env_override:
+        p = Path(env_override)
+        if (p / "lib" / "single-file-script.js").is_file():
+            return p
+        logger.warning("SINGLEFILE_LIB_DIR=%r set but %s missing", env_override, p / "lib" / "single-file-script.js")
+
+    candidates: List[Path] = [
+        Path("/usr/lib/node_modules/single-file-cli"),
+        Path("/usr/local/lib/node_modules/single-file-cli"),
+        Path("/opt/homebrew/lib/node_modules/single-file-cli"),
+        Path.home() / ".npm-global" / "lib" / "node_modules" / "single-file-cli",
+        Path.home() / "n" / "lib" / "node_modules" / "single-file-cli",
+        Path.home() / ".linuxbrew" / "lib" / "node_modules" / "single-file-cli",
+    ]
+    nvm_root = Path.home() / ".nvm" / "versions" / "node"
+    if nvm_root.is_dir():
+        try:
+            for v in nvm_root.iterdir():
+                if v.is_dir():
+                    candidates.append(v / "lib" / "node_modules" / "single-file-cli")
+        except OSError:
+            pass
+    if os.name == "nt":
+        pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+        candidates.append(Path(pf) / "nodejs" / "node_modules" / "single-file-cli")
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            candidates.append(Path(appdata) / "npm" / "node_modules" / "single-file-cli")
+
+    for c in candidates:
+        try:
+            if (c / "lib" / "single-file-script.js").is_file():
+                return c
+        except (OSError, PermissionError):
+            continue
+
+    npm_path = shutil.which("npm")
+    if npm_path:
+        try:
+            out = subprocess.run([npm_path, "root", "-g"], capture_output=True, text=True, timeout=5)
+            if out.returncode == 0 and out.stdout.strip():
+                root = Path(out.stdout.strip()) / "single-file-cli"
+                if (root / "lib" / "single-file-script.js").is_file():
+                    return root
+        except Exception:
+            pass
+
+    logger.error(
+        "single-file-cli not found. Install with `npm install -g single-file-cli` "
+        "or set SINGLEFILE_LIB_DIR."
+    )
+    return None
+
+
+async def _load_singlefile_sources() -> Optional[Dict[str, str]]:
+    global _SINGLEFILE_SOURCES
+    if _SINGLEFILE_SOURCES is not None:
+        return _SINGLEFILE_SOURCES
+
+    lib_dir = _find_singlefile_lib_dir()
+    if lib_dir is None:
+        # Fallback: use the shipped MV3 extension's bundled SingleFile
+        # sources directly so library-injection still works even when
+        # `single-file-cli` is not installed (e.g. in minimal Docker).
+        # This keeps Yahoo / strict-CSP fallback from being "hrabbinyme"
+        # when only the extension is present.
+        try:
+            candidates = [
+                Path(__file__).resolve().parent / "single",
+                Path.cwd() / "single",
+                Path.home() / "shifixsxs" / "single",
+                Path("/home/user/shifixsxs/single"),
+            ]
+            env_dir = os.environ.get("SINGLEFILE_EXT_DIR", "").strip()
+            if env_dir:
+                candidates.insert(0, Path(env_dir))
+            ext_lib = None
+            for cand in candidates:
+                cand_lib = Path(os.path.abspath(cand)) / "lib"
+                if (cand_lib / "single-file.js").is_file() and (cand_lib / "single-file-hooks-frames.js").is_file():
+                    ext_lib = cand_lib
+                    break
+            if ext_lib is not None:
+                hook_src = (ext_lib / "single-file-hooks-frames.js").read_text(encoding="utf-8", errors="ignore")
+                main_src = (ext_lib / "single-file.js").read_text(encoding="utf-8", errors="ignore")
+                zip_candidates = [ext_lib / "single-file-zip.js", ext_lib / "single-file-zip.min.js"]
+                zip_src = ""
+                for zc in zip_candidates:
+                    if zc.is_file():
+                        zip_src = zc.read_text(encoding="utf-8", errors="ignore")
+                        break
+                if hook_src and main_src:
+                    _SINGLEFILE_SOURCES = {"hook": hook_src, "main": main_src, "zip": zip_src}
+                    logger.debug("SingleFile lib: using extension bundled sources (no CLI) from %s", ext_lib)
+                    return _SINGLEFILE_SOURCES
+        except Exception as _e:
+            logger.debug("SingleFile lib: extension fallback failed: %s", _e)
+        return None
+
+    script_path = lib_dir / "lib" / "single-file-script.js"
+    script_uri = script_path.resolve().as_uri()
+    extractor = (
+        "import * as sf from %r;"
+        "const o = {"
+        "  hook: await sf.getHookScriptSource(),"
+        "  main: await sf.getScriptSource({}),"
+        "  zip: await sf.getZipScriptSource()"
+        "};"
+        "process.stdout.write('###SPLIT###' + JSON.stringify(o) + '###END###');"
+    ) % script_uri
+
+    def _run() -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["node", "--input-type=module", "-e", extractor],
+            capture_output=True, text=True, timeout=30,
+        )
+
+    try:
+        result = await asyncio.to_thread(_run)
+    except Exception as exc:
+        logger.error("Failed to extract single-file sources: %s", exc)
+        return None
+
+    out = result.stdout or ""
+    if "###SPLIT###" not in out or "###END###" not in out:
+        logger.error("single-file source extraction malformed (rc=%s)", result.returncode)
+        return None
+
+    payload = out.split("###SPLIT###", 1)[1].rsplit("###END###", 1)[0]
+    try:
+        parsed = json.loads(payload)
+    except Exception as exc:
+        logger.error("Failed to parse single-file sources: %s", exc)
+        return None
+
+    if not (isinstance(parsed, dict) and parsed.get("hook") and parsed.get("main") and parsed.get("zip")):
+        logger.error("single-file sources payload missing required fields")
+        return None
+
+    _SINGLEFILE_SOURCES = parsed
+    return _SINGLEFILE_SOURCES
+
+
+# ---------------------------------------------------------------------------
+# Page helpers
+# ---------------------------------------------------------------------------
+
+async def _ensure_page_stable(page: Any) -> None:
+    """Best-effort wait for the page to settle.  Each step has a tight
+    timeout so a hung network request doesn't block the capture pipeline."""
+    try:
+        await page.wait_for_load_state("load", timeout=2500)
+    except Exception:
+        pass
+    try:
+        await page.wait_for_load_state("networkidle", timeout=2500)
+    except Exception:
+        pass
+    try:
+        await page.wait_for_function("document.readyState === 'complete'", timeout=1000)
+    except Exception:
+        pass
+    if PRE_CAPTURE_WAIT > 0:
+        await asyncio.sleep(PRE_CAPTURE_WAIT)
+
+
+# <base href="..."> injector.  SingleFile output usually has a <base> already;
+# we ensure the captured page's <head> has one so relative URLs in the
+# captured HTML resolve against the original page URL.
+_BASE_HREF_RE = re.compile(r"<base\b[^>]*\bhref=[\"'][^\"']*[\"'][^>]*>", re.IGNORECASE)
+
+# ---------------------------------------------------------------------------
+# Dead-subframe stripping
+# ---------------------------------------------------------------------------
+# When an iframe refuses to load (proxy block, X-Frame-Options, refused
+# connection — e.g. gpt.mail.yahoo.net), Chrome paints an error page inside
+# the frame ("<div id=\"sub-frame-error\"> ... refused to connect").  That
+# error markup must never reach the mirror: it renders as a broken page
+# island and the real frame content isn't there anyway.  Fast captures drop
+# such iframes in the serializer; this net covers SingleFile/delta-replayed
+# HTML too.  Same idea: whole chrome-error:// iframes and documents.
+
+def _strip_dead_subframes(html: str) -> str:
+    if not html:
+        return html
+    out = html
+    # whole chrome-error iframes
+    out = re.sub(r"<iframe\b[^>]*\bsrc=[\"\']chrome-error://[^\"\']*[\"\'][^>]*>(?:.*?</iframe>)?",
+                 "", out, flags=re.IGNORECASE | re.DOTALL)
+    # the #sub-frame-error block (two nested </div> closers)
+    out = re.sub(r"<div\b[^>]*\bid=[\"\']sub-frame-error[\"\'][^>]*>.*?</div>\s*</div>",
+                 "", out, flags=re.IGNORECASE | re.DOTALL)
+    return out
+
+
+def _inject_base_href(html: str, url: str) -> str:
+    if not html or not url:
+        return html
+    safe_url = url.replace('"', "&quot;")
+    base_tag = f'<base href="{safe_url}">'
+    if _BASE_HREF_RE.search(html):
+        return _BASE_HREF_RE.sub(base_tag, html, count=1)
+    m = re.search(r"<head\b[^>]*>", html, re.IGNORECASE)
+    if m:
+        return html[: m.end()] + base_tag + html[m.end() :]
+    m = re.search(r"<html\b[^>]*>", html, re.IGNORECASE)
+    if m:
+        return html[: m.end()] + "<head>" + base_tag + "</head>" + html[m.end() :]
+    return base_tag + html
+
+
+# ---------------------------------------------------------------------------
+# Mirror-font override (Montserrat)
+# ---------------------------------------------------------------------------
+# Every mirrored page is forced onto Montserrat so all kit pages share the
+# client's look regardless of the target's original webfonts.  Applied at
+# send time (after the asset rewrite, so the Google stylesheet is NOT routed
+# through /assets — the viewing browser resolves it directly).  The LPV live
+# view is untouched: it streams real screencast pixels.  Icon webfonts are
+# exempted — overriding their family would turn glyph pseudo-elements into
+# empty squares.
+
+_MIRROR_FONT_LINKS = (
+    '<link rel="preconnect" href="https://fonts.googleapis.com">'
+    '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>'
+    '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family='
+    'Montserrat:ital,wght@0,300;0,400;0,500;0,600;0,700;0,800;1,400&display=swap">'
+)
+_MIRROR_FONT_CSS = (
+    "<style>/* shfm-font */"
+    "html, body, body *, input, button, select, textarea, optgroup {\n"
+    "  font-family: 'Montserrat', -apple-system, BlinkMacSystemFont, 'Segoe UI',"
+    " Roboto, Helvetica, Arial, sans-serif !important;\n"
+    "}\n"
+    ".fa, .fas, .far, .fab, .fal, .fad { font-family: 'Font Awesome 5 Free',"
+    " 'Font Awesome 5 Brands', 'Font Awesome 6 Free', 'Font Awesome 6 Brands',"
+    " 'FontAwesome' !important; }\n"
+    ".glyphicon { font-family: 'Glyphicons Halflings' !important; }\n"
+    ".material-icons { font-family: 'Material Icons' !important; }\n"
+    ".material-icons-outlined { font-family: 'Material Icons Outlined' !important; }\n"
+    ".material-icons-rounded { font-family: 'Material Icons Round' !important; }\n"
+    ".material-icons-sharp { font-family: 'Material Icons Sharp' !important; }\n"
+    ".material-symbols-outlined { font-family: 'Material Symbols Outlined' !important; }\n"
+    ".material-symbols-rounded { font-family: 'Material Symbols Rounded' !important; }\n"
+    ".material-symbols-sharp { font-family: 'Material Symbols Sharp' !important; }\n"
+    ".ionicons, [class^='ion-'], [class^='ionicons '] { font-family: 'Ionicons' !important; }\n"
+    "</style>"
+)
+
+
+def _inject_mirror_font(html: str) -> str:
+    if not html:
+        return html
+    if "shfm-font" in html:  # idempotent: never double-inject (safe even if target uses Montserrat)
+        return html
+    blob = _MIRROR_FONT_LINKS + _MIRROR_FONT_CSS
+    m = re.search(r"</head\s*>", html, re.IGNORECASE)
+    if m:
+        return html[: m.start()] + blob + html[m.start() :]
+    return blob + html
+
+
+# ---------------------------------------------------------------------------
+# Content-addressed asset cache (server fetch-once ↔ /assets/<hash> endpoint)
+# ---------------------------------------------------------------------------
+
+class AssetEntry:
+    """One cached asset.  Fields match what api.py's /assets handler reads."""
+
+    __slots__ = ("data", "content_type", "size")
+
+    def __init__(self, data: bytes, content_type: str) -> None:
+        self.data = data
+        self.content_type = content_type or "application/octet-stream"
+        self.size = len(data)
+
+
+class AssetManager:
+    """In-memory content-addressed LRU cache for captured-page assets.
+
+    The capture pipeline rewrites external URLs in captured HTML to
+    ``/assets/<sha256>[.<ext>]``; api.py serves the bytes from here with
+    ``Cache-Control: immutable`` so the browser only ever fetches each
+    asset once.  Process-local; a restart simply refetches on demand.
+
+    Also keeps a URL→digest memo so that repeat captures (and assets that
+    get data-URI embedded instead of cached) reuse already-fetched bytes
+    without hitting the network again — the "fetch-once per URL" promise.
+    """
+
+    def __init__(self, max_items: int = CACHE_MAX_ITEMS, max_bytes: int = CACHE_MAX_BYTES) -> None:
+        self._items: "OrderedDict[str, AssetEntry]" = OrderedDict()
+        self._by_url: "OrderedDict[str, str]" = OrderedDict()   # abs_url -> digest
+        self._max_items = max_items
+        self._max_bytes = max_bytes
+        self._bytes = 0
+        self._hits = 0
+        self._misses = 0
+        self._evictions = 0
+        self._registered = 0
+
+    def register(self, data: bytes, content_type: str, url: Optional[str] = None) -> str:
+        """Store bytes under their sha256; returns the hex digest."""
+        digest = hashlib.sha256(data).hexdigest()
+        existing = self._items.get(digest)
+        if existing is not None:
+            # Refresh LRU position; first content_type wins.
+            self._items.move_to_end(digest)
+        else:
+            entry = AssetEntry(data, content_type)
+            self._items[digest] = entry
+            self._bytes += entry.size
+            self._registered += 1
+        if url:
+            self._by_url[url] = digest
+            self._by_url.move_to_end(url)
+        # Evict LRU until within both bounds.
+        while self._items and (len(self._items) > self._max_items or self._bytes > self._max_bytes):
+            evict_digest, ev = self._items.popitem(last=False)
+            self._bytes -= ev.size
+            self._evictions += 1
+            for u, d in list(self._by_url.items()):
+                if d == evict_digest:
+                    del self._by_url[u]
+        while len(self._by_url) > self._max_items:
+            self._by_url.popitem(last=False)
+        return digest
+
+    def get(self, digest: str) -> Optional[AssetEntry]:
+        entry = self._items.get(digest)
+        if entry is None:
+            self._misses += 1
+            return None
+        self._hits += 1
+        self._items.move_to_end(digest)
+        return entry
+
+    def get_by_url(self, url: str) -> Optional[AssetEntry]:
+        digest = self._by_url.get(url)
+        if not digest:
+            return None
+        return self.get(digest)
+
+    def digest_for(self, data: bytes) -> str:
+        return hashlib.sha256(data).hexdigest()
+
+    async def clear(self) -> None:
+        self._items.clear()
+        self._by_url.clear()
+        self._bytes = 0
+
+    def stats(self) -> Dict[str, Any]:
+        return {
+            "items": len(self._items),
+            "url_entries": len(self._by_url),
+            "bytes": self._bytes,
+            "max_items": self._max_items,
+            "max_bytes": self._max_bytes,
+            "hits": self._hits,
+            "misses": self._misses,
+            "evictions": self._evictions,
+            "registered": self._registered,
+        }
+
+
+_GLOBAL_ASSET_MANAGER: Optional[AssetManager] = None
+
+
+def get_global_asset_manager() -> AssetManager:
+    """Process-wide singleton used by the capture pipeline and /assets."""
+    global _GLOBAL_ASSET_MANAGER
+    if _GLOBAL_ASSET_MANAGER is None:
+        _GLOBAL_ASSET_MANAGER = AssetManager()
+    return _GLOBAL_ASSET_MANAGER
+
+
+_MIME_TO_EXT = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/gif": "gif",
+    "image/webp": "webp",
+    "image/svg+xml": "svg",
+    "image/x-icon": "ico",
+    "image/bmp": "bmp",
+    "text/css": "css",
+    "application/javascript": "js",
+    "text/javascript": "js",
+    "application/json": "json",
+    "font/woff": "woff",
+    "font/woff2": "woff2",
+    "font/ttf": "ttf",
+    "font/otf": "otf",
+    "application/font-woff": "woff",
+    "application/font-woff2": "woff2",
+    "application/vnd.ms-fontobject": "eot",
+}
+
+
+def _guess_ext_from_content_type(content_type: str) -> str:
+    """Reverse of api.py's _EXT_TO_MIME fallback table."""
+    return _MIME_TO_EXT.get((content_type or "").split(";", 1)[0].strip().lower(), "")
+
+
+# ---------------------------------------------------------------------------
+# Fast in-page serializer
+# ---------------------------------------------------------------------------
+#
+# One CSP-immune evaluate (Runtime.callFunctionOn) serializes the live DOM
+# to HTML.  Compared to SingleFile it is ~100x faster because it does NOT
+# fetch/inline resources: external URLs stay URLs and are rewritten into
+# the asset cache server-side.  Fidelity rules:
+#   * live form state (input.value / checked / option.selected / textarea)
+#     is materialized into attributes/text so the mirror renders what the
+#     victim sees;
+#   * open shadow roots serialize as declarative shadow DOM
+#     (<template shadowrootmode>); closed roots become a marker comment;
+#   * same-origin canvases are rasterized to data-URL <img>; tainted ones
+#     are left as-is;
+#   * <base> tags are dropped (the server injects its own);
+#   * when deltaIds is on, every element is stamped with a stable
+#     data-mid from a page-lifetime WeakMap — the delta observer reuses
+#     the same ids so client patches address the right nodes after a
+#     full resync.
+_FAST_SERIALIZE_JS = r"""
+(params) => {
+  const deltaIds = !!(params && params.deltaIds);
+  const MID = 'data-mid';
+  if (deltaIds) {
+    if (!window.__domMidMap) window.__domMidMap = new WeakMap();
+    if (!window.__domMidNext) window.__domMidNext = 1;
+  }
+  const escText = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const escAttr = (s) => String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+  // CSS-in-JS / constructable stylesheets (styled-components SSR-mode,
+  // Lit, MUI, Tailwind JIT injectors): rules living in
+  // ``adoptedStyleSheets`` have NO DOM node, so plain HTML serialization
+  // loses them.  We re-materialize them as <style> elements.
+  const adoptedCss = (root) => {
+    try {
+      const sheets = root.adoptedStyleSheets || [];
+      let css = '';
+      for (const sh of sheets) {
+        try { for (const r of sh.cssRules) css += r.cssText + '\n'; } catch (e) { /* cross-origin sheet */ }
+      }
+      return css;
+    } catch (e) { return ''; }
+  };
+  const adoptedStyleTag = (css) => css
+    ? '<style data-shf-adopted="1">' + css.replace(/<\//g, '<\\/') + '</style>'
+    : '';
+  // SingleFile technique: the CSSOM is the truth, DOM text is stale.
+  // <style> elements carry their ORIGINAL text even after page scripts
+  // insertRule()/deleteRule(); sheet.cssRules reflects the ACTUAL current
+  // cascade.  <link> stylesheets that are readable (same-origin or
+  // CORS-allowed) get materialized inline with recursive @import
+  // expansion, so their styling ships without a network fetch at all.
+  const rulesToCss = (rules, depth) => {
+    let css = '';
+    try {
+      for (const r of (rules || [])) {
+        if (r && r.type === 3 /* CSSRule.IMPORT_RULE */) {
+          try {
+            if (depth < 3 && r.styleSheet && r.styleSheet.cssRules) {
+              css += rulesToCss(r.styleSheet.cssRules, depth + 1);
+              continue;
+            }
+          } catch (e) { /* cross-origin import */ }
+        }
+        css += (r ? r.cssText : '') + '\n';
+      }
+    } catch (e) { /* sheet vanished */ }
+    return css;
+  };
+  const liveSheetCss = (sheet) => {
+    try { return (sheet && sheet.cssRules) ? rulesToCss(sheet.cssRules, 0) : ''; }
+    catch (e) { return ''; }  // SecurityError on cross-origin sheets
+  };
+  const styleSafe = (css) => css.replace(/<\//g, '<\\/');
+
+  const VOID = new Set(['area','base','br','col','embed','hr','img','input','link','meta','param','source','track','wbr']);
+  const attrsFor = (el, tag) => {
+    let s = '';
+    const list = el.attributes;
+    for (let i = 0; i < list.length; i++) {
+      const a = list[i];
+      const n = a.name;
+      if (n === MID) continue;
+      // NO page modifications (policy): attributes go out EXACTLY as the
+      // site authored them — nothing materialized from live JS state.
+      s += ' ' + n + '="' + escAttr(a.value) + '"';
+    }
+    if (deltaIds) {
+      let m = window.__domMidMap.get(el);
+      if (!m) { m = window.__domMidNext++; window.__domMidMap.set(el, m); }
+      s += ' ' + MID + '="' + m + '"';
+    }
+    return s;
+  };
+  const serialize = (node, out) => {
+    const t = node.nodeType;
+    if (t === 3) { out.push(escText(node.nodeValue)); return; }
+    if (t === 8) { out.push('<!--', String(node.nodeValue).replace(/--/g, '--'), '-->'); return; }
+    if (t !== 1) return;
+    const el = node;
+    const tag = (el.localName || el.tagName.toLowerCase());
+    if (tag === 'base') return;   // server injects its own <base href>
+    if (tag === 'iframe') {
+      // Frames that wouldn't load must never reach the mirror (user policy):
+      //   * chrome-error documents (refused/blocked server-side) -> delete.
+      //   * cross-origin frames would fail to embed from the mirrored
+      //     page's origin anyway (X-Frame-Options / frame-ancestors) and
+      //     render as "refused to connect" error islands -> delete.
+      //   * same-origin / about: / srcdoc frames are kept.
+      let dead = false;
+      try {
+        const d = el.contentDocument;
+        if (d && d.URL && d.URL.indexOf('chrome-error:') === 0) dead = true;
+      } catch (e) { /* cross-origin child document: unreadable */ }
+      if (dead) return;
+      const fsrc = el.src || el.getAttribute('src') || '';
+      if (fsrc && fsrc.indexOf('about:') !== 0) {
+        try {
+          const loc = document.location;
+          if (new URL(fsrc, loc.href).origin !== loc.origin) return;
+        } catch (e) { /* unparseable src -> keep */ }
+      }
+    }
+    // Same-origin <link rel=stylesheet> -> materialize from the CSSOM
+    // (SingleFile's live-read); cross-origin links stay links and go
+    // through the server-side asset cache instead.
+    if (tag === 'link') {
+      const rel = (el.getAttribute('rel') || '').toLowerCase();
+      const asA = (el.getAttribute('as') || '').toLowerCase();
+      const onload = el.getAttribute('onload') || '';
+      // Async-CSS patterns that NEVER fire without JS (no-JS mirror):
+      //   <link rel="preload" as="style" onload="this.rel='stylesheet'">
+      //   <link rel="stylesheet" media="print" onload="this.media='all'">
+      // Detect them as stylesheets too, or normalize the rel/media below.
+      const styleish = rel.indexOf('stylesheet') !== -1
+        || (rel.indexOf('preload') !== -1 && asA === 'style');
+      if (styleish && !el.disabled) {
+        const css = liveSheetCss(el.sheet);
+        if (css) {
+          const media = el.getAttribute('media');
+          out.push('<style data-shf-fromlink="1"',
+                   media ? ' media="' + escAttr(media) + '"' : '',
+                   (el.title ? ' title="' + escAttr(el.title) + '"' : ''),
+                   '>', styleSafe(css), '</style>');
+          return;
+        }
+        // Not readable from the CSSOM (cross-origin) — emit a WORKING
+        // stylesheet link so the mirror browser loads it directly:
+        // rel is always stylesheet, swapped media becomes 'all', the
+        // onload swapper is dropped.
+        const href = el.getAttribute('href');
+        if (href) {
+          const media = /media\s*=/.test(onload) ? 'all' : el.getAttribute('media');
+          const xo = el.getAttribute('crossorigin');
+          out.push('<link rel="stylesheet" href="', escAttr(href), '"',
+                   media ? ' media="' + escAttr(media) + '"' : '',
+                   xo ? ' crossorigin="' + escAttr(xo) + '"' : '', '>');
+          return;
+        }
+      }
+    }
+    // Images: pick the URL the PAGE would actually display.  Lazy-load
+    // libraries (react-lazyload & co.) leave src empty / a 1x1 gif and
+    // swap via JS that never runs in the no-JS mirror.
+    if (tag === 'img') {
+      let pick = '';
+      try { pick = el.currentSrc || ''; } catch (e) { /* not ready */ }
+      const authored = el.getAttribute('src') || '';
+      if (!pick) pick = authored;
+      if (!pick || pick.indexOf('data:image/gif') === 0 || pick === 'about:blank') {
+        pick = el.getAttribute('data-src') || el.getAttribute('data-original')
+            || el.getAttribute('data-lazy-src') || el.getAttribute('data-image') || pick;
+      }
+      if (!pick) {
+        const ss = el.getAttribute('srcset') || el.getAttribute('data-srcset') || '';
+        if (ss) pick = ss.split(',')[0].trim().split(/\s+/)[0];
+      }
+      out.push('<img');
+      const list2 = el.attributes;
+      for (let i = 0; i < list2.length; i++) {
+        const a = list2[i];
+        if (a.name === 'src' || a.name === 'srcset' || a.name === MID) continue;
+        if (a.name.indexOf('data-src') === 0 || a.name.indexOf('data-original') === 0
+            || a.name.indexOf('data-lazy') === 0 || a.name === 'data-image') continue;
+        out.push(' ', a.name, '="', escAttr(a.value), '"');
+      }
+      if (deltaIds) {
+        let m2 = window.__domMidMap.get(el);
+        if (!m2) { m2 = window.__domMidNext++; window.__domMidMap.set(el, m2); }
+        out.push(' ', MID, '="', String(m2), '"');
+      }
+      if (pick) out.push(' src="', escAttr(pick), '"');
+      out.push('>');
+      return;
+    }
+    out.push('<', tag);
+    out.push(attrsFor(el, tag));
+    out.push('>');
+    if (VOID.has(tag)) return;
+    if (tag === 'script' || tag === 'style') {
+      let raw;
+      if (tag === 'style') {
+        // CSSOM wins over stale DOM text (script-mutated sheets).
+        raw = liveSheetCss(el.sheet) || el.textContent || '';
+        raw = styleSafe(raw);
+      } else {
+        raw = (el.textContent || '').replace(/<\/script/gi, '<\\/script');
+      }
+      out.push(raw, '</', tag, '>');
+      return;
+    }
+    const sr = el.shadowRoot;
+    if (sr) {
+      if (sr.mode === 'open') {
+        out.push('<template shadowrootmode="open">');
+        const srCss = adoptedCss(sr);
+        if (srCss) out.push(adoptedStyleTag(srCss));
+        for (const c of sr.childNodes) serialize(c, out);
+        out.push('</template>');
+      } else {
+        out.push('<!--shifix:closed-shadow-->');
+      }
+    }
+    for (const c of el.childNodes) serialize(c, out);
+    out.push('</', tag, '>');
+  };
+  const de = document.documentElement;
+  if (!de) return null;
+  const out = [];
+  out.push('<!DOCTYPE html>\n');
+  serialize(de, out);
+  let html = out.join('');
+  const docCss = adoptedCss(document);
+  if (docCss) {
+    const tag = adoptedStyleTag(docCss);
+    html = /<head[^>]*>/i.test(html)
+      ? html.replace(/<head[^>]*>/i, (m) => m + tag)
+      : html.replace(/<html[^>]*>/i, (m) => m + tag);
+  }
+  return html;
+}
+"""
+
+
+# The serializer invoked as an IIFE expression (NOT as a function+args
+# callFunctionOn payload).  This makes Playwright and raw-CDP (SB) evaluate
+# it through the IDENTICAL mechanism (Runtime.evaluate-compatible) — the
+# callFunctionOn function+arguments shape is where the two backends
+# diverged on the live box (fast capture returned None on SB).
+_FAST_SERIALIZE_CALL_JS = (
+    "(() => { const fn = "
+    + _FAST_SERIALIZE_JS
+    + "; return fn(" + _json.dumps({"deltaIds": bool(LIVE_DELTA)}) + "); })();"
+)
+
+# Last fast-capture failure, surfaced by capture_page when all tiers fail
+# (kept at module level: _capture_fast is a plain function).
+_LAST_FAST_CAPTURE_ERROR: str = ""
+
+
+async def _capture_fast(page: Any) -> Optional[str]:
+    """Serialize the live DOM in-page via one evaluate round-trip.
+
+    Returns the HTML string (NOT yet base-href/asset rewritten), or None
+    when the page/evaluate is unavailable — the caller decides whether to
+    fall back to SingleFile / outerHTML.
+    """
+    global _LAST_FAST_CAPTURE_ERROR
+    if page is None:
+        _LAST_FAST_CAPTURE_ERROR = "page is None"
+        return None
+    try:
+        url = page.url
+    except Exception as exc:
+        _LAST_FAST_CAPTURE_ERROR = f"page.url unreadable: {exc}"
+        return None
+    if not url:
+        _LAST_FAST_CAPTURE_ERROR = "empty page url"
+        return None
+    try:
+        html = await page.evaluate(_FAST_SERIALIZE_CALL_JS)
+    except Exception as exc:
+        _LAST_FAST_CAPTURE_ERROR = f"evaluate: {exc}"
+        logger.debug("dc fast serializer evaluate failed: %s", exc)
+        return None
+    if not isinstance(html, str) or not html:
+        _LAST_FAST_CAPTURE_ERROR = f"serializer returned {type(html).__name__} (empty)"
+        return None
+    return html
+
+
+# Cheap DOM checksum for the unchanged-skip.  Deliberately NOT computed
+# from the serialized HTML (that would defeat the point — serialization
+# is the expensive part we are trying to skip).  Node count + text length
+# + scroll height catches every user-visible class of change on mirrored
+# pages (element churn, text updates, reflow) at O(1)-ish cost.
+_DOM_CHECKSUM_JS = r"""
+() => {
+  const de = document.documentElement;
+  if (!de) return '';
+  const els = de.getElementsByTagName('*').length;
+  const tl = de.textContent ? de.textContent.length : 0;
+  const sh = de.scrollHeight | 0;
+  return els + ':' + tl + ':' + sh;
+}
+"""
+
+
+_COLD_REASONS = frozenset((
+    "click", "mouseup", "text", "keydown", "touchend", "tap", "delta_overflow",
+))
+
+
+def _settle_for_reason(reason: Optional[str]) -> str:
+    """Map a capture reason to a settle level.
+
+    Interaction-driven recaptures ("interaction:*", input forwards,
+    coalesced follow-ups, delta overflow) snapshot a page that is already
+    live — the legacy load/networkidle waits were pure latency.  Initial
+    loads and navigations get a light readyState wait so the client never
+    sees a parsing document.  DOM_CAPTURE_FULL_SETTLE=1 reverts globally.
+    """
+    if FULL_SETTLE:
+        return "full"
+    if not reason:
+        return "light"
+    r = reason.lower()
+    if r.startswith(("interaction:", "coalesce:")) or r in _COLD_REASONS:
+        return "none"
+    return "light"
+
+
+# ---------------------------------------------------------------------------
+# Asset rewrite: external URLs -> /assets/<sha256>[.<ext>]
+# ---------------------------------------------------------------------------
+#
+# Only applied to FAST captures.  SingleFile output is self-contained
+# already.  Every fetch is bounded (per-asset timeout + max bytes +
+# max-per-page fan-in + global time budget); any fetch failure simply
+# leaves the original URL in place — the injected <base href> then
+# resolves it against the origin, exactly like the pre-cache behavior.
+
+_IMG_SRC_RE = re.compile(r'(<img\b[^>]*?\ssrc\s*=\s*)(["\'])([^"\']*)\2', re.IGNORECASE)
+_SCRIPT_SRC_RE = re.compile(r'(<script\b[^>]*?\ssrc\s*=\s*)(["\'])([^"\']*)\2', re.IGNORECASE)
+_LINK_TAG_RE = re.compile(r'<link\b[^>]*?>', re.IGNORECASE)
+_LINK_ATTR_RE = re.compile(r'(\w[\w-]*)\s*=\s*(["\'])([^"\']*)\2')
+_LINK_CACHEABLE_REL_RE = re.compile(r'(stylesheet|icon|apple-touch-icon|mask-icon|manifest|shortcut)', re.IGNORECASE)
+_CSS_URL_RE = re.compile(r'url\(\s*(["\']?)([^"\')\s][^"\')]*?)\1\s*\)', re.IGNORECASE)
+_CSS_IMPORT_RE = re.compile(r'@import\s+(?:url\(\s*)?(["\'])([^"\']+)\1', re.IGNORECASE)
+_REWRITE_GLOBAL_BUDGET_S: float = float(os.environ.get("DOM_CAPTURE_ASSET_TOTAL_TIMEOUT_S", "10"))
+
+# Chrome UA fallback for cache fetches (real UA pulled from the page).
+_FETCH_UA_FALLBACK = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+
+def _data_uri(data: bytes, content_type: str) -> str:
+    """data: URI for small embedded assets (images/logos/SVGs/fonts)."""
+    ct = (content_type or "").split(";")[0].strip() or "application/octet-stream"
+    return f"data:{ct};base64,{base64.b64encode(data).decode('ascii')}"
+
+
+def _resolvable_url(ref: str, base_url: str) -> Optional[str]:
+    """Absolute http(s) URL for a page ref, or None when not cacheable."""
+    if not ref:
+        return None
+    ref = ref.strip()
+    if not ref or ref.startswith(('#', 'data:', 'blob:', 'javascript:', 'mailto:', 'tel:', 'about:', '/assets/')):
+        return None
+    abs_url = urljoin(base_url, ref)
+    if not abs_url.lower().startswith(('http://', 'https://')):
+        return None
+    return abs_url
+
+
+async def _fetch_one_asset(client: Any, sem: asyncio.Semaphore, abs_url: str) -> Optional[Tuple[bytes, str]]:
+    """Fetch one asset body with hard bounds.  None on any failure."""
+    async with sem:
+        try:
+            resp = await client.get(abs_url, timeout=ASSET_FETCH_TIMEOUT_S)
+            if resp.status_code >= 400:
+                return None
+            data = resp.content
+            if not data or len(data) > ASSET_MAX_BYTES:
+                return None
+            ctype = (resp.headers.get("content-type") or "").split(";")[0].strip().lower()
+            return (data, ctype)
+        except Exception:
+            return None
+
+
+async def _cache_css_text(css_text: str, css_abs_url: str, client: Any, sem: asyncio.Semaphore,
+                          manager: AssetManager, depth: int) -> bytes:
+    """Fetch+rewrite the resources referenced by a CSS body, recursively
+    (bounded depth), then return the rewritten CSS bytes.  Small image/font
+    refs are data-URI embedded (logo-in-CSS case); larger refs and nested
+    stylesheets go through the /assets cache."""
+    if depth > 2:
+        return css_text.encode("utf-8", errors="ignore")
+
+    refs: List[str] = []
+    for m in _CSS_URL_RE.finditer(css_text):
+        refs.append(m.group(2))
+    for m in _CSS_IMPORT_RE.finditer(css_text):
+        refs.append(m.group(2))
+    uniq: List[str] = []
+    seen = set()
+    for ref in refs:
+        abs_u = _resolvable_url(ref, css_abs_url)
+        if abs_u and abs_u not in seen:
+            seen.add(abs_u)
+            uniq.append(abs_u)
+    uniq = uniq[:96]  # was 24: inner CSS refs (sprites/fonts) were dropped on heavy pages
+
+    results = await asyncio.gather(*(_fetch_one_asset(client, sem, u) for u in uniq))
+    repl: Dict[str, str] = {}
+    for abs_u, res in zip(uniq, results):
+        if not res:
+            continue
+        data, ctype = res
+        # Nested stylesheet?  Recurse so its url()s also resolve locally.
+        is_css_ref = ctype in ("text/css", "") or abs_u.lower().split("?", 1)[0].endswith(".css")
+        if is_css_ref and depth < 2:
+            try:
+                sub_text = data.decode("utf-8", errors="ignore")
+                data = await _cache_css_text(sub_text, abs_u, client, sem, manager, depth + 1)
+                ctype = "text/css"
+            except Exception:
+                pass
+            # Small nested css embeds as a data: URI (works in @import and
+            # url()) so an inlined parent <style> stays fully self-contained.
+            if CSS_EMBED_MAX_BYTES > 0 and len(data) <= CSS_EMBED_MAX_BYTES:
+                manager.register(data, ctype, url=abs_u)
+                repl[abs_u] = _data_uri(data, ctype)
+                continue
+            digest = manager.register(data, ctype, url=abs_u)
+            ext = _guess_ext_from_content_type(ctype)
+            repl[abs_u] = f"/assets/{digest}{'.' + ext if ext else ''}"
+            continue
+        # Small image/font refs: embed as data URI.
+        if (EMBED_MAX_BYTES > 0 and len(data) <= EMBED_MAX_BYTES
+                and (ctype.startswith(("image/", "font/", "application/font")) or not ctype)):
+            manager.register(data, ctype, url=abs_u)
+            repl[abs_u] = _data_uri(data, ctype)
+            continue
+        digest = manager.register(data, ctype, url=abs_u)
+        ext = _guess_ext_from_content_type(ctype)
+        repl[abs_u] = f"/assets/{digest}{'.' + ext if ext else ''}"
+
+    def _sub_url(m: "re.Match[str]") -> str:
+        orig = m.group(2)
+        abs_u = _resolvable_url(orig, css_abs_url)
+        new = repl.get(abs_u) if abs_u else None
+        if not new:
+            return m.group(0)
+        return m.group(0).replace(orig, new, 1)
+
+    def _sub_import(m: "re.Match[str]") -> str:
+        orig = m.group(2)
+        abs_u = _resolvable_url(orig, css_abs_url)
+        new = repl.get(abs_u) if abs_u else None
+        if not new:
+            return m.group(0)
+        return m.group(0).replace(orig, new, 1)
+
+    css_text = _CSS_URL_RE.sub(_sub_url, css_text)
+    css_text = _CSS_IMPORT_RE.sub(_sub_import, css_text)
+    return css_text.encode("utf-8", errors="ignore")
+
+
+# Strip JavaScript from captured pages (default ON, user-requested:
+# "html and css only").  The mirror is a RENDERER: the Playwright page
+# already ran all page JS, and every interaction is relayed to it, so
+# scripts baked into the capture only re-run in the viewer's context and
+# build URLs against the VIEWER'S origin (blob: docs inherit it) — the
+# root of the glued-host sub-frame failures.  Everything visual is
+# already in the DOM we captured; JS in the mirror is pure harm.
+DOM_CAPTURE_STRIP_SCRIPTS: bool = os.environ.get("DOM_CAPTURE_STRIP_SCRIPTS", "1") not in ("0", "false", "False")
+
+_SCRIPT_TAG_RE = re.compile(
+    r"<script\b[^>]*(?:/>|>[\s\S]*?</script\s*>)",
+    re.IGNORECASE,
+)
+
+
+def _strip_script_tags(html: str) -> str:
+    """Remove all <script> elements from captured HTML. HTML spec: script
+    bodies are raw-text until the FIRST literal '</script', so a
+    non-greedy match is spec-correct ('<\\/script>' escapes in JS strings
+    are exactly that — escaped — and cannot appear raw)."""
+    if not html:
+        return html
+    out, n = _SCRIPT_TAG_RE.subn("", html)
+    if n:
+        logger.debug("strip-scripts: removed %d <script> element(s) from capture", n)
+    return out
+
+
+async def _rewrite_assets_to_cache(html: str, base_url: str, page: Any = None) -> Tuple[str, List[Dict[str, Any]]]:
+    """Resolve external asset refs in captured HTML: small images/icons are
+    data-URI EMBEDDED (see EMBED_MAX_BYTES), small stylesheets become inline
+    <style> blocks with their inner refs rewritten (CSS_EMBED_MAX_BYTES),
+    scripts/large media/large stylesheets go to the fetch-once
+    ``/assets/<sha256>[.<ext>]`` cache.
+
+    Returns ``(new_html, assets_meta)`` where assets_meta lists only the
+    /assets-path refs (client pre-warms those; embedded refs need nothing).
+    Any fetch failure leaves the original URL — the injected <base href>
+    then resolves it against the origin exactly like pre-cache behavior.
+    ``ImportError`` (no httpx) propagates so the caller can kill-switch.
+    """
+    manager = get_global_asset_manager()
+
+    # -- 1. Collect refs with kinds --------------------------------------
+    candidates: List[str] = []
+    kind_by_url: Dict[str, str] = {}
+    seen: set = set()
+
+    def _add(ref: str, kind: str) -> None:
+        abs_u = _resolvable_url(ref, base_url)
+        if abs_u and abs_u not in seen:
+            seen.add(abs_u)
+            candidates.append(abs_u)
+            kind_by_url[abs_u] = kind
+
+    for m in _IMG_SRC_RE.finditer(html):
+        _add(m.group(3), "img")
+    if not DOM_CAPTURE_STRIP_SCRIPTS:
+        for m in _SCRIPT_SRC_RE.finditer(html):
+            _add(m.group(3), "script")
+    for tm in _LINK_TAG_RE.finditer(html):
+        tag = tm.group(0)
+        rel = None
+        href = None
+        for am in _LINK_ATTR_RE.finditer(tag):
+            name = am.group(1).lower()
+            if name == "rel":
+                rel = am.group(3)
+            elif name == "href":
+                href = am.group(3)
+        if rel and href and _LINK_CACHEABLE_REL_RE.search(rel):
+            rel_l = rel.lower()
+            kind = "css" if "stylesheet" in rel_l else ("icon" if "icon" in rel_l else "other")
+            _add(href, kind)
+
+    candidates = candidates[:ASSET_MAX_PER_PAGE]
+    if not candidates:
+        return html, []
+
+    # -- 2. URL-memo: reuse bytes fetched in earlier captures --------------
+    hits: Dict[str, Tuple[bytes, str]] = {}
+    fetch_list: List[str] = []
+    for u in candidates:
+        ent = manager.get_by_url(u)
+        if ent is not None:
+            hits[u] = (ent.data, ent.content_type)
+        else:
+            fetch_list.append(u)
+
+    # -- 3. Fetch what the memo missed (bounded parallelism + budget) ------
+    import httpx  # NOTE: ImportError must propagate (caller kill-switch)
+
+    ua = _FETCH_UA_FALLBACK
+    if page is not None:
+        try:
+            got = await page.evaluate("() => navigator.userAgent")
+            if isinstance(got, str) and got:
+                ua = got
+        except Exception:
+            pass
+
+    async def _run_fetches() -> List[Any]:
+        async with httpx.AsyncClient(follow_redirects=True,
+                                     headers={"User-Agent": ua, "Referer": base_url,
+                                              "Accept": "*/*",
+                                              "Accept-Language": "en-US,en;q=0.9"}) as client:
+            sem = asyncio.Semaphore(6)
+            return await asyncio.gather(*(_fetch_one_asset(client, sem, u) for u in fetch_list))
+
+    fetched: List[Any] = []
+    if fetch_list:
+        try:
+            fetched = await asyncio.wait_for(_run_fetches(), timeout=_REWRITE_GLOBAL_BUDGET_S)
+        except Exception as exc:
+            logger.debug("asset rewrite: global fetch budget hit (%s) — partial reuse only", exc)
+            fetched = []
+    for abs_u, res in zip(fetch_list, fetched):
+        if not res:
+            continue
+        data, ctype = res
+        hits[abs_u] = (data, ctype)
+        # Stylesheets are registered only AFTER their inner urls are
+        # rewritten (step 4) — memoizing raw CSS would both skip the inner
+        # rewrite forever and cache the wrong bytes.
+        if kind_by_url.get(abs_u) != "css":
+            manager.register(data, ctype, url=abs_u)
+
+    # -- 4. Decision per ref: embed / cache / leave -------------------------
+    repl: Dict[str, str] = {}
+    inline_css: Dict[str, str] = {}
+    meta_by_digest: Dict[str, Dict[str, Any]] = {}
+    n_embed = 0
+    n_cache = 0
+    for abs_u in candidates:
+        res = hits.get(abs_u)
+        if not res:
+            continue
+        data, ctype = res
+        kind = kind_by_url.get(abs_u, "other")
+        try:
+            if kind == "css":
+                if abs_u not in manager._by_url:
+                    # Fresh CSS: rewrite its inner url()/@import refs (small
+                    # images embed below threshold, fonts/nested css via
+                    # cache/data-uri), then memoize the rewritten bytes.
+                    try:
+                        async with httpx.AsyncClient(follow_redirects=True,
+                                                     headers={"User-Agent": ua, "Referer": abs_u,
+                                                              "Accept": "*/*",
+                                                              "Accept-Language": "en-US,en;q=0.9"}) as client:
+                            sem = asyncio.Semaphore(6)
+                            sub_text = data.decode("utf-8", errors="ignore")
+                            data = await _cache_css_text(sub_text, abs_u, client, sem, manager, depth=0)
+                        ctype = "text/css"
+                        manager.register(data, ctype, url=abs_u)
+                    except Exception as exc:
+                        logger.debug("css inner rewrite failed for %s: %s", abs_u[:120], exc)
+                # Small stylesheets INLINE as <style> (client needs no
+                # /assets route to render styled pages — the yahoo case);
+                # larger ones keep the cache path below.
+                if CSS_EMBED_MAX_BYTES > 0 and len(data) <= CSS_EMBED_MAX_BYTES:
+                    inline_css[abs_u] = data.decode("utf-8", errors="ignore")
+                    n_embed += 1
+                    continue
+            elif kind in ("img", "icon") and EMBED_MAX_BYTES > 0 and len(data) <= EMBED_MAX_BYTES:
+                repl[abs_u] = _data_uri(data, ctype)
+                n_embed += 1
+                continue
+            digest = manager.digest_for(data)
+            ext = _guess_ext_from_content_type(ctype)
+            path = f"/assets/{digest}{'.' + ext if ext else ''}"
+            repl[abs_u] = path
+            meta_by_digest[digest] = {"hash": digest, "ext": ext, "content_type": ctype}
+            n_cache += 1
+        except Exception as exc:
+            logger.debug("asset decision failed for %s: %s", abs_u[:120], exc)
+            continue
+
+    if n_embed or n_cache:
+        logger.debug("asset rewrite: %d embedded, %d cached, %d untouched (memo_hits=%d)",
+                     n_embed, n_cache, len(candidates) - n_embed - n_cache,
+                     len(candidates) - len(fetch_list))
+    if not repl and not inline_css:
+        return html, []
+
+    # -- 4. Rewrite HTML ---------------------------------------------------
+    def _lookup(ref: str) -> Optional[str]:
+        abs_u = _resolvable_url(ref, base_url)
+        return repl.get(abs_u) if abs_u else None
+
+    def _sub_src(m: "re.Match[str]") -> str:
+        new = _lookup(m.group(3))
+        if not new:
+            return m.group(0)
+        return m.group(1) + m.group(2) + new + m.group(2)
+
+    html = _IMG_SRC_RE.sub(_sub_src, html)
+    html = _SCRIPT_SRC_RE.sub(_sub_src, html)
+
+    def _sub_link(m: "re.Match[str]") -> str:
+        tag = m.group(0)
+        rel = None
+        href = None
+        media = None
+        for am in _LINK_ATTR_RE.finditer(tag):
+            name = am.group(1).lower()
+            if name == "rel":
+                rel = am.group(3)
+            elif name == "href":
+                href = am.group(3)
+            elif name == "media":
+                media = am.group(3)
+        if not rel or not _LINK_CACHEABLE_REL_RE.search(rel):
+            return tag
+        # Inline stylesheet?  Replace the whole <link> with a <style>
+        # carrying the rewritten CSS (media attribute preserved).
+        if href and inline_css:
+            abs_u = _resolvable_url(href, base_url)
+            if abs_u and abs_u in inline_css:
+                media_attr = ' media="%s"' % media.replace('"', "&quot;") if media else ""
+                src_attr = ' data-shfcss="%s"' % abs_u.replace('"', "&quot;")
+                return "<style" + src_attr + media_attr + ">" + _inline_css_safe(inline_css[abs_u]) + "</style>"
+        def _fix(am2: "re.Match[str]") -> str:
+            if am2.group(1).lower() != "href":
+                return am2.group(0)
+            new = _lookup(am2.group(3))
+            if not new:
+                return am2.group(0)
+            return am2.group(1) + "=" + am2.group(2) + new + am2.group(2)
+        return _LINK_ATTR_RE.sub(_fix, tag)
+
+    html = _LINK_TAG_RE.sub(_sub_link, html)
+
+    return html, list(meta_by_digest.values())
+
+
+# ---------------------------------------------------------------------------
+# MHTML capture (archive-quality single artifact via CDP)
+# ---------------------------------------------------------------------------
+
+async def capture_page_mhtml(page: Any, *, timeout: float = 15.0) -> Optional[str]:
+    """MHTML snapshot of the current page via CDP ``Page.captureSnapshot``.
+
+    Archive-quality single artifact (replaces the SingleFile extension
+    round-trip for archive flows when ``ARCHIVE_FORMAT=mhtml``).  NOT used
+    for the live mirror: browsers cannot reliably render MHTML inside the
+    viewer, and it carries the same base64 bloat as SingleFile.
+    """
+    cdp = None
+    try:
+        cdp = await page.context.new_cdp_session(page)
+        res = await asyncio.wait_for(
+            cdp.send("Page.captureSnapshot", {"format": "mhtml"}),
+            timeout=timeout,
+        )
+        data = (res or {}).get("data")
+        if isinstance(data, str) and data:
+            return data
+        return None
+    except Exception as exc:
+        logger.debug("MHTML capture failed: %s", exc)
+        return None
+    finally:
+        if cdp is not None:
+            try:
+                await cdp.detach()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# SingleFile full capture
+# ---------------------------------------------------------------------------
+
+async def _capture_with_single_file(page: Any, *, timeout: int = SINGLEFILE_TIMEOUT_S) -> Optional[str]:
+    """Capture the current page using SingleFile.
+
+    Default mode is **extension** (the MV3 SingleFile we ship).  We open
+    a CDP session to the extension's background service worker, call
+    ``business.captureTab`` via the official ``capture-page`` external
+    message, and wait for the content script to return the inlined
+    HTML.
+
+    Set ``SINGLEFILE_CAPTURE_MODE=library`` to use the legacy JS-library
+    injection path instead.
+    """
+    if page is None:
+        return None
+    try:
+        url = page.url
+    except Exception:
+        return None
+    if not url:
+        return None
+
+    # Fast path: if both capture backends are disabled, don't even try.
+    if not _is_extension_capture_enabled() and not _is_live_library_enabled():
+        logger.warning(
+            "SingleFile capture is fully disabled "
+            "(ENABLE_EXTENSION_CAPTURE=0 and ENABLE_LIVE_LIBRARY=0); "
+            "returning None"
+        )
+        return None
+
+    mode = os.environ.get("SINGLEFILE_CAPTURE_MODE", "extension").strip().lower()
+    if mode == "library":
+        if not _is_live_library_enabled():
+            logger.warning(
+                "SingleFile library capture requested but "
+                "ENABLE_LIVE_LIBRARY is off; returning None"
+            )
+            return None
+        return await _capture_via_library_injection(page, timeout=timeout)
+
+    # Default & "extension": try the extension path with retries.
+    # Library fallback has been removed per user request — extension is now
+    # the single source of truth (system Chrome + bundled Chromium both load
+    # the MV3 via --load-extension, visible in chrome://extensions).
+    # This avoids the garbled CSP-bypass library path on Yahoo and the
+    # extra 8 MB capture fallback that was triggered on transient
+    # "message channel closed" errors.
+    if _is_extension_capture_enabled():
+        last_exc = None
+        for attempt in range(3):
+            try:
+                html = await _capture_via_extension(page, timeout=timeout)
+                if html:
+                    if attempt > 0:
+                        logger.debug("SingleFile ext: capture succeeded on retry %s/3 (%d bytes)", attempt + 1, len(html))
+                    return html
+                last_exc = None
+                if attempt < 2:
+                    logger.debug("SingleFile ext: returned no content, retry %s/3", attempt + 1)
+                    await asyncio.sleep(0.5 * (attempt + 1))
+                    continue
+                logger.warning("SingleFile ext: returned no content after 3 attempts — not falling back to library (disabled)")
+            except Exception as exc:
+                last_exc = exc
+                msg = str(exc).lower()
+                # Transient "message channel closed" happens when the content
+                # script hasn't re-attached yet after navigation or when the
+                # service worker was idle. Retry instead of falling back to
+                # the garbled library injection.
+                if ("message channel closed" in msg or "receiving end does not exist" in msg or "could not establish connection" in msg) and attempt < 2:
+                    logger.debug("SingleFile ext: transient failure retry %s/3: %s", attempt + 1, exc)
+                    await asyncio.sleep(0.5 * (attempt + 1))
+                    continue
+                logger.warning("SingleFile ext: capture failed (%s)", exc)
+                break
+        # No library fallback — return None so caller can decide (avoids 8 MB duplicate + garbled Yahoo)
+        if last_exc:
+            logger.debug("SingleFile ext: giving up after retries, last error: %s", last_exc)
+        return None
+    else:
+        logger.debug(
+            "SingleFile extension capture disabled "
+            "(CONFIG.enable_extension_capture=False)"
+        )
+
+    # Extension disabled and library not requested via SINGLEFILE_CAPTURE_MODE=library.
+    # Library fallback is disabled per user request; only use it when explicitly
+    # requested via mode=="library" above. Return None.
+    if _is_live_library_enabled():
+        logger.debug("SingleFile ext: extension disabled but live library is enabled — not using fallback (explicit mode=library required)")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Extension capture path
+# ---------------------------------------------------------------------------
+
+def _is_live_library_enabled() -> bool:
+    """True if the user has not disabled the in-page SingleFile JS library
+    fallback.  Source of truth is :mod:`server_settings` (admin-toggled
+    at runtime); we fall back to ``CONFIG.enable_live_library`` and the
+    legacy ``ENABLE_LIVE_LIBRARY`` env var for backward compatibility."""
+    try:
+        import server_settings as _ss
+        v = _ss.get_settings().enable_live_library
+        if v is False:
+            return False
+        if v is True:
+            return True
+    except Exception:
+        pass
+    # Fall back to UltraConfig + env
+    try:
+        from config import CONFIG as _CFG
+        return bool(getattr(_CFG, "enable_live_library", True))
+    except Exception:
+        return True
+
+
+def _extension_id_from_manifest() -> Optional[str]:
+    """Deterministic unpacked extension ID derived from manifest's ``key``.
+
+    Chrome derives the ID as: first 16 bytes of SHA-256(SPKI DER) →
+    each nibble mapped 0-15 → 'a'-'p' (32 chars).  The manifest we ship
+    has a stable ``key`` so the ID is ``ebclppejdflkgblgpoodlceeeabmlajo``.
+    Computing it lets us address the extension even when the service
+    worker is idle and ``Target.getTargets`` does not list it (or when a
+    stealth patch has overwritten ``window.chrome.runtime.id`` in MAIN
+    world).  Falls back to the known hard-coded ID if decode fails.
+    """
+    try:
+        import base64 as _b64
+        import hashlib as _hl
+        candidates = []
+        env_dir = os.environ.get("SINGLEFILE_EXT_DIR", "").strip()
+        if env_dir:
+            candidates.append(env_dir)
+        else:
+            # same order as browser_manager
+            candidates.append(str(Path(__file__).resolve().parent / "single"))
+            candidates.append(str(Path.cwd() / "single"))
+            candidates.append(str(Path.home() / "shifixsxs" / "single"))
+            candidates.append("/home/user/shifixsxs/single")
+        for cand in candidates:
+            cand_abs = os.path.abspath(cand)
+            mf = Path(cand_abs) / "manifest.json"
+            if mf.is_file():
+                try:
+                    data = json.loads(mf.read_text(encoding="utf-8") or "{}")
+                except Exception:
+                    continue
+                key = data.get("key") or ""
+                if key:
+                    try:
+                        der = _b64.b64decode(key)
+                        h = _hl.sha256(der).digest()
+                        hx = h[:16].hex()
+                        trans = str.maketrans("0123456789abcdef", "abcdefghijklmnop")
+                        return hx.translate(trans)
+                    except Exception:
+                        pass
+                # No key → cannot derive ID → try next candidate
+        # Hard-coded fallback for the manifest we ship (key above)
+        return "ebclppejdflkgblgpoodlceeeabmlajo"
+    except Exception:
+        return "ebclppejdflkgblgpoodlceeeabmlajo"
+
+
+def _is_extension_capture_enabled() -> bool:
+    """True if the user has not disabled extension capture AND a loadable
+    extension is on disk.
+
+    The master switch is :mod:`server_settings` (admin-toggled at runtime).
+    We fall back to ``CONFIG.enable_extension_capture`` and the legacy
+    ``SINGLEFILE_EXT_MODE`` env var for backward compatibility.
+    """
+    try:
+        import server_settings as _ss
+        if _ss.get_settings().enable_extension_capture is False:
+            return False
+    except Exception:
+        pass
+
+    if os.environ.get("SINGLEFILE_EXT_MODE", "1").strip() in ("0", "false", "no", "off"):
+        return False
+
+    d = os.environ.get("SINGLEFILE_EXT_DIR", "").strip()
+    if not d:
+        d = str(Path(__file__).resolve().parent / "single")
+    from pathlib import Path as _P
+    return (_P(d) / "manifest.json").is_file()
+
+
+async def _capture_via_extension(page: Any, *, timeout: int) -> Optional[str]:
+    """
+    Capture the current page through the SingleFile extension.
+
+    IMPORTANT:
+    Do NOT try to convert a CDP targetId into a Chrome tab ID.
+
+    CDP target IDs look like:
+        0A5CCAD1203D610B8CD18E53A149EBE3
+
+    Chrome tab IDs are numeric:
+        123
+
+    Instead, this function uses the SingleFile page bridge. The bridge
+    runs inside the actual browser tab and sends the request to the
+    extension. Chrome then supplies the correct sender.tab.id to the
+    service worker automatically.
+    """
+
+    if page is None:
+        return None
+
+    try:
+        url = page.url
+    except Exception:
+        return None
+
+    if not url:
+        return None
+
+    # Quick pre-check: if the content-script bridge never injected, the
+    # extension is not loaded for this tab → skip CDP discovery entirely.
+    # The check runs in MAIN world; __singlefile_bridge_installed is set by
+    # lib/single-file-page-bridge.js (MAIN) which is injected at document_start.
+    try:
+        bridge_installed = await page.evaluate("() => !!window.__singlefile_bridge_installed")
+    except Exception:
+        bridge_installed = False
+    if not bridge_installed:
+        logger.debug("SingleFile ext: page bridge not yet installed (will try Target discovery anyway)")
+
+    # ---------------------------------------------------------------
+    # 1. Get the extension ID.
+    #    Preferred: Target.getTargets service_worker URL.
+    #    However system Chrome may have multiple extensions (e.g. fign...
+    #    plus our SingleFile ebcl...). The first service_worker in the
+    #    list may be the wrong extension, which then has no bridge and
+    #    forces a garbled library fallback. So we collect ALL IDs and
+    #    prefer the manifest-derived one (ebcl...) when it appears.
+    #    Fallback (1): deterministic ID from manifest key — works even
+    #                  when the service worker is idle (not listed).
+    #    Fallback (2): scripts with chrome-extension:// src.
+    # ---------------------------------------------------------------
+    extension_id: Optional[str] = None
+    discovered_via: str = ""
+    manifest_id: Optional[str] = _extension_id_from_manifest()
+    # Remember if we saw a mismatch so we can retry with manifest later
+    discovered_manifest_mismatch: bool = False
+    cdp = None
+    try:
+        try:
+            cdp = await page.context.new_cdp_session(page)
+        except Exception as exc:
+            logger.debug("SingleFile ext: could not open CDP session: %s", exc)
+            cdp = None
+
+        if cdp is not None:
+            try:
+                await cdp.send("Target.setDiscoverTargets", {"discover": True})
+                targets = await cdp.send("Target.getTargets")
+                target_list = targets.get("targetInfos") or []
+
+                # Collect all chrome-extension IDs; prefer manifest_id
+                all_ids = []
+                for target in target_list:
+                    ttype = target.get("type")
+                    turl = target.get("url") or ""
+                    if turl.startswith("chrome-extension://"):
+                        remainder = turl[len("chrome-extension://"): ]
+                        ext_id = remainder.split("/", 1)[0].split("?", 1)[0].strip()
+                        if ext_id and len(ext_id) >= 10:
+                            all_ids.append((ttype, ext_id, turl))
+                # Deduplicate preserving order
+                seen = set()
+                uniq = []
+                for ttype, eid, turl in all_ids:
+                    if eid not in seen:
+                        seen.add(eid)
+                        uniq.append((ttype, eid))
+                if uniq:
+                    logger.debug("SingleFile ext: all extension targets=%r manifest_id=%s", [(t, i) for t, i in uniq], manifest_id)
+                # Prefer manifest_id if it's among discovered
+                if manifest_id and any(eid == manifest_id for _, eid in uniq):
+                    extension_id = manifest_id
+                    for ttype, eid in uniq:
+                        if eid == manifest_id:
+                            discovered_via = ttype + "(manifest_match)"
+                            break
+                else:
+                    # Otherwise prefer any service_worker, then fallback
+                    for ttype, eid in uniq:
+                        if ttype == "service_worker":
+                            extension_id = eid
+                            discovered_via = "service_worker"
+                            break
+                    if not extension_id and uniq:
+                        extension_id = uniq[0][1]
+                        discovered_via = f"fallback:{uniq[0][0]}"
+                        logger.debug("SingleFile ext: extension ID from fallback type %s: %s", uniq[0][0], extension_id)
+
+                # Remember mismatch for later bridge retry
+                if manifest_id and extension_id and extension_id != manifest_id:
+                    discovered_manifest_mismatch = True
+                    logger.debug("SingleFile ext: discovered ID %s != manifest %s; will retry manifest if bridge missing", extension_id, manifest_id)
+
+                if not extension_id and manifest_id:
+                    if bridge_installed:
+                        extension_id = manifest_id
+                        discovered_via = "manifest+bridge"
+                        logger.debug("SingleFile ext: Target.getTargets found no extension; using manifest ID %s (bridge installed)", extension_id)
+                    else:
+                        try:
+                            ext_id_via_script = await page.evaluate('''() => {
+                                try {
+                                    const scripts = Array.from(document.querySelectorAll('script[src*="chrome-extension://"]'));
+                                    for (const s of scripts) {
+                                        const m = s.src.match(/chrome-extension:\\/\\/([^\\/]+)\\//);
+                                        if (m) return m[1];
+                                    }
+                                    const links = Array.from(document.querySelectorAll('link[href*="chrome-extension://"]'));
+                                    for (const l of links) {
+                                        const m = l.href.match(/chrome-extension:\\/\\/([^\\/]+)\\//);
+                                        if (m) return m[1];
+                                    }
+                                } catch(e) {}
+                                return null;
+                            }''')
+                            if ext_id_via_script and isinstance(ext_id_via_script, str) and len(ext_id_via_script) >= 10:
+                                extension_id = ext_id_via_script
+                                discovered_via = "script_src"
+                                logger.debug("SingleFile ext: extension ID via script[src] fallback: %s", extension_id)
+                            else:
+                                extension_id = manifest_id
+                                discovered_via = "manifest"
+                                logger.debug("SingleFile ext: Target.getTargets found no extension and no bridge signal; trying manifest ID %s anyway (extension may be starting)", extension_id)
+                        except Exception:
+                            extension_id = manifest_id
+                            discovered_via = "manifest"
+                            logger.debug("SingleFile ext: Target.getTargets found no extension; trying manifest ID %s", extension_id)
+
+                if not extension_id:
+                    try:
+                        dbg = [(t.get("type"), (t.get("url") or "")[:80]) for t in target_list[:10]]
+                        logger.debug("SingleFile ext: could not determine extension ID (targets=%r)", dbg)
+                    except Exception:
+                        logger.debug("SingleFile ext: could not determine extension ID")
+                    return None
+
+                logger.debug("SingleFile ext: extension ID = %s (via %s)", extension_id, discovered_via or "unknown")
+
+            except Exception as exc:
+                if not extension_id and manifest_id:
+                    if bridge_installed:
+                        extension_id = manifest_id
+                        discovered_via = "manifest+bridge(exc)"
+                        logger.debug("SingleFile ext: Target discovery failed (%s); using manifest ID %s (bridge installed)", exc, extension_id)
+                    else:
+                        logger.debug("SingleFile ext: failed to discover extension ID: %s", exc)
+                        return None
+                else:
+                    logger.debug("SingleFile ext: failed to discover extension ID: %s", exc)
+                    return None
+            finally:
+                try:
+                    await cdp.detach()
+                except Exception:
+                    pass
+        else:
+            if bridge_installed and manifest_id:
+                extension_id = manifest_id
+                discovered_via = "manifest(no_cdp)+bridge"
+                logger.debug("SingleFile ext: no CDP session; using manifest ID %s (bridge installed)", extension_id)
+            else:
+                logger.debug("SingleFile ext: no CDP session and no bridge signal — cannot capture via extension")
+                return None
+
+    except Exception as exc:
+        logger.debug("SingleFile ext: failed to discover extension ID: %s", exc)
+        if manifest_id and bridge_installed:
+            extension_id = manifest_id
+            discovered_via = "manifest(outer_exc)+bridge"
+            logger.debug("SingleFile ext: outer exception; falling back to manifest ID %s", extension_id)
+        else:
+            return None
+        if cdp is not None:
+            try:
+                await cdp.detach()
+            except Exception:
+                pass
+
+    if not extension_id:
+        if manifest_id and bridge_installed:
+            extension_id = manifest_id
+            discovered_via = "manifest(final)+bridge"
+            logger.debug("SingleFile ext: final fallback to manifest ID %s (bridge installed)", extension_id)
+        else:
+            logger.warning("SingleFile ext: extension ID still unknown after all discovery paths")
+            return None
+
+    if not bridge_installed:
+        try:
+            await page.wait_for_timeout(400)
+            bridge_installed = await page.evaluate("() => !!window.__singlefile_bridge_installed")
+        except Exception:
+            pass
+        # If bridge still not installed but we have a manifest mismatch,
+        # the discovered ID (e.g. fign...) is likely the wrong extension.
+        # Try the manifest ID (ebcl...) before giving up — it may be that
+        # Target.getTargets didn't list the idle SingleFile service_worker,
+        # but the content script (which sets the bridge) is actually from
+        # the manifest extension.
+        # If bridge still not installed, try manifest ID regardless of whether we
+        # discovered a mismatched ID or found nothing at all. This covers the
+        # case where Target.getTargets returned no chrome-extension targets
+        # (extension service_worker idle or not loaded) but the SingleFile
+        # content script *should* be there. Manual injection of the page bridge
+        # can recover.
+        if not bridge_installed and manifest_id:
+            if discovered_manifest_mismatch:
+                logger.debug("SingleFile ext: bridge not installed for discovered ID %s (via %s) — trying manifest ID %s", extension_id, discovered_via, manifest_id)
+            elif not extension_id:
+                logger.debug("SingleFile ext: bridge not installed and no extension targets found — trying manifest ID %s via manual bridge injection", manifest_id)
+            else:
+                logger.debug("SingleFile ext: bridge not installed for %s — trying manifest ID %s via manual injection", extension_id, manifest_id)
+            # Try to manually inject the SingleFile page bridge from disk so
+            # the extension can be addressed even if content_scripts didn't
+            # inject (e.g. world:MAIN not supported, or profile stale).
+            try:
+                import pathlib as _pl
+                _candidates = [
+                    _pl.Path(__file__).resolve().parent / "single" / "lib" / "single-file-page-bridge.js",
+                    _pl.Path.cwd() / "single" / "lib" / "single-file-page-bridge.js",
+                    _pl.Path.home() / "shifixsxs" / "single" / "lib" / "single-file-page-bridge.js",
+                    _pl.Path("/home/user/shifixsxs/single/lib/single-file-page-bridge.js"),
+                ]
+                _env = __import__('os').environ.get("SINGLEFILE_EXT_DIR", "").strip()
+                if _env:
+                    _candidates.insert(0, _pl.Path(_env) / "lib" / "single-file-page-bridge.js")
+                _bridge_src = None
+                _cand = None
+                for _cand in _candidates:
+                    if _cand.is_file():
+                        _bridge_src = _cand.read_text(encoding="utf-8", errors="ignore")
+                        break
+                if _bridge_src:
+                    await page.evaluate("(code) => { (0, eval)(code); }", _bridge_src)
+                    logger.debug("SingleFile ext: manually injected page bridge from %s", _cand)
+                    bridge_installed = await page.evaluate("() => !!window.__singlefile_bridge_installed")
+                    if bridge_installed:
+                        extension_id = manifest_id
+                        discovered_via = "manifest+manual_bridge"
+                        logger.debug("SingleFile ext: manual bridge injection succeeded, now using manifest ID %s", extension_id)
+            except Exception as _ibe:
+                logger.debug("SingleFile ext: manual bridge injection failed: %s", _ibe)
+        if not bridge_installed:
+            logger.warning("SingleFile ext: bridge not installed for %s (extension not loaded for this tab, ID was %s via %s) — falling back", url[:80], extension_id, discovered_via)
+            return None
+        else:
+            logger.debug("SingleFile ext: bridge appeared after short wait")
+
+    # ---------------------------------------------------------------
+    # 2. Ask the PAGE bridge to send the capture request.
+    #
+    # The bridge is already injected by:
+    #
+    #     lib/single-file-page-bridge.js
+    #
+    # It receives the window.postMessage(), calls
+    # chrome.runtime.sendMessage(), and posts the response back.
+    # ---------------------------------------------------------------
+
+    capture_config = {
+        "compressHTML": False,
+        "blockImages": False,
+        "removeHiddenElements": False,
+        "removeUnusedStyles": False,
+        "removeUnusedFonts": False,
+        "removeAlternativeFonts": False,
+        "removeAlternativeMedias": False,
+        "removeAlternativeImages": False,
+        "groupDuplicateImages": False,
+        "loadDeferredImages": True,
+        "loadDeferredImagesMaxIdleTime": 1500,
+        "removeFrames": False,
+        "compressCSS": False,
+        "moveStylesInHead": False,
+    }
+
+    timeout_ms = int(timeout * 1000)
+
+    expression = r"""
+    async ({ extensionId, captureConfig, timeoutMs }) => {
+        const REQUEST_KEY = "__singlefile_bridge_request";
+        const RESPONSE_KEY = "__singlefile_bridge_response";
+
+        // Make sure the bridge exists.
+        if (!window.__singlefile_bridge_installed) {
+            return {
+                __sf_err: "page_bridge_not_installed"
+            };
+        }
+
+        const requestId =
+            "__sf_" +
+            Date.now().toString(36) +
+            "_" +
+            Math.random().toString(36).slice(2);
+
+        return await new Promise((resolve) => {
+            let finished = false;
+
+            const cleanup = () => {
+                window.removeEventListener(
+                    "message",
+                    onMessage
+                );
+
+                if (timer) {
+                    clearTimeout(timer);
+                }
+            };
+
+            const finish = (value) => {
+                if (finished) {
+                    return;
+                }
+
+                finished = true;
+                cleanup();
+                resolve(value);
+            };
+
+            const onMessage = (event) => {
+                if (event.source !== window) {
+                    return;
+                }
+
+                const data = event.data;
+
+                if (!data ||
+                    data[RESPONSE_KEY] !== true ||
+                    data.requestId !== requestId) {
+                    return;
+                }
+
+                finish(data.resp || {
+                    __sf_err: "empty_bridge_response"
+                });
+            };
+
+            const timer = setTimeout(() => {
+                finish({
+                    __sf_err: "bridge_timeout"
+                });
+            }, timeoutMs + 5000);
+
+            window.addEventListener(
+                "message",
+                onMessage
+            );
+
+            window.postMessage(
+                {
+                    [REQUEST_KEY]: true,
+                    requestId,
+                    extId: extensionId,
+                    message: {
+                        method: "capture-page",
+                        trustedCaller: true,
+                        ...captureConfig
+                    }
+                },
+                "*"
+            );
+        });
+    }
+    """
+
+    try:
+        result = await page.evaluate(
+            expression,
+            {
+                "extensionId": extension_id,
+                "captureConfig": capture_config,
+                "timeoutMs": timeout_ms,
+            },
+        )
+    except Exception as exc:
+        logger.warning(
+            "SingleFile ext: page bridge evaluation failed: %s",
+            exc,
+        )
+        return None
+
+    if not isinstance(result, dict):
+        logger.warning(
+            "SingleFile ext: invalid bridge result: %r",
+            result,
+        )
+        return None
+
+    if result.get("__sf_err"):
+        logger.warning(
+            "SingleFile ext: %s",
+            result["__sf_err"],
+        )
+        return None
+
+    content = result.get("content")
+
+    if not content:
+        logger.warning(
+            "SingleFile ext: bridge response contained no content: %r",
+            result,
+        )
+        return None
+
+    if not isinstance(content, str):
+        logger.warning(
+            "SingleFile ext: content was not a string: %s",
+            type(content).__name__,
+        )
+        return None
+
+    logger.debug(
+        "SingleFile ext: capture successful (%d bytes)",
+        len(content),
+    )
+
+    return content
+
+
+async def _capture_via_library_injection(page: Any, *, timeout: int) -> Optional[str]:
+    """Original library-injection path.  Kept as a fallback for environments
+    where the extension isn't loaded (or extension mode is off)."""
+    sources = await _load_singlefile_sources()
+    if not sources:
+        return None
+
+    # --- CSP bypass for Yahoo and other strict-CSP sites -----------------
+    # SingleFile's library injection uses inline <script> tags which are
+    # blocked by nonce/hash CSP (e.g. Yahoo: script-src 'nonce-...').
+    # Real browsers honor CSP, but Playwright can bypass it per-page via
+    # CDP. We enable bypass for this page only so the injection succeeds
+    # without flipping the global `bypass_csp` (which is a bot tell).
+    # We also strip CSP headers for future navigations and remove <meta
+    # http-equiv="Content-Security-Policy"> already in the DOM.
+    try:
+        cdp = await page.context.new_cdp_session(page)
+        try:
+            await cdp.send("Page.setBypassCSP", {"enabled": True})
+            logger.debug("SingleFile lib: CSP bypass via CDP enabled")
+        finally:
+            try:
+                await cdp.detach()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Strip CSP headers for subsequent requests (covers navigations after
+    # the initial document). Keep per-context and per-page handlers; both
+    # are tolerated to be registered multiple times.
+    try:
+        async def _strip_csp(route, _request):
+            try:
+                response = await route.fetch()
+                headers = {
+                    k: v for k, v in response.headers.items()
+                    if k.lower() not in (
+                        "content-security-policy",
+                        "content-security-policy-report-only",
+                        "x-content-security-policy",
+                    )
+                }
+                body = await response.body()
+                await route.fulfill(response=response, headers=headers, body=body)
+            except Exception:
+                try:
+                    await route.continue_()
+                except Exception:
+                    pass
+
+        # page-level route is most reliable for the current document;
+        # context-level is a safety net for new pages.
+        for target in (page, page.context):
+            try:
+                await target.route("**/*", _strip_csp)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Remove <meta http-equiv="Content-Security-Policy"> already parsed.
+    try:
+        await page.evaluate('''() => {
+            document.querySelectorAll('meta[http-equiv="Content-Security-Policy"], meta[http-equiv="content-security-policy"], meta[http-equiv="Content-Security-Policy-Report-Only"]')
+                .forEach(m => m.remove());
+        }''')
+    except Exception:
+        pass
+
+    # Inject SingleFile hook + main scripts.
+    # add_script_tag is blocked by nonce-CSP even after header stripping
+    # (the initial document's CSP is already enforced). Prefer a CDP
+    # evaluation path that is not subject to CSP, then fall back to
+    # nonce-aware script-tag injection and finally plain add_script_tag.
+    injected = False
+    last_exc = None
+
+    # 1) CDP Runtime evaluation (bypasses CSP) — most reliable.
+    # Playwright's page.evaluate is implemented via Runtime.callFunctionOn
+    # which is outside CSP. Evaluating the script source directly as an
+    # expression executes it in the page.
+    for key in ("hook", "main"):
+        code = sources.get(key)
+        if not code:
+            continue
+        try:
+            # Evaluate the script source as a program. Wrapping in an
+            # async IIFE ensures top-level await / return handling works
+            # while still executing for side effects (window.singlefile).
+            await page.evaluate("(code) => { (0, eval)(code); }", code)
+            injected = True
+            logger.debug("SingleFile lib: injected %s via evaluate", key)
+        except Exception as exc:
+            last_exc = exc
+            logger.debug("SingleFile lib: evaluate inject %s failed: %s", key, exc)
+            injected = False
+            break
+
+    # Verify
+    try:
+        has_sf = await page.evaluate("() => !!window.singlefile")
+        if has_sf:
+            injected = True
+        else:
+            injected = False
+    except Exception:
+        injected = False
+
+    if not injected:
+        # 2) Nonce-aware <script> injection — reuses the page's own nonce
+        # so the inline script passes the nonce check.
+        try:
+            ok = await page.evaluate('''(codes) => {
+                const getNonce = () => {
+                    const s = document.querySelector('script[nonce]');
+                    if (s) return s.nonce || s.getAttribute('nonce') || s.getAttribute('data-nonce');
+                    // some Yahoo pages store nonce on the CSP meta or html
+                    const html = document.documentElement;
+                    if (html && html.getAttribute('nonce')) return html.getAttribute('nonce');
+                    return null;
+                };
+                const nonce = getNonce();
+                for (const code of codes) {
+                    const el = document.createElement('script');
+                    if (nonce) el.setAttribute('nonce', nonce);
+                    // also set data-nonce for frameworks that check it
+                    el.textContent = code;
+                    (document.head || document.documentElement).appendChild(el);
+                    el.remove();
+                }
+                return !!window.singlefile;
+            }''', [sources["hook"], sources["main"]])
+            if ok:
+                injected = True
+                logger.debug("SingleFile lib: injected via nonce-aware script tag")
+            else:
+                logger.debug("SingleFile lib: nonce-aware injection did not create window.singlefile")
+        except Exception as exc:
+            last_exc = exc
+            logger.debug("SingleFile lib: nonce-aware injection failed: %s", exc)
+
+    if not injected:
+        # 3) Plain add_script_tag — last resort (will fail on strict nonce CSP)
+        try:
+            await page.add_script_tag(content=sources["hook"])
+            await page.add_script_tag(content=sources["main"])
+            injected = True
+            logger.debug("SingleFile lib: injected via add_script_tag fallback")
+        except Exception as exc:
+            last_exc = exc
+            logger.warning("SingleFile lib: script injection failed: %s", exc)
+            # keep last_exc for warning below
+            pass
+
+    if not injected:
+        # Final verify before bailing
+        try:
+            has_sf2 = await page.evaluate("() => !!window.singlefile")
+            if has_sf2:
+                injected = True
+        except Exception:
+            pass
+
+    if not injected:
+        if last_exc is not None:
+            logger.warning("SingleFile lib: script injection failed: %s", last_exc)
+        else:
+            logger.warning("SingleFile lib: script injection failed: window.singlefile not present after injection")
+        return None
+
+    try:
+        page_data = await asyncio.wait_for(
+            page.evaluate(
+                """async (opts) => {
+                    if (!window.singlefile) {
+                        throw new Error('window.singlefile not present after injection');
+                    }
+                    return await window.singlefile.getPageData(opts);
+                }""",
+                {
+                    "zipScript": sources["zip"],
+                    "compressHTML": False,
+                    "blockImages": False,
+                    "removeHiddenElements": False,
+                    "removeUnusedStyles": False,
+                    "removeUnusedFonts": False,
+                    "removeAlternativeFonts": False,
+                    "removeAlternativeMedias": False,
+                    "removeAlternativeImages": False,
+                    "groupDuplicateImages": False,
+                    "loadDeferredImages": True,
+                    "loadDeferredImagesMaxIdleTime": 1500,
+                    "removeFrames": False,
+                    "compressCSS": False,
+                    "moveStylesInHead": False,
+                },
+            ),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("SingleFile lib: getPageData timed out after %ss", timeout)
+        return None
+    except Exception as exc:
+        logger.warning("SingleFile lib: getPageData failed: %s", exc)
+        return None
+
+    if not page_data:
+        return None
+    if isinstance(page_data, dict):
+        return page_data.get("content") or page_data.get("html")
+    if isinstance(page_data, str):
+        return page_data
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Generic interaction-trigger detection
+# ---------------------------------------------------------------------------
+#
+# Goal: capture when the user ACTIVATES an interactive element, not
+# merely when the mouse moves or the page polls.  This JS snippet is
+# installed once per page and works for any site because:
+#
+#   * It uses a single delegated listener on `document` in the CAPTURE
+#     phase, so dynamically-added elements are picked up for free
+#     (no per-element registration, no MutationObserver).
+#
+#   * It decides "is this element actually interactive?" with a
+#     fully generic predicate -- native semantics, ARIA roles,
+#     tabindex, and inline event handlers.  No selectors, no class
+#     names, no per-site configuration.
+#
+#   * It resolves the rightmost *interactive* ancestor of the
+#     original event target using event.composedPath() so a click on
+#     an <svg> or <span> inside a <button>/<a> still resolves to the
+#     <button>/<a> -- without ever firing twice for a single user
+#     activation (dedupe is done with a per-event flag set in the
+#     capture phase).
+#
+#   * When a real activation is detected it calls the globally
+#     exposed `window.__domCaptureRequest(reason)`.  The Python side
+#     wires that to `DOMCaptureSession.send_page` (see
+#     `_install_interaction_trigger`).
+#
+# Mouse clicks are the obvious case, but the snippet also treats
+# keyboard activation of an interactive element (Enter / Space on a
+# button/anchor, Enter inside a contenteditable, etc.) as activation,
+# so a focus-and-Enter flow from the remote-control client also
+# triggers a recapture.
+
+_INTERACTION_TRIGGER_JS = r"""
+(() => {
+    if (window.__domCaptureTriggerInstalled) return;
+    window.__domCaptureTriggerInstalled = true;
+
+    // ----------------------------------------------------------------
+    // Track which elements have JS-attached interactive listeners.
+    // We can't enumerate addEventListener listeners from the page
+    // side, so we patch EventTarget.prototype.addEventListener once
+    // and record (element, type) pairs.  This catches React/Vue/etc.
+    // synthetic listeners, jQuery .on(), and any framework that uses
+    // addEventListener under the hood.  It does NOT require us to
+    // poll the DOM or to know about specific frameworks.
+    // ----------------------------------------------------------------
+    if (!window.__domCaptureListenerTrackerInstalled) {
+        window.__domCaptureListenerTrackerInstalled = true;
+        window.__domCaptureInteractiveListeners = new WeakSet();
+
+        const origAdd = EventTarget.prototype.addEventListener;
+        const origRemove = EventTarget.prototype.removeEventListener;
+        // Activation-bearing event types.  We only flag elements
+        // that have one of these -- a passive scroll listener doesn't
+        // make an element "interactive".
+        const ACTIVATION_TYPES = new Set([
+            "click", "mousedown", "mouseup", "pointerdown",
+            "pointerup", "keydown", "keyup", "keypress",
+            "touchstart", "touchend", "submit", "change", "input"
+        ]);
+
+        EventTarget.prototype.addEventListener = function (type, listener, options) {
+            try {
+                if (this && this.nodeType === 1 && ACTIVATION_TYPES.has(String(type))) {
+                    window.__domCaptureInteractiveListeners.add(this);
+                }
+            } catch (_) {}
+            return origAdd.apply(this, arguments);
+        };
+        EventTarget.prototype.removeEventListener = function (type, listener, options) {
+            // We don't bother removing from the WeakSet on remove --
+            // the element dropping the listener still won't be
+            // activated, the only effect of leaving it in the set is
+            // that we may flag it as interactive when it isn't.  Not
+            // a correctness problem because isVisible filters out
+            // detached / disabled elements; an extra capture is
+            // preferable to false negatives.
+            return origRemove.apply(this, arguments);
+        };
+    }
+
+    // ARIA roles that represent a genuinely interactive widget.
+    // Source: https://www.w3.org/TR/wai-aria-1.2/#widget_roles
+    // plus the roles in https://www.w3.org/TR/wai-aria-1.2/#document_structure_roles
+    // that are user-activated.  Anything not in this list is treated
+    // as non-interactive even if the element has role="...".
+    const INTERACTIVE_ROLES = new Set([
+        "button", "link", "menuitem", "menuitemcheckbox", "menuitemradio",
+        "checkbox", "radio", "switch", "tab", "option", "combobox",
+        "textbox", "searchbox", "spinbutton", "slider", "treeitem",
+        "rowheader", "columnheader", "gridcell", "row"
+    ]);
+
+    // <input> types that are actually clickable / activatable.  Things
+    // like type="hidden" or type="text" are NOT activation targets on
+    // their own (text inputs capture on commit, handled separately).
+    const CLICKABLE_INPUT_TYPES = new Set([
+        "submit", "reset", "button", "image", "checkbox", "radio",
+        "file", "color", "range"
+    ]);
+
+    function isVisible(node) {
+        if (!node || node.nodeType !== 1) return false;
+        // Element.isConnected check first so detached subtrees return
+        // false without crawling.
+        if (node.isConnected === false) return false;
+        // Honor disabled / aria-disabled.
+        if (node.disabled === true) return false;
+        if (node.getAttribute && node.getAttribute("aria-disabled") === "true") return false;
+        // Inline display:none / visibility:hidden make the element
+        // not actually clickable.  We check inline style only --
+        // we deliberately do NOT walk computed styles because that
+        // forces a layout and adds latency to every click handler.
+        // Sites that use CSS classes to hide things will still
+        // appear "visible" to us; the worst case is a false
+        // positive (a capture on a hidden element), not a false
+        // negative.
+        try {
+            if (node.style && (node.style.display === "none" ||
+                               node.style.visibility === "hidden")) {
+                return false;
+            }
+        } catch (_) { /* style object unavailable on some node types */ }
+        return true;
+    }
+
+    function isInteractive(node) {
+        if (!node || node.nodeType !== 1) return false;
+        const tag = node.tagName;
+
+        // 1. Native interactive elements.
+        if (tag === "A") {
+            // <a> is only interactive if it has an href, name, or is
+            // explicitly a control via role.
+            if (node.hasAttribute("href")) return true;
+            if (node.hasAttribute("role")) return true;
+            return false;
+        }
+        if (tag === "BUTTON" || tag === "SELECT" || tag === "TEXTAREA" ||
+            tag === "SUMMARY" || tag === "DETAILS" || tag === "LABEL" ||
+            tag === "OPTION" || tag === "OUTPUT") {
+            return true;
+        }
+        if (tag === "INPUT") {
+            const t = (node.getAttribute("type") || "text").toLowerCase();
+            return CLICKABLE_INPUT_TYPES.has(t);
+        }
+
+        // 2. tabindex >= 0 makes an element focusable and therefore
+        //    activatable.
+        const ti = node.getAttribute && node.getAttribute("tabindex");
+        if (ti !== null && ti !== undefined) {
+            const n = Number(ti);
+            if (!Number.isNaN(n) && n >= 0) return true;
+        }
+
+        // 3. ARIA role.
+        const role = (node.getAttribute && node.getAttribute("role") || "").toLowerCase().split(/\s+/)[0];
+        if (role && INTERACTIVE_ROLES.has(role)) return true;
+
+        // 4. Inline event-handler attributes: if the site wired a
+        //    click/mousedown/pointerdown/keydown/keypress handler
+        //    inline, the element is interactive by definition.
+        if (node.onclick || node.onmousedown || node.onpointerdown ||
+            node.onkeydown || node.onkeypress || node.onkeyup) {
+            return true;
+        }
+
+        // 5. JS-attached activation listeners (React onClick, jQuery
+        //    .on('click', ...), framework addEventListener('click'),
+        //    etc.).  We tracked these at install time via a one-time
+        //    EventTarget.prototype.addEventListener patch above.
+        try {
+            if (window.__domCaptureInteractiveListeners &&
+                window.__domCaptureInteractiveListeners.has(node)) {
+                return true;
+            }
+        } catch (_) { /* WeakSet not available in some sandboxes */ }
+
+        return false;
+    }
+
+    // Walk up the composed path (which crosses shadow boundaries) to
+    // find the rightmost interactive ancestor.  This is the key piece
+    // for "child of button resolves to button" -- we DO NOT use
+    // event.target blindly because the deepest element often isn't the
+    // actionable one (icons, spans, SVGs inside real controls).
+    function resolveInteractive(path) {
+        if (!path || path.length === 0) return null;
+        // First-pass: find the rightmost interactive element on the
+        // path.  If the event target itself is interactive, we prefer
+        // that (it's the most specific).  Otherwise we walk outward.
+        for (let i = 0; i < path.length; i++) {
+            const n = path[i];
+            if (isInteractive(n) && isVisible(n)) {
+                return n;
+            }
+        }
+        return null;
+    }
+
+    // Dedupe per user activation.  We set a flag on the first
+    // interactive element we find; the capture-phase listener sets
+    // a "consumed" sentinel on `event` so bubble-phase children of
+    // the same activation don't double-fire.
+    const CONSUMED = Symbol.for("__domCaptureConsumed");
+
+    function requestCapture(reason, target) {
+        try {
+            if (typeof window.__domCaptureRequest === "function") {
+                window.__domCaptureRequest(reason, target ? (target.tagName + (target.id ? "#" + target.id : "")) : "");
+            }
+        } catch (_) { /* host not wired -- ignore */ }
+    }
+
+    function handleActivation(reason) {
+        return function (event) {
+            // The flag is checked at the start of the handler.  The
+            // capture-phase listener for the SAME event type runs
+            // before any bubble-phase child listener, so we set it
+            // here on `event` directly -- no reliance on the target
+            // being the same node.
+            if (event[CONSUMED]) return;
+            event[CONSUMED] = true;
+
+            // composedPath includes shadow-DOM roots; walk all of them.
+            const path = (typeof event.composedPath === "function")
+                ? event.composedPath()
+                : [];
+            const interactive = resolveInteractive(path);
+
+            if (!interactive) {
+                // Real click/Enter, but on plain content.  Do nothing.
+                return;
+            }
+
+            requestCapture(reason, interactive);
+        };
+    }
+
+    // Capture-phase listeners.  Using capture (not bubble) means:
+    //   1. We see the activation before site handlers, so we never
+    //      miss it because stopPropagation() was called.
+    //   2. Dedupe via event[CONSUMED] is well-defined: a single
+    //      activation yields exactly one capture-phase event per type.
+    // We listen to `click` and `auxclick` only -- not pointerup or
+    // mousedown.  Listening to multiple activation-bearing events
+    // would fire the recapture once per event in the same gesture
+    // (a real click fires pointerdown -> pointerup -> click, three
+    // events).  `click` already covers normal left-click; `auxclick`
+    // covers middle/right-click on platforms that fire it.
+    document.addEventListener(
+        "click",
+        handleActivation("click"),
+        true
+    );
+    document.addEventListener(
+        "auxclick",
+        handleActivation("auxclick"),
+        true
+    );
+
+    // Keyboard activation: Enter / Space on a focused interactive
+    // element.  We don't recapture on every keydown -- only on keys
+    // that actually activate the focused control.  For keyboard
+    // events we walk from event.target up to the document root
+    // (rather than using composedPath) because keyboard events
+    // dispatched via the browser already target the focused
+    // element, and the synthetic-event case (test harnesses, some
+    // frameworks) may produce a composedPath that omits the
+    // actual target.
+    function buildPathFromTarget(t) {
+        const path = [];
+        let n = t;
+        while (n && n.nodeType === 1) {
+            path.push(n);
+            n = n.parentNode;
+            if (!n || n === document) { path.push(document); break; }
+        }
+        return path;
+    }
+
+    document.addEventListener(
+        "keydown",
+        function (event) {
+            const key = event.key;
+            if (key !== "Enter" && key !== " " && key !== "Spacebar") return;
+            const ae = event.target || document.activeElement;
+            if (!ae || ae.nodeType !== 1) return;
+            if (!isInteractive(ae) || !isVisible(ae)) return;
+            // For links, Enter activates.  For buttons, Enter or
+            // Space activates.  isInteractive already filtered
+            // anchors/buttons/roles; this branch just gates on the
+            // key.  We hand-built the path above because
+            // composedPath() may not include event.target for
+            // synthetic dispatch.
+            const path = buildPathFromTarget(ae);
+            if (event[CONSUMED]) return;
+            event[CONSUMED] = true;
+            const interactive = resolveInteractive(path);
+            if (!interactive) return;
+            requestCapture("keydown", interactive);
+        },
+        true
+    );
+})();
+"""
+
+
+# ---------------------------------------------------------------------------
+# Live-delta layer (LIVE_DELTA=1)
+# ---------------------------------------------------------------------------
+#
+# In-page MutationObserver that batches compact DOM ops between full
+# captures and ships them through the ``__domDelta`` binding.  Op grammar
+# (positional arrays, applied in order by client.html):
+#   ['a', mid, name, value|null]        attribute set / remove
+#   ['t', parentMid, textIndex, value]  characterData on n-th text child
+#   ['i', parentMid, refMid|0, html]    insert serialized subtree before ref
+#   ['r', mid]                          remove element
+#   ['v', mid, value, checked|null]     form control live state
+#   ['overflow']                        op budget blown → server recaptures
+#
+# Node identity: every serialized element carries a data-mid stamped from
+# the page-lifetime WeakMap (__domMidMap / __domMidNext) shared with the
+# fast full serializer, so ids stay valid across full resyncs.  Inserted
+# subtrees get fresh ids before serialization.
+#
+# Form values are mirrored from 'input'/'change' EVENTS (MutationObserver
+# cannot see property-only .value changes — the classic trap), coalesced
+# per node per batch so fast typing ships the latest value once.
+_DELTA_OBSERVER_JS = r"""
+(() => {
+  if (window.__shifixDeltaInstalled) return;
+  window.__shifixDeltaInstalled = true;
+  if (!window.__domMidMap) window.__domMidMap = new WeakMap();
+  if (!window.__domMidNext) window.__domMidNext = 1;
+  const MID = 'data-mid';
+  const midOf = (el) => {
+    if (!el || el.nodeType !== 1) return 0;
+    let m = window.__domMidMap.get(el);
+    if (!m) { m = window.__domMidNext++; window.__domMidMap.set(el, m); }
+    return m;
+  };
+  const escText = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const escAttr = (s) => String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+  const VOID = new Set(['area','base','br','col','embed','hr','img','input','link','meta','param','source','track','wbr']);
+  const serSubtree = (node, out) => {
+    const t = node.nodeType;
+    if (t === 3) { out.push(escText(node.nodeValue)); return; }
+    if (t === 8) { out.push('<!--', String(node.nodeValue).replace(/--/g, '--'), '-->'); return; }
+    if (t !== 1) return;
+    const el = node;
+    const tag = (el.localName || el.tagName.toLowerCase());
+    if (tag === 'base') return;
+    out.push('<', tag);
+    const isFormCtl = (tag === 'input' || tag === 'option');
+    const list = el.attributes;
+    for (let i = 0; i < list.length; i++) {
+      const a = list[i];
+      if (a.name === MID) continue;
+      if (isFormCtl && (a.name === 'value' || a.name === 'checked' || a.name === 'selected')) continue;
+      out.push(' ', a.name, '="', escAttr(a.value), '"');
+    }
+    out.push(' ', MID, '="', String(midOf(el)), '"');
+    if (tag === 'input') {
+      const ty = (el.getAttribute('type') || 'text').toLowerCase();
+      if (ty === 'checkbox' || ty === 'radio') { if (el.checked) out.push(' checked'); }
+      else if (ty !== 'file') out.push(' value="', escAttr(el.value == null ? '' : el.value), '"');
+    } else if (tag === 'option') {
+      if (el.selected) out.push(' selected');
+    }
+    out.push('>');
+    if (VOID.has(tag)) return;
+    if (tag === 'textarea') { out.push(escText(el.value == null ? '' : el.value), '</textarea>'); return; }
+    if (tag === 'script' || tag === 'style') {
+      let raw = el.textContent || '';
+      if (tag === 'script') raw = raw.replace(/<\/script/gi, '<\\/script');
+      out.push(raw, '</', tag, '>');
+      return;
+    }
+    for (const c of el.childNodes) serSubtree(c, out);
+    out.push('</', tag, '>');
+  };
+  const ops = [];
+  const pendingVals = new Map();   // mid -> [value, checked|null], coalesced per batch
+  let scheduled = false;
+  let overflowed = false;
+  const OP_CAP = 1500;
+  const schedule = () => {
+    if (scheduled) return;
+    scheduled = true;
+    setTimeout(flush, 120);
+  };
+  const flush = () => {
+    scheduled = false;
+    if (pendingVals.size) {
+      for (const [id, st] of pendingVals) ops.push(['v', id, st[0], st[1]]);
+      pendingVals.clear();
+    }
+    if (!ops.length) return;
+    const batch = ops.splice(0, ops.length);
+    overflowed = false;
+    try {
+      if (typeof window.__domDelta === 'function') {
+        window.__domDelta(JSON.stringify(batch));
+      }
+    } catch (e) { /* binding not wired yet */ }
+  };
+  const push = (op) => {
+    if (overflowed) return;
+    ops.push(op);
+    if (ops.length > OP_CAP) {
+      overflowed = true;
+      ops.length = 0;
+      ops.push(['overflow']);
+    }
+    schedule();
+  };
+  const pushVal = (el) => {
+    const id = midOf(el);
+    if (!id) return;
+    const checked = (el.tagName === 'INPUT' && (el.type === 'checkbox' || el.type === 'radio')) ? !!el.checked : null;
+    pendingVals.set(id, [(el.value == null ? '' : String(el.value)), checked]);
+    schedule();
+  };
+  const mo = new MutationObserver((recs) => {
+    for (const r of recs) {
+      if (r.type === 'attributes') {
+        const el = r.target;
+        if (r.attributeName === MID) continue;   // our own stamping
+        push(['a', midOf(el), r.attributeName, el.getAttribute(r.attributeName)]);
+      } else if (r.type === 'characterData') {
+        const p = r.target.parentNode;
+        if (!p || p.nodeType !== 1) continue;
+        let idx = -1, i = 0;
+        for (const c of p.childNodes) {
+          if (c.nodeType === 3) { if (c === r.target) { idx = i; break; } i++; }
+        }
+        if (idx >= 0) push(['t', midOf(p), idx, r.target.nodeValue]);
+      } else if (r.type === 'childList') {
+        const pm = midOf(r.target);
+        for (const rem of r.removedNodes) {
+          if (rem.nodeType !== 1) continue;
+          const m = window.__domMidMap.get(rem);
+          if (m) push(['r', m]);
+        }
+        for (const add of r.addedNodes) {
+          if (add.nodeType !== 1) continue;
+          let ref = r.nextSibling;
+          while (ref && ref.nodeType !== 1) ref = ref.nextSibling;
+          const refMid = ref ? midOf(ref) : 0;
+          const buf = [];
+          serSubtree(add, buf);
+          push(['i', pm, refMid, buf.join('')]);
+        }
+      }
+    }
+  });
+  mo.observe(document, {
+    subtree: true, childList: true, attributes: true, characterData: true,
+    attributeOldValue: false, characterDataOldValue: false,
+  });
+  const onFormEvent = (e) => {
+    const t = e.target;
+    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT')) pushVal(t);
+  };
+  document.addEventListener('input', onFormEvent, true);
+  document.addEventListener('change', onFormEvent, true);
+  window.__shifixDeltaFlush = flush;
+})();
+"""
+
+
+async def _install_delta_observer(page: Any, session: "DOMCaptureSession") -> bool:
+    """Install the delta observer + ``__domDelta`` relay binding.
+
+    Idempotent (JS-side guard flag); runs both as an init script (every
+    future navigation) and immediately (current document).  Patches are
+    DROPPED while a full capture is in flight — the pending full snapshot
+    supersedes them by definition.
+    """
+    if not LIVE_DELTA or page is None or session is None:
+        return False
+
+    async def _on_delta(payload: Any) -> None:
+        try:
+            if session.websocket is None or session._stopped:
+                return
+            if session._send_inflight:
+                return  # pending full snapshot supersedes queued patches
+            if not isinstance(payload, str) or not payload or len(payload) > 1_000_000:
+                return
+            ops = _json.loads(payload)
+            if not isinstance(ops, list) or not ops:
+                return
+            first = ops[0]
+            if isinstance(first, list) and first and first[0] == "overflow":
+                logger.debug("dc delta overflow -> full recapture (client %s)", session.client_id)
+                await session.send_page(reason="delta_overflow")
+                return
+            await session.websocket.send_text(_json.dumps({
+                "type": "dom_patch",
+                "gen": session._gen,
+                "ops": ops,
+            }, ensure_ascii=False))
+        except Exception as exc:
+            logger.debug("delta relay failed: %s", exc)
+
+    try:
+        await page.expose_function("__domDelta", _on_delta)
+    except Exception as exc:
+        logger.debug("expose_function(__domDelta) failed: %s", exc)
+        return False
+    try:
+        await page.add_init_script(script=_DELTA_OBSERVER_JS)
+    except Exception as exc:
+        logger.debug("add_init_script(delta observer) failed: %s", exc)
+        return False
+    try:
+        await page.evaluate(_DELTA_OBSERVER_JS)
+    except Exception as exc:
+        logger.debug("install delta observer (immediate) failed: %s", exc)
+    return True
+
+
+async def _install_interaction_trigger(page: Any, session: "DOMCaptureSession") -> bool:
+    """Install the generic interaction-trigger on a Playwright page.
+
+    Idempotent: re-injection is a no-op (the JS guards itself with
+    a window flag).  Returns True on success, False on any failure
+    -- the page will still work, it just won't auto-recapture.
+    """
+    if page is None or session is None:
+        return False
+    try:
+        # Expose the Python-side handler to the page.  We pass the
+        # reason through; the JS side does the interactivity
+        # detection, this side just calls send_page.
+        async def _on_request(reason: str, target_desc: str) -> None:
+            try:
+                # Flood control -- don't recapture if we just did.
+                now = asyncio.get_event_loop().time()
+                last = getattr(session, "_last_interaction_capture_t", 0.0)
+                _min_iv = (SNAPSHOT_CAPTURE_MIN_INTERVAL_S
+                           if getattr(session, "snapshot_only", False)
+                           else INTERACTION_CAPTURE_MIN_INTERVAL_S)
+                if (now - last) < _min_iv:
+                    logger.debug(
+                        "interaction recapture suppressed (debounce): "
+                        "reason=%s target=%s",
+                        reason, target_desc,
+                    )
+                    return
+                session._last_interaction_capture_t = now
+                full_reason = f"interaction:{reason}"
+                if target_desc:
+                    full_reason = f"{full_reason}:{target_desc}"
+                # Don't await capture_page itself to avoid blocking
+                # the JS handler; send_page is a coroutine and
+                # schedules a new task so the page's event loop is
+                # not blocked.
+                asyncio.create_task(
+                    session.send_page(reason=full_reason)
+                )
+            except Exception as exc:
+                logger.debug("interaction recapture dispatch failed: %s", exc)
+
+        await page.expose_function(
+            "__domCaptureRequest",
+            _on_request,
+        )
+    except Exception as exc:
+        logger.debug("expose_function(__domCaptureRequest) failed: %s", exc)
+        return False
+
+    # Install the trigger via add_init_script so it runs at the very
+    # start of every page load, BEFORE any page script.  This is the
+    # only way to catch addEventListener registrations that happen at
+    # module top-level (React/Vue/Material bundle entry points).  If
+    # we used page.evaluate here, the patch would land AFTER the
+    # page's own scripts had already wired their listeners, and the
+    # WeakSet would miss them -- which manifests as "I clicked a
+    # Material button and got no recapture".
+    #
+    # add_init_script is idempotent in the JS-side: the
+    # __domCaptureTriggerInstalled guard short-circuits the second
+    # onward navigations where the script is re-injected by Playwright.
+    # We still attempt a one-time page.evaluate so the very first
+    # page (if it was already loaded before this function ran) gets
+    # the trigger immediately rather than waiting for the next nav.
+    try:
+        await page.add_init_script(script=_INTERACTION_TRIGGER_JS)
+    except Exception as exc:
+        logger.debug("add_init_script(interaction trigger) failed: %s", exc)
+        return False
+
+    try:
+        await page.evaluate(_INTERACTION_TRIGGER_JS)
+    except Exception as exc:
+        # Not fatal -- the next navigation will re-inject via
+        # add_init_script and the JS-side guard handles that.
+        logger.debug("install interaction trigger (immediate) failed: %s", exc)
+
+    # Live-delta layer rides the same install lifecycle (idempotent,
+    # guarded by the LIVE_DELTA env flag).
+    try:
+        # Snapshot mode: no delta observer at all -- every update is a full
+        # baked capture, so there is no live-mutation layer to install.
+        if not getattr(session, "snapshot_only", False) and await _install_delta_observer(page, session):
+            session._delta_installed = True
+    except Exception as exc:
+        logger.debug("delta observer install failed: %s", exc)
+
+    return True
+
+
+# ---------------------------------------------------------------------------
+# DOMCaptureSession
+# ---------------------------------------------------------------------------
+
+class DOMCaptureSession:
+    """Reusable single-shot capture helper for remote browser sessions.
+
+    Usage::
+
+        session = DOMCaptureSession(page, websocket=ws)
+        await session.send_page()       # full SingleFile capture -> ship
+        # ...user clicks, types, navigates...
+        await session.send_page()       # capture again (explicit)
+        await session.shutdown()
+
+    Sync strategy: **full capture only**.  Every call to ``send_page`` or
+    ``capture_page`` runs SingleFile and ships the inlined HTML to the
+    client.  No body-swap, no fingerprint polling, no patch grammar.
+    The caller is responsible for triggering captures (initial, on
+    navigation, on demand).
+    """
+
+    CAPTURE_STRATEGY: str = "single_capture"
+
+    @classmethod
+    def for_url(cls, page: Any, url: str, websocket: Any = None, client_id: Optional[str] = None) -> "DOMCaptureSession":
+        return cls(page, websocket=websocket, client_id=client_id)
+
+    def __init__(self, page: Any, websocket: Any = None, client_id: Optional[str] = None) -> None:
+        self.page = page
+        self.websocket = websocket
+        self.client_id = client_id
+        self.capture_strategy: str = self.CAPTURE_STRATEGY
+
+        self.last_sent_url: Optional[str] = None
+        self.last_sent_html: Optional[str] = None
+        self.has_initial_capture: bool = False
+        self._stopped = False
+        # URL watch task slot (kept here so session.py's getattr check is happy).
+        self.url_watch_task: Optional[asyncio.Task] = None
+        # Monotonic timestamp of the last interaction-driven recapture,
+        # used purely for flood control.  The actual decision about
+        # whether something is interactive is made in-page by
+        # _INTERACTION_TRIGGER_JS; this number just prevents an
+        # automated click-storm from melting the capture pipeline.
+        self._last_interaction_capture_t: float = 0.0
+        # Whether the generic interaction trigger has been installed
+        # on the current page.  Re-install on navigation.
+        self._interaction_trigger_installed: bool = False
+        # Whether the live-delta observer delivered at least install
+        # successfully — typing recaptures are redundant while patches
+        # ('v' value ops) carry the keystrokes to the client live.
+        self._delta_installed: bool = False
+        # ---- fast-pipeline state (MIGRATION_LIVE_MIRROR.md) ----
+        # Coalesce: at most one capture in flight; overlaps buffer the
+        # latest reason and produce exactly one follow-up send.
+        self._send_inflight: bool = False
+        self._pending_reason: Optional[str] = None
+        self._overlap_count: int = 0
+        # Generation counter — bumped on every full_document send; delta
+        # patches carry the generation they apply to.
+        self._gen: int = 0
+        # Last DOM checksum that produced a send (unchanged-DOM skip).
+        self._last_checksum: Optional[str] = None
+        # Kill-switch once httpx turns out to be unavailable.
+        self._assets_ok: bool = True
+        # Consecutive full-capture failures — surfaced as an ERROR once
+        # (a client receiving no DOM at all must never be silent).
+        self._capture_fail_streak: int = 0
+        # Whether the most recent capture came from SingleFile (fast
+        # degenerate-fallback) — asset rewrite must not touch those.
+        self._last_capture_was_singlefile: bool = False
+        # Whether the last capture can carry delta patches (has data-mid
+        # stamps) and whether asset rewriting applies to it.  fast=True/True;
+        # SingleFile=False/False; outerHTML tier3=False/True.
+        # Snapshot mode (default for non-live hosts): no delta observer, no
+        # patches -- every update is a full baked capture.  Set per-site by
+        # the owning session via prefer_snapshot_for_url().
+        self.snapshot_only: bool = False
+        self._last_capture_supports_delta: bool = True
+        self._last_capture_supports_assets: bool = True
+        # Best-effort auto-install on construction: only succeeds if
+        # the page object is usable right now.  Failures are silent --
+        # call enable_interaction_capture() later, or it will be
+        # re-attempted on each navigation / first send_page.
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running() and page is not None:
+                # Cannot await from __init__; schedule for next tick.
+                loop.create_task(self.enable_interaction_capture())
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    async def start(self) -> None:
+        """Install the generic interaction trigger.  Idempotent; safe
+        to call multiple times.  Callers that previously relied on
+        ``start()`` being a no-op will still get a working session;
+        we only added the trigger installation, no background polling
+        loop."""
+        await self.enable_interaction_capture()
+        return
+
+    async def enable_interaction_capture(self) -> bool:
+        """Install (or re-install) the generic interaction trigger on
+        the current page.  Safe to call after navigation: the JS
+        guard ensures at most one delegated listener per page, and
+        the Python-side ``expose_function`` is also idempotent on
+        the Playwright side."""
+        if self.page is None:
+            return False
+        if self._stopped:
+            return False
+        ok = await _install_interaction_trigger(self.page, self)
+        if ok:
+            self._interaction_trigger_installed = True
+        return ok
+
+    async def shutdown(self) -> None:
+        """Mark the session stopped and cancel the URL watcher if any."""
+        self._stopped = True
+        if self.url_watch_task and not self.url_watch_task.done():
+            self.url_watch_task.cancel()
+            try:
+                await self.url_watch_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self.url_watch_task = None
+
+    async def watch_url(self, interval_s: float = 0.5) -> None:
+        """Watch the page's URL and trigger a full SingleFile resync on
+        change.  Fires on every URL change with no debouncing -- the
+        caller is responsible for how often captures happen.
+
+        Navigation-aware: when the URL changes, the new page is still
+        in flight (subresources streaming, JS framework hydrating).
+        We must NOT capture immediately on URL-string change -- the
+        DOM is unstable.  Instead we wait for the same load /
+        networkidle / readyState-complete sequence the initial
+        capture uses, and only then fire the full resync.  This
+        mirrors the initial-capture behaviour so the client never
+        sees a half-rendered page after a navigation.
+        """
+        last_url: Optional[str] = None
+        try:
+            if self.page is not None:
+                last_url = self.page.url
+        except Exception:
+            last_url = None
+        while not self._stopped:
+            try:
+                current_url: Optional[str] = None
+                if self.page is not None:
+                    try:
+                        current_url = self.page.url
+                    except Exception:
+                        current_url = None
+                if current_url and last_url and current_url != last_url:
+                    logger.debug("URL changed %s -> %s, waiting for page to settle before resync", last_url, current_url)
+                    # Re-install the interaction trigger on the new
+                    # document; the previous one is gone with the old
+                    # page.  Best-effort: failure just means we won't
+                    # auto-recapture on clicks until the next
+                    # send_page, which is harmless.
+                    try:
+                        await self.enable_interaction_capture()
+                    except Exception as exc:
+                        logger.debug("re-install interaction trigger after URL change: %s", exc)
+                    # Wait for the new page to settle -- the same
+                    # load/networkidle/readyState sequence the
+                    # initial capture uses.  We deliberately do NOT
+                    # skip ahead and capture during this wait;
+                    # capturing a parsing document produces a
+                    # half-rendered snapshot that the client then
+                    # has to manually re-request.
+                    try:
+                        await _ensure_page_stable(self.page)
+                    except Exception as exc:
+                        logger.debug("post-URL-change page-stability wait failed: %s", exc)
+                    try:
+                        await self._send_full(current_url, reason="url_change")
+                    except Exception as exc:
+                        logger.debug("URL-watch full capture failed: %s", exc)
+                last_url = current_url or last_url
+            except Exception as exc:
+                logger.debug("URL watch loop error: %s", exc)
+            try:
+                await asyncio.sleep(interval_s)
+            except asyncio.CancelledError:
+                return
+
+    # ------------------------------------------------------------------
+    # Public entry points
+    # ------------------------------------------------------------------
+
+    def request_capture(self, reason: Optional[str] = None) -> None:  # noqa: ARG002
+        """No-op kept for API compatibility.  Call ``send_page()`` to
+        actually capture."""
+        return
+
+    # Backwards-compatible alias.
+    request_sync = request_capture
+
+    async def capture_page(self, settle: Optional[str] = None) -> Optional[str]:
+        """Capture the current page.  Returns the HTML string, or None.
+
+        ``settle``:
+          none   — no waits at all (interaction recapture of a live page)
+          light  — readyState-complete only (default; never networkidle)
+          full   — legacy load + networkidle + readyState sequence
+        ``DOM_CAPTURE_FULL_SETTLE=1`` forces ``full`` everywhere (rollback).
+        """
+        if self.page is None:
+            return None
+        if settle is None:
+            settle = "light"
+        if FULL_SETTLE:
+            settle = "full"
+        try:
+            if settle != "none":
+                try:
+                    await self.page.wait_for_load_state("domcontentloaded", timeout=10000)
+                except Exception:
+                    pass
+                if settle == "full":
+                    await _ensure_page_stable(self.page)
+                else:
+                    try:
+                        await self.page.wait_for_function("document.readyState === 'complete'", timeout=1500)
+                    except Exception:
+                        pass
+                    if PRE_CAPTURE_WAIT > 0:
+                        await asyncio.sleep(PRE_CAPTURE_WAIT)
+            self._last_capture_was_singlefile = False
+            self._last_capture_supports_delta = True
+            self._last_capture_supports_assets = True
+            if DOM_CAPTURE_MODE == "singlefile":
+                self._last_capture_was_singlefile = True
+                self._last_capture_supports_delta = False
+                self._last_capture_supports_assets = False
+                return await _capture_with_single_file(self.page)
+            html = await _capture_fast(self.page)
+            if html is not None and len(html) < 400 and "<html" not in html.lower():
+                html = None  # degenerate output — fall back
+            fast_err = _LAST_FAST_CAPTURE_ERROR
+            if html is None:
+                # Tier 2: SingleFile (requires the MV3 extension — absent on
+                # SeleniumBase UC Chrome, so this is a no-op there).
+                logger.debug("dc fast capture degenerate/unavailable (%s) — SingleFile fallback", fast_err)
+                html = await _capture_with_single_file(self.page)
+                if html is not None:
+                    self._last_capture_was_singlefile = True
+                    self._last_capture_supports_delta = False
+                    self._last_capture_supports_assets = False
+                    return html
+            if html is None:
+                # Tier 3: outerHTML — always works if evaluate works at all.
+                # No data-mid (delta off) but asset rewrite applies so CSS
+                # still lands inline.
+                try:
+                    html = await self.page.evaluate("document.documentElement.outerHTML")
+                    if isinstance(html, str) and html:
+                        html = "<!DOCTYPE html>\n" + html
+                        self._last_capture_supports_delta = False
+                        self._last_capture_supports_assets = True
+                        return html
+                    html = None
+                except Exception as exc:
+                    logger.debug("dc outerHTML fallback failed: %s", exc)
+                logger.error(
+                    "[CAPTURE] all capture tiers failed: fast=%s; singlefile=extension-unavailable/failed; "
+                    "outerHTML=failed — check the page/backend (SB evaluate path)",
+                    fast_err or "unknown")
+                return None
+            return html
+        except Exception as exc:
+            logger.exception("page capture failed: %s", exc)
+            return None
+
+    async def _dom_checksum(self) -> Optional[str]:
+        """Cheap O(1)-ish page fingerprint for the unchanged-DOM skip."""
+        if self.page is None:
+            return None
+        try:
+            v = await self.page.evaluate(_DOM_CHECKSUM_JS)
+            return v if isinstance(v, str) and v else None
+        except Exception:
+            return None
+
+    async def capture_page_delta(self) -> Optional[dict]:
+        """Legacy delta-capture entry point.  No-op in single-capture mode."""
+        return None
+
+    async def send_page(self, reason: Optional[str] = None, force: bool = False) -> Optional[str]:  # noqa: ARG002
+        """Run a full SingleFile capture and ship it to the websocket.
+        Returns the URL on success, None on failure.
+        """
+        if self.page is None:
+            return None
+        # Self-heal: if the trigger isn't installed yet (e.g. session
+        # was constructed without a running event loop, or the page
+        # navigated without going through handle_navigation), install
+        # it now.  This keeps the interaction-capture guarantee
+        # without forcing every caller to remember to call
+        # enable_interaction_capture().
+        if not self._interaction_trigger_installed:
+            try:
+                await self.enable_interaction_capture()
+            except Exception:
+                pass
+        try:
+            url = self.page.url
+        except Exception:
+            url = None
+        return await self._send_full(url, reason=reason or "manual")
+
+    # ------------------------------------------------------------------
+    # Senders
+    # ------------------------------------------------------------------
+
+    async def _send_full(self, url: Optional[str], *, reason: str = "desync") -> Optional[str]:
+        """Capture and send the page.
+
+        Coalesced (SEND_COALESCE): if a capture is already in flight the
+        latest reason is buffered and exactly one follow-up is scheduled
+        after the current send — captures never queue or overlap.
+        Unchanged pages (checksum-equal, interaction reasons only) are
+        skipped before paying for a capture.
+        """
+        if self.websocket is None:
+            return None
+        if SEND_COALESCE and self._send_inflight:
+            self._pending_reason = reason
+            self._overlap_count += 1
+            logger.debug("dc coalesce: buffered reason=%s (capture in flight)", reason)
+            return None
+        self._send_inflight = True
+        t_start = time.perf_counter()
+        try:
+            if url is None:
+                try:
+                    url = self.page.url
+                except Exception:
+                    url = None
+            settle = _settle_for_reason(reason)
+
+            # ---- unchanged-DOM skip (only for hot interaction reasons) ----
+            checksum: Optional[str] = None
+            if SKIP_UNCHANGED and settle == "none" and self._last_checksum is not None:
+                checksum = await self._dom_checksum()
+                if checksum and checksum == self._last_checksum:
+                    logger.debug("dc skip(unchanged) reason=%s gen=%s", reason, self._gen)
+                    return url
+
+            t_cap = time.perf_counter()
+            html_data = await self.capture_page(settle=settle)
+            capture_ms = (time.perf_counter() - t_cap) * 1000.0
+            if not html_data:
+                self._capture_fail_streak += 1
+                if self._capture_fail_streak >= 2:
+                    logger.error(
+                        "[CAPTURE] %d consecutive capture failures (client %s, last reason=%s, "
+                        "url=%s) — client receives NO DOM updates; check page/backend health",
+                        self._capture_fail_streak, self.client_id, reason, url)
+                return None
+            html_data = _strip_dead_subframes(html_data)
+            if url:
+                html_data = _inject_base_href(html_data, url)
+
+            # ---- asset-cache rewrite (fast captures only) ----
+            assets_meta: List[Dict[str, Any]] = []
+            rewrite_ms = 0.0
+            supports_assets = self._last_capture_supports_assets
+            if supports_assets and url and self._assets_ok:
+                t_rw = time.perf_counter()
+                try:
+                    if DOM_CAPTURE_STRIP_SCRIPTS:
+                        html_data = _strip_script_tags(html_data)
+                    html_data, assets_meta = await _rewrite_assets_to_cache(html_data, url, self.page)
+                except ImportError:
+                    self._assets_ok = False
+                except Exception as exc:
+                    logger.debug("asset rewrite failed (serving originals): %s", exc)
+                rewrite_ms = (time.perf_counter() - t_rw) * 1000.0
+
+            # ---- mirror font: Montserrat everywhere in the mirrored page ----
+            html_data = _inject_mirror_font(html_data)
+
+            # Snapshot mode: skip byte-identical re-sends.  Idle pages in
+            # snapshot mode otherwise ship a full document on every
+            # interaction cadence — pure waste of WS bytes + client parse.
+            # (Delta/live mode keeps sends so generation anchors keep moving.)
+            _rs = str(reason)
+            if (self.snapshot_only and url == self.last_sent_url
+                    and html_data == self.last_sent_html
+                    and not _rs.startswith(("resync", "mirror_err", "recover"))):
+                logger.debug("dc skip(identical snapshot) reason=%s", reason)
+                return url
+
+            self._gen += 1
+            msg: Dict[str, Any] = {
+                "type": "full_document",
+                "reason": reason,
+                "url": url,
+                "html": html_data,
+                "gen": self._gen,
+            }
+            if LIVE_DELTA and self._last_capture_supports_delta and not self.snapshot_only:
+                msg["delta"] = True
+            if assets_meta:
+                msg["assets"] = assets_meta
+            t_send = time.perf_counter()
+            try:
+                await self.websocket.send_text(json.dumps(msg, ensure_ascii=False))
+            except Exception as exc:
+                logger.debug("full_document send failed: %s", exc)
+                return None
+            send_ms = (time.perf_counter() - t_send) * 1000.0
+
+            if checksum is None:
+                checksum = await self._dom_checksum()
+            self._last_checksum = checksum or self._last_checksum
+            self._capture_fail_streak = 0
+            self.last_sent_html = html_data
+            self.last_sent_url = url
+            self.has_initial_capture = True
+            logger.debug(
+                "dc send reason=%s settle=%s capture_ms=%.0f rewrite_ms=%.0f send_ms=%.0f "
+                "html_bytes=%d assets=%d gen=%d overlaps=%d total_ms=%.0f",
+                reason, settle, capture_ms, rewrite_ms, send_ms, len(html_data),
+                len(assets_meta), self._gen, self._overlap_count,
+                (time.perf_counter() - t_start) * 1000.0,
+            )
+            return url
+        finally:
+            self._send_inflight = False
+            pending = self._pending_reason
+            self._pending_reason = None
+            if SEND_COALESCE and pending and not self._stopped:
+                # Recompute URL/task state inside the follow-up.
+                asyncio.create_task(self._send_full(None, reason=f"coalesce:{pending}"))
+
+    # ------------------------------------------------------------------
+    # Event handlers
+    # ------------------------------------------------------------------
+
+    async def handle_click(self, selector: Optional[str] = None, mid: Optional[str] = None) -> bool:
+        if self.page is None:
+            return False
+        try:
+            # ELEMENT-PURE relay (no coordinate mapping):
+            #   1. data-mid — stamped by the capture serializer, survives DOM
+            #      churn between mirror frames better than a CSS path.
+            #   2. CSS selector built client-side from the resolved element.
+            # Runtime "click" candidates are tried with a short actionability
+            # budget (custom-element buttons like Apple's ui-button can stall
+            # Playwright's waits). The SB adapter stays on its real pointer
+            # path; only the legacy Playwright adapter uses the DOM fallback.
+            candidates = []
+            if mid is not None:
+                safe_mid = re.sub(r'[^0-9A-Za-z_\-]', '', str(mid))
+                if safe_mid:
+                    candidates.append(f'[data-mid="{safe_mid}"]')
+            if selector:
+                candidates.append(selector)
+            if not candidates:
+                return False
+            for sel in candidates:
+                try:
+                    # Independent budget per candidate.  Sharing one
+                    # 1200ms budget across all candidates means the
+                    # second one (usually the CSS selector) gets only
+                    # whatever's left after the first one's actionability
+                    # loop times out — typically zero.  This was the
+                    # root cause of "click does nothing on the second
+                    # attempt" on the SB backend: data-mid matched a
+                    # stale node, actionability loop ate the budget,
+                    # CSS selector was never tried.
+                    await self.page.click(sel, timeout=1500)
+                    logger.debug(
+                        "handle_click: dispatched selector=%s mid=%s backend=%s",
+                        sel, mid, getattr(self.page, "_backend_name", type(self.page).__name__),
+                    )
+                    return True
+                except Exception as exc:
+                    logger.debug(
+                        "handle_click: candidate=%s failed (%s): %s",
+                        sel, type(exc).__name__, exc,
+                    )
+                    continue
+            # The SeleniumBase adapter intentionally uses real CDP pointer
+            # events in page.click(). Do not fall back to element.click() on
+            # that backend: it bypasses pointerdown/mousedown handlers and
+            # was the reason SB behaved differently from Playwright.
+            if getattr(self.page, "_is_sb_backend", False):
+                logger.debug(
+                    "handle_click: SB actionability failed (mid=%s selector=%s)",
+                    mid, selector,
+                )
+                return False
+            for sel in candidates:
+                try:
+                    clicked = await self.page.evaluate(
+                        "(sel) => { const el = document.querySelector(sel);"
+                        " if (el) { el.click(); return true; } return false; }", sel)
+                    if clicked:
+                        return True
+                except Exception:
+                    continue
+            logger.debug("handle_click: element not resolvable (mid=%s selector=%s)", mid, selector)
+            return False
+        except Exception as exc:
+            logger.debug("handle_click failed: %s", exc)
+            return False
+
+    async def handle_navigation(self, url: str) -> None:
+        if self.page is None:
+            return
+        try:
+            await self.page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            # Fresh document -> the JS listener from the previous
+            # page is gone.  Re-install the generic interaction
+            # trigger on the new document.
+            try:
+                await self.enable_interaction_capture()
+            except Exception as exc:
+                logger.debug("re-install interaction trigger after nav: %s", exc)
+            # IMPORTANT: do NOT fire _send_full immediately.  A page
+            # that just changed URL is in an unstable state: the
+            # document is parsing, subresources are still in flight,
+            # client-side frameworks are mounting, SPAs are still
+            # hydrating.  Capturing right now would snapshot a
+            # half-rendered DOM.  Wait for the page to settle the
+            # same way the initial capture does, then capture.
+            try:
+                await _ensure_page_stable(self.page)
+            except Exception as exc:
+                logger.debug("post-nav page-stability wait failed: %s", exc)
+            await self._send_full(url, reason="url_change")
+        except Exception as exc:
+            logger.debug("handle_navigation failed: %s", exc)
+
+    async def handle_keypress(self, key: str, selector: Optional[str] = None) -> None:
+        if self.page is None:
+            return
+        try:
+            if selector:
+                try:
+                    await self.page.focus(selector)
+                except Exception:
+                    pass
+            if key and len(key) == 1:
+                await self.page.keyboard.type(key, delay=0)
+            elif key:
+                key_map = {
+                    "Enter": "Enter", "Backspace": "Backspace", "Delete": "Delete",
+                    "Tab": "Tab", "Escape": "Escape",
+                    "ArrowUp": "ArrowUp", "ArrowDown": "ArrowDown",
+                    "ArrowLeft": "ArrowLeft", "ArrowRight": "ArrowRight",
+                }
+                if key in key_map:
+                    await self.page.keyboard.press(key_map[key])
+        except Exception as exc:
+            logger.debug("handle_keypress failed: %s", exc)
+
+    async def handle_submit_form(self, selector: str, form_data: Dict[str, Any]) -> None:
+        if self.page is None:
+            return
+        try:
+            for field_name, field_value in form_data.items():
+                try:
+                    await self.page.fill(f'{selector} [name="{field_name}"]', str(field_value))
+                except Exception:
+                    pass
+            try:
+                await self.page.eval_on_selector(selector, "form => form.submit()")
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.debug("handle_submit_form failed: %s", exc)
+
+
+__all__ = [
+    "DOMCaptureSession",
+    "_inject_base_href",
+    "_capture_with_single_file",
+    "_capture_via_extension",
+    "_capture_via_library_injection",
+    "_is_extension_capture_enabled",
+    "_load_singlefile_sources",
+    "_get_page_tab_id",
+    "_install_interaction_trigger",
+    "_INTERACTION_TRIGGER_JS",
+    # fast-capture pipeline (MIGRATION_LIVE_MIRROR.md)
+    "AssetEntry",
+    "AssetManager",
+    "get_global_asset_manager",
+    "_guess_ext_from_content_type",
+    "_capture_fast",
+    "_rewrite_assets_to_cache",
+    "_settle_for_reason",
+    "_install_delta_observer",
+    "_FAST_SERIALIZE_JS",
+    "_DELTA_OBSERVER_JS",
+    "_DOM_CHECKSUM_JS",
+    "capture_page_mhtml",
+]
