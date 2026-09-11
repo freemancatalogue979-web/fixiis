@@ -6442,6 +6442,54 @@ function applySpinnerColorFromHex(hexColor) {
                 return out;
             }
 
+            // Chrome can deliver a failed subframe as ordinary DOM markup
+            // (not just as an iframe with chrome-error://).  Full captures are
+            // filtered server-side; run the same guard on every delta fragment
+            // and legacy outerHTML patch so an error island can never re-enter
+            // the mirror after the initial snapshot.
+            function stripDeadMirrorNodes(root) {
+                if (!root) return;
+                const deadSelector = '#sub-frame-error, #main-frame-error';
+                try {
+                    if (root.nodeType === 1 && root.matches && root.matches(deadSelector)) {
+                        root.remove();
+                    }
+                } catch (e) { /* ignore */ }
+                try {
+                    if (root.querySelectorAll) {
+                        root.querySelectorAll(deadSelector).forEach((node) => {
+                            try { node.remove(); } catch (e) { /* ignore */ }
+                        });
+                    }
+                } catch (e) { /* ignore */ }
+
+                // The mirror deliberately does not embed cross-origin frames:
+                // from the viewer origin they become the same refused-to-
+                // connect Chrome error page.  Keep about:, data:, blob: and
+                // srcdoc frames, which can be self-contained.
+                try {
+                    const ownerDoc = root.nodeType === 9 ? root : root.ownerDocument;
+                    const base = ownerDoc && ownerDoc.baseURI ? ownerDoc.baseURI : '';
+                    const baseOrigin = base ? new URL(base).origin : '';
+                    if (!root.querySelectorAll) return;
+                    root.querySelectorAll('iframe').forEach((iframe) => {
+                        const raw = iframe.getAttribute('src') || '';
+                        const src = raw.trim().toLowerCase();
+                        if (!src || src.startsWith('about:') || src.startsWith('data:')
+                            || src.startsWith('blob:') || src.startsWith('javascript:')) return;
+                        if (src.startsWith('chrome-error:')) {
+                            try { iframe.remove(); } catch (e) { /* ignore */ }
+                            return;
+                        }
+                        if (!baseOrigin || baseOrigin === 'null') return;
+                        try {
+                            const frameOrigin = new URL(raw, base).origin;
+                            if (frameOrigin !== baseOrigin) iframe.remove();
+                        } catch (e) { /* keep unparseable frames */ }
+                    });
+                } catch (e) { /* ignore */ }
+            }
+
             // -----------------------------------------------------------------
             // Legacy delta-capture handler (back-compat)
             // -----------------------------------------------------------------
@@ -6473,6 +6521,7 @@ function applySpinnerColorFromHex(hexColor) {
                         allOk = false;
                     }
                 }
+                stripDeadMirrorNodes(doc);
 
                 try {
                     restoreSavedInputsImpl(doc, state._pageSavedInputs || []);
@@ -7400,6 +7449,7 @@ function applySpinnerColorFromHex(hexColor) {
                                 const tpl = doc.createElement('template');
                                 tpl.innerHTML = op[3];
                                 const frag = tpl.content;
+                                stripDeadMirrorNodes(frag);
                                 frag.querySelectorAll('[data-mid]').forEach((n) => {
                                     const id = parseInt(n.getAttribute('data-mid'), 10);
                                     if (!isNaN(id)) map.set(id, n);

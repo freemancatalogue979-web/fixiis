@@ -221,6 +221,7 @@ and exercises screencast + input + rebuilds.
 BROWSER_BACKEND=sb            # sb | pw (default pw until flip)
 SB_UC_CAPTCHA=auto            # off | auto
 SB_HEADED=true                # false -> Xvfb on Linux
+SB_BLOCK_WEBAUTHN=0           # native WebAuthn by default; 1 enables legacy block
 LOG_LEVEL=DEBUG               # (existing) for cutover diagnosis
 ```
 

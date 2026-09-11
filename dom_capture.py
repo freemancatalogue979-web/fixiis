@@ -55,7 +55,7 @@ import time
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 # Shared JSON helper for CDP evaluation payloads.
 _json = json
@@ -391,17 +391,161 @@ _BASE_HREF_RE = re.compile(r"<base\b[^>]*\bhref=[\"'][^\"']*[\"'][^>]*>", re.IGN
 # such iframes in the serializer; this net covers SingleFile/delta-replayed
 # HTML too.  Same idea: whole chrome-error:// iframes and documents.
 
-def _strip_dead_subframes(html: str) -> str:
+_IFRAME_BLOCK_RE = re.compile(
+    r"<iframe\b(?P<attrs>[^>]*)(?:>(?P<body>.*?</iframe\s*>)|/?>)",
+    re.IGNORECASE | re.DOTALL,
+)
+_DEAD_ERROR_OPEN_RE = re.compile(
+    r"<div\b[^>]*\bid\s*=\s*[\"'](?:sub-frame-error|main-frame-error)[\"'][^>]*>",
+    re.IGNORECASE,
+)
+_DIV_TOKEN_RE = re.compile(r"</?div\b[^>]*>", re.IGNORECASE)
+_KNOWN_DEAD_FRAME_HOSTS = {"gpt.mail.yahoo.net"}
+_PROTECTED_HTML_RE = re.compile(
+    r"<!--.*?-->|<(?P<tag>script|style)\b[^>]*>.*?</(?P=tag)\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _rewrite_html_outside_protected(html: str, transform: Any) -> str:
+    """Apply a markup transform without touching script/style text or comments."""
+    pieces: List[str] = []
+    cursor = 0
+    for protected in _PROTECTED_HTML_RE.finditer(html):
+        pieces.append(transform(html[cursor:protected.start()]))
+        pieces.append(protected.group(0))
+        cursor = protected.end()
+    pieces.append(transform(html[cursor:]))
+    return "".join(pieces)
+
+
+def _remove_chrome_error_blocks_plain(html: str) -> str:
+    """Remove Chrome error divs with balanced nested divs.
+
+    A non-greedy regex is not sufficient here: Chrome's error template has
+    changed its nesting over time, and stopping after two closing tags can
+    leave a visible ``</div>`` or the error details behind.
+    """
+    if not html:
+        return html
+    pieces: List[str] = []
+    cursor = 0
+    while True:
+        opening = _DEAD_ERROR_OPEN_RE.search(html, cursor)
+        if not opening:
+            pieces.append(html[cursor:])
+            break
+        pieces.append(html[cursor:opening.start()])
+        depth = 1
+        scan = opening.end()
+        end = len(html)
+        while depth and scan < len(html):
+            token = _DIV_TOKEN_RE.search(html, scan)
+            if not token:
+                end = len(html)
+                depth = 0
+                break
+            if token.group(0).startswith("</"):
+                depth -= 1
+            else:
+                depth += 1
+            scan = token.end()
+            if depth == 0:
+                end = scan
+        cursor = end
+    return "".join(pieces)
+
+
+def _remove_chrome_error_blocks(html: str) -> str:
+    return _rewrite_html_outside_protected(html, _remove_chrome_error_blocks_plain)
+
+
+def _remove_known_dead_frame_tags(html: str) -> str:
+    """Drop known failed embeds even when a caller has no page URL."""
+    def _replace(match: re.Match[str]) -> str:
+        attrs = match.group("attrs") or ""
+        src_match = re.search(r"\bsrc\s*=\s*([\"'])(.*?)\1", attrs,
+                              re.IGNORECASE | re.DOTALL)
+        if not src_match:
+            return match.group(0)
+        try:
+            host = (urlsplit(src_match.group(2).strip()).hostname or "").lower()
+            return "" if host in _KNOWN_DEAD_FRAME_HOSTS else match.group(0)
+        except Exception:
+            return match.group(0)
+
+    return _rewrite_html_outside_protected(
+        html, lambda part: _IFRAME_BLOCK_RE.sub(_replace, part)
+    )
+
+
+def _strip_dead_subframes(html: str, base_url: Optional[str] = None) -> str:
+    """Remove browser error documents and iframe shells that cannot mirror.
+
+    The fast serializer already omits cross-origin frames.  SingleFile and
+    fallback captures can still contain the opening iframe tag, however, and
+    the client may render Chrome's ``sub-frame-error`` page inside it.  Apply
+    the same policy to every full-capture tier, while retaining same-origin,
+    ``about:``, ``data:`` and ``srcdoc`` frames.
+    """
     if not html:
         return html
     out = html
-    # whole chrome-error iframes
-    out = re.sub(r"<iframe\b[^>]*\bsrc=[\"\']chrome-error://[^\"\']*[\"\'][^>]*>(?:.*?</iframe>)?",
-                 "", out, flags=re.IGNORECASE | re.DOTALL)
-    # the #sub-frame-error block (two nested </div> closers)
-    out = re.sub(r"<div\b[^>]*\bid=[\"\']sub-frame-error[\"\'][^>]*>.*?</div>\s*</div>",
-                 "", out, flags=re.IGNORECASE | re.DOTALL)
-    return out
+    # Whole chrome-error iframes.  Keep this separate from the generic iframe
+    # pass so it also works when no page URL is available.
+    out = _rewrite_html_outside_protected(
+        out,
+        lambda part: re.sub(
+            r"<iframe\b[^>]*\bsrc=[\"\']chrome-error://[^\"\']*[\"\'][^>]*>(?:.*?</iframe>)?",
+            "", part, flags=re.IGNORECASE | re.DOTALL,
+        ),
+    )
+    # Chrome's error template is nested and has varied across Chrome builds;
+    # remove the balanced block rather than guessing how many div closers it
+    # contains.
+    out = _remove_chrome_error_blocks(out)
+    # Keep the Yahoo embed known to fail out of legacy callers that only pass
+    # HTML. With a page URL, the generic origin check below removes all such
+    # cross-origin frames, not only this host.
+    out = _remove_known_dead_frame_tags(out)
+
+    if not base_url:
+        return out
+    try:
+        page = urlsplit(base_url)
+        page_origin = (
+            page.scheme.lower(), page.hostname.lower() if page.hostname else "",
+            page.port or (443 if page.scheme.lower() == "https" else 80),
+        )
+    except Exception:
+        return out
+
+    def _frame_replacement(match: re.Match[str]) -> str:
+        attrs = match.group("attrs") or ""
+        src_match = re.search(r"\bsrc\s*=\s*([\"'])(.*?)\1", attrs,
+                              re.IGNORECASE | re.DOTALL)
+        if not src_match:
+            return match.group(0)  # srcdoc/about:blank/blob/data frames may be valid
+        src = src_match.group(2).strip()
+        if not src or src.lower().startswith(("about:", "data:", "blob:", "javascript:")):
+            return match.group(0)
+        try:
+            target = urlsplit(urljoin(base_url, src))
+            if target.scheme.lower() not in ("http", "https"):
+                return match.group(0)
+            target_origin = (
+                target.scheme.lower(), target.hostname.lower() if target.hostname else "",
+                target.port or (443 if target.scheme.lower() == "https" else 80),
+            )
+            if target_origin != page_origin:
+                return ""
+        except Exception:
+            return match.group(0)
+        return match.group(0)
+
+    return _rewrite_html_outside_protected(
+        out, lambda part: _IFRAME_BLOCK_RE.sub(_frame_replacement, part)
+    )
 
 
 def _inject_base_href(html: str, url: str) -> str:
@@ -3413,7 +3557,7 @@ class DOMCaptureSession:
                         "url=%s) — client receives NO DOM updates; check page/backend health",
                         self._capture_fail_streak, self.client_id, reason, url)
                 return None
-            html_data = _strip_dead_subframes(html_data)
+            html_data = _strip_dead_subframes(html_data, url)
             if url:
                 html_data = _inject_base_href(html_data, url)
 

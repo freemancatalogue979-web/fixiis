@@ -54,6 +54,81 @@ _SB_XVFB_ALLOC_LOCK = asyncio.Lock()
 _SB_DRIVER_ENV_LOCK = threading.RLock()
 
 
+def _cdp_user_agent_override(user_agent: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Build a coherent CDP UA override, including UA Client Hints.
+
+    Sending only a legacy ``User-Agent`` header leaves Chrome's real
+    ``sec-ch-ua`` / ``navigator.userAgentData`` values untouched. That creates
+    an internally contradictory browser identity and breaks strict login
+    providers. SeleniumBase gets one consistent identity without extra flags.
+    """
+    if not user_agent:
+        return None
+    ua = str(user_agent)
+    low = ua.lower()
+    match = re.search(r"(?:chrome|crios|edg|opr)/(\d+(?:\.\d+){0,3})", ua, re.IGNORECASE)
+    full_version = match.group(1) if match else "147.0.0.0"
+    major = full_version.split(".", 1)[0]
+    is_mobile = "android" in low or "mobile" in low
+
+    if "android" in low:
+        platform = "Linux armv8l"
+        platform_name = "Android"
+        android = re.search(r"android\s+(\d+(?:\.\d+)*)", low)
+        platform_version = (android.group(1) + ".0.0") if android else "15.0.0"
+        platform_version = ".".join(platform_version.split(".")[:3])
+        model_match = re.search(r"android[^;]*;\s*([^;)]+)", ua, re.IGNORECASE)
+        model = model_match.group(1).strip() if model_match else ""
+        architecture = "arm"
+    elif "windows" in low:
+        platform, platform_name, platform_version, model, architecture = (
+            "Win32", "Windows", "10.0.0", "", "x86"
+        )
+    elif "macintosh" in low or "mac os" in low:
+        platform, platform_name, platform_version, model, architecture = (
+            "MacIntel", "macOS", "10.15.7", "", "x86"
+        )
+    else:
+        platform, platform_name, platform_version, model, architecture = (
+            "Linux x86_64", "Linux", "", "", "x86"
+        )
+
+    brands = [
+        {"brand": "Not_A Brand", "version": "24"},
+        {"brand": "Chromium", "version": major},
+        {"brand": "Google Chrome", "version": major},
+    ]
+    full_brands = [
+        {"brand": "Not_A Brand", "version": "24.0.0.0"},
+        {"brand": "Chromium", "version": full_version},
+        {"brand": "Google Chrome", "version": full_version},
+    ]
+    return {
+        "userAgent": ua,
+        "platform": platform,
+        "userAgentMetadata": {
+            "brands": brands,
+            "fullVersionList": full_brands,
+            "fullVersion": full_version,
+            "mobile": is_mobile,
+            "platform": platform_name,
+            "platformVersion": platform_version,
+            "architecture": architecture,
+            "model": model if is_mobile else "",
+            "bitness": "64",
+            "wow64": False,
+        },
+    }
+
+
+# WebAuthn is a normal browser capability. Blocking it globally changes the
+# observable API surface and can make legitimate account providers reject the
+# session. Keep the old workaround available only as an explicit rollback.
+_SB_BLOCK_WEBAUTHN = os.environ.get("SB_BLOCK_WEBAUTHN", "0").strip().lower() in (
+    "1", "true", "yes", "on"
+)
+
+
 # ---------------------------------------------------------------------------
 # Backend / flag resolution
 # ---------------------------------------------------------------------------
@@ -531,23 +606,29 @@ class SBPage:
             )
         except Exception:
             pass
-        # WebAuthn/passkey blocking, identical to the Playwright backend:
-        # JS override at document creation + CDP virtual authenticator so
-        # Windows Hello / Microsoft passkey prompts never reach the OS and
-        # sites fall back to passwords (see webauthn_block.py).
-        try:
-            from webauthn_block import WEBAUTHN_BLOCK_JS, VIRTUAL_AUTHENTICATOR_OPTIONS
-            await self._session.send(
-                "Page.addScriptToEvaluateOnNewDocument",
-                {"source": WEBAUTHN_BLOCK_JS}, timeout=10)
+        # Leave WebAuthn native by default.  The old global JS rejection plus
+        # virtual authenticator changes a normal browser capability into an
+        # automation-specific fingerprint and can break passkey-aware login
+        # providers (including Yahoo).  Set SB_BLOCK_WEBAUTHN=1 only for the
+        # legacy Microsoft/password-only workaround.
+        if _SB_BLOCK_WEBAUTHN:
             try:
-                await self._session.send("WebAuthn.enable", timeout=10)
-                await self._session.send("WebAuthn.addVirtualAuthenticator",
-                                         {"options": VIRTUAL_AUTHENTICATOR_OPTIONS}, timeout=10)
-            except Exception as cdp_exc:
-                logger.debug("[SB][WebAuthn] virtual authenticator unavailable: %s", cdp_exc)
-        except Exception as exc:
-            logger.debug("[SB][WebAuthn] block install failed: %s", exc)
+                from webauthn_block import WEBAUTHN_BLOCK_JS, VIRTUAL_AUTHENTICATOR_OPTIONS
+                await self._session.send(
+                    "Page.addScriptToEvaluateOnNewDocument",
+                    {"source": WEBAUTHN_BLOCK_JS}, timeout=10)
+                try:
+                    await self._session.send("WebAuthn.enable", timeout=10)
+                    await self._session.send("WebAuthn.addVirtualAuthenticator",
+                                             {"options": VIRTUAL_AUTHENTICATOR_OPTIONS}, timeout=10)
+                except Exception as cdp_exc:
+                    logger.debug("[SB][WebAuthn] virtual authenticator unavailable: %s", cdp_exc)
+                else:
+                    logger.debug("[SB][WebAuthn] legacy blocking enabled by SB_BLOCK_WEBAUTHN")
+            except Exception as exc:
+                logger.debug("[SB][WebAuthn] block install failed: %s", exc)
+        else:
+            logger.debug("[SB][WebAuthn] native browser behavior enabled")
         for dom, params in (
             ("DOM.enable", {}),
             ("Page.setBypassCSP", {"enabled": True}),
@@ -1064,11 +1145,21 @@ class SBPage:
         except Exception as exc:
             logger.debug("[SB] set_extra_http_headers failed: %s", exc)
         ua = headers.get("User-Agent") or headers.get("user-agent")
-        if ua:
+        override = _cdp_user_agent_override(ua)
+        if override:
             try:
-                await self._session.send("Emulation.setUserAgentOverride", {"userAgent": ua})
-            except Exception:
-                pass
+                await self._session.send("Emulation.setUserAgentOverride", override)
+            except Exception as exc:
+                # Older Chrome protocol revisions may not accept
+                # userAgentMetadata. Preserve the previous UA behavior rather
+                # than losing the override altogether.
+                logger.debug("[SB] coherent UA override unavailable: %s", exc)
+                try:
+                    await self._session.send(
+                        "Emulation.setUserAgentOverride", {"userAgent": ua}
+                    )
+                except Exception:
+                    pass
 
     async def set_viewport_size(self, size: Dict[str, Any]) -> None:
         await self._session.send("Emulation.setDeviceMetricsOverride", {
@@ -1424,12 +1515,19 @@ class SBBrowser:
             except Exception:
                 pass
         if self._handle is not None and self._handle.user_agent:
-            try:
-                await page._session.send("Emulation.setUserAgentOverride", {
-                    "userAgent": self._handle.user_agent,
-                })
-            except Exception:
-                pass
+            override = _cdp_user_agent_override(self._handle.user_agent)
+            if override:
+                try:
+                    await page._session.send("Emulation.setUserAgentOverride", override)
+                except Exception as exc:
+                    logger.debug("[SB] initial coherent UA override unavailable: %s", exc)
+                    try:
+                        await page._session.send(
+                            "Emulation.setUserAgentOverride",
+                            {"userAgent": self._handle.user_agent},
+                        )
+                    except Exception:
+                        pass
         if self._handle is not None and self._handle.mobile:
             try:
                 await page._session.send("Emulation.setTouchEmulationEnabled", {"enabled": True, "maxTouchPoints": 5})

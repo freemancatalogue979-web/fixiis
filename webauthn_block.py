@@ -1,12 +1,11 @@
-"""Shared WebAuthn/passkey blocking for both browser backends.
+"""Legacy WebAuthn/passkey blocking shared by the browser backends.
 
-The Playwright path (browser_manager._apply_webauthn_disable) proved this
-two-layer approach on real sites: a JS override installed on every new
-document plus a CDP virtual authenticator so WebAuthn requests never
-reach the OS-level UI (Windows Hello / Microsoft passkey popups). Sites
-then fall back to password login automatically. Extracted into a module
-so the SeleniumBase backend (CDP passthrough) applies the exact same
-block instead of drifting.
+The Playwright path (browser_manager._apply_webauthn_disable) uses this
+opt-in workaround for password-only Microsoft flows: a JS override is
+installed on every new document plus a CDP virtual authenticator, so
+WebAuthn requests do not reach the OS-level UI. SeleniumBase can enable
+the same behavior explicitly with ``SB_BLOCK_WEBAUTHN=1``; its default is
+native WebAuthn so ordinary account providers see an unmodified API.
 """
 
 WEBAUTHN_BLOCK_JS = r"""            (function() {
