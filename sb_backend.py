@@ -36,13 +36,22 @@ import json
 import logging
 import os
 import re
+import shutil
 import socket
 import sys
+import threading
 import time
 import urllib.request
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
+
+# SeleniumBase sessions deliberately get private Xvfb processes.  The async
+# lock prevents two handles in this process from selecting the same display;
+# the thread lock protects the short-lived DISPLAY environment override while
+# SeleniumBase creates the corresponding Chrome process.
+_SB_XVFB_ALLOC_LOCK = asyncio.Lock()
+_SB_DRIVER_ENV_LOCK = threading.RLock()
 
 
 # ---------------------------------------------------------------------------
@@ -1419,8 +1428,12 @@ class SBBrowser:
 # ---------------------------------------------------------------------------
 
 class SBHandle:
-    """Owns the SeleniumBase Driver (sync, single-thread executor) and the
-    remote-debugging endpoint of the browser it launched."""
+    """Owns one SeleniumBase browser and its private headed Xvfb display.
+
+    The Xvfb process is created before ``Driver`` and stopped with the driver;
+    this path never adopts the application's shared Xvfb manager or an
+    inherited ``DISPLAY``.
+    """
 
     def __init__(self, profile_dir: Optional[str] = None,
                  viewport: Optional[Dict[str, Any]] = None,
@@ -1445,6 +1458,9 @@ class SBHandle:
         self._debugger_host: str = "127.0.0.1"
         self._ex: Optional[concurrent.futures.ThreadPoolExecutor] = None
         self._stopped = False
+        self._xvfb_process: Any = None
+        self._xvfb_display: Optional[str] = None
+        self._xvfb_stderr_task: Optional[asyncio.Task] = None
         # ChromeDriver/Selenium objects are thread-affine.  Keep every native
         # action on the same worker that created the Driver; using a second
         # executor worker can make an otherwise valid action target a stale
@@ -1484,7 +1500,28 @@ class SBHandle:
             kwargs["user_data_dir"] = self.profile_dir
         if proxy:
             kwargs["proxy"] = proxy
-        self.driver = Driver(**kwargs)
+
+        # SeleniumBase does not expose a reliable per-Driver environment kwarg.
+        # Set DISPLAY only for the synchronous Driver construction and restore
+        # the parent process immediately afterward. The thread lock prevents
+        # concurrent SB handles from crossing their private displays.
+        with _SB_DRIVER_ENV_LOCK:
+            previous_display = os.environ.get("DISPLAY")
+            previous_wayland = os.environ.get("WAYLAND_DISPLAY")
+            if self._xvfb_display:
+                os.environ["DISPLAY"] = self._xvfb_display
+                os.environ.pop("WAYLAND_DISPLAY", None)
+            try:
+                self.driver = Driver(**kwargs)
+            finally:
+                if previous_display is None:
+                    os.environ.pop("DISPLAY", None)
+                else:
+                    os.environ["DISPLAY"] = previous_display
+                if previous_wayland is None:
+                    os.environ.pop("WAYLAND_DISPLAY", None)
+                else:
+                    os.environ["WAYLAND_DISPLAY"] = previous_wayland
 
         # The ONLY fully reliable debug endpoint source: chromedriver tells
         # us where its browser listens.  DevToolsActivePort is a fallback
@@ -1819,6 +1856,31 @@ class SBHandle:
         except Exception:
             pass
 
+    async def _stop_private_xvfb(self) -> None:
+        """Terminate only this browser's Xvfb process."""
+        process = self._xvfb_process
+        stderr_task = self._xvfb_stderr_task
+        self._xvfb_process = None
+        self._xvfb_stderr_task = None
+        self._xvfb_display = None
+        if process is not None:
+            try:
+                if process.returncode is None:
+                    process.terminate()
+                await asyncio.wait_for(process.wait(), timeout=5.0)
+            except Exception:
+                try:
+                    if process.returncode is None:
+                        process.kill()
+                    await process.wait()
+                except Exception:
+                    pass
+        if stderr_task is not None:
+            try:
+                await asyncio.wait_for(stderr_task, timeout=0.5)
+            except Exception:
+                stderr_task.cancel()
+
     # ---- async side ----
 
     @staticmethod
@@ -1849,9 +1911,9 @@ class SBHandle:
     async def start(self) -> None:
         """Launch the UC browser and resolve its debug endpoint."""
         if sys.platform.startswith("linux"):
-            await _ensure_sb_xvfb()
+            await _ensure_sb_xvfb(self)
             if self.headless:
-                logger.warning("[SB] ignoring headless=True: SeleniumBase is pinned to Xvfb-headed mode")
+                logger.warning("[SB] ignoring headless=True: SeleniumBase is pinned to private Xvfb-headed mode")
             self.headless = False
         _t0 = time.monotonic()
         if self._ex is None:
@@ -1948,7 +2010,7 @@ class SBHandle:
             return False
 
     async def stop(self) -> None:
-        if self._stopped:
+        if self._stopped and self._xvfb_process is None:
             return
         self._stopped = True
         try:
@@ -1962,62 +2024,110 @@ class SBHandle:
                 self._ex.shutdown(wait=False, cancel_futures=True)
         except Exception:
             pass
+        await self._stop_private_xvfb()
 
 
 # ---------------------------------------------------------------------------
 # Launch factories
 # ---------------------------------------------------------------------------
 
-async def _ensure_sb_xvfb() -> Optional[str]:
-    """Give every Linux SeleniumBase launch its own headed X display.
+async def _ensure_sb_xvfb(handle: "SBHandle") -> Optional[str]:
+    """Create one private headed Xvfb display for one SB browser.
 
-    SeleniumBase is deliberately not allowed to inherit an operator's real
-    ``DISPLAY`` or silently turn into headless Chrome.  Reuse the process-wide
-    Xvfb manager when the application already started one; otherwise start a
-    virtual screen here and fail loudly if Xvfb is unavailable.  No Chrome
-    arguments are added by this guard.
+    This intentionally does not call ``get_xvfb_manager().start*()`` and does
+    not inherit or publish the application's ``DISPLAY``. The existing
+    manager may still be used as an installer when the Xvfb binary is missing,
+    but the process created here is owned by ``handle`` and is stopped with
+    that browser.
     """
     if not sys.platform.startswith("linux"):
         return None
 
-    # Import lazily to keep sb_backend importable in environments that do not
-    # install the browser stack, and to share the manager with BrowserManager.
-    from browser_manager import get_xvfb_manager
+    process = handle._xvfb_process
+    if process is not None and process.returncode is None:
+        return handle._xvfb_display
+    handle._xvfb_process = None
+    handle._xvfb_display = None
 
-    xvfb = get_xvfb_manager()
-    if not xvfb.ensure_checked():
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, xvfb.try_install)
-    if not xvfb.ensure_checked():
+    xvfb_bin = shutil.which("Xvfb")
+    if not xvfb_bin:
+        # Keep the existing best-effort package installation behavior, but do
+        # not use the shared manager's display even if it already has one.
+        try:
+            from browser_manager import get_xvfb_manager
+            installer = get_xvfb_manager()
+            if not installer.ensure_checked():
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, installer.try_install)
+        except Exception as exc:
+            logger.debug("[SB] private Xvfb installer failed: %s", exc)
+        xvfb_bin = shutil.which("Xvfb")
+    if not xvfb_bin:
         raise RuntimeError(
-            "SeleniumBase requires Xvfb on Linux; install xvfb or set "
-            "XVFB_AUTOINSTALL=1 before selecting BROWSER_BACKEND=sb"
+            "SeleniumBase requires Xvfb on Linux; install xvfb before selecting "
+            "BROWSER_BACKEND=sb"
         )
 
-    process = getattr(xvfb, "process", None)
-    if process is not None and getattr(process, "returncode", None) is not None:
-        await xvfb.stop_async()
-        process = None
-    if process is None:
-        if not await xvfb.start_async():
-            detail = getattr(xvfb, "_last_start_error", None)
-            raise RuntimeError(
-                "SeleniumBase could not start its Xvfb display"
-                + (f": {detail}" if detail else "")
-            )
-        process = getattr(xvfb, "process", None)
-    if process is None or getattr(process, "returncode", None) is not None:
-        raise RuntimeError("SeleniumBase Xvfb exited before Chrome could attach")
+    errors: List[str] = []
+    async with _SB_XVFB_ALLOC_LOCK:
+        # A different worker/process may own the traditional display range.
+        # Use a broad range and verify the child rather than trusting only the
+        # lock-file probe, which is subject to races.
+        for display_num in range(99, 200):
+            lock_path = f"/tmp/.X{display_num}-lock"
+            socket_path = f"/tmp/.X11-unix/X{display_num}"
+            if os.path.exists(lock_path) or os.path.exists(socket_path):
+                continue
 
-    display = xvfb.get_display()
-    if not display:
-        raise RuntimeError("SeleniumBase Xvfb started without a usable DISPLAY")
-    os.environ["DISPLAY"] = display
-    # A Wayland value can make Chromium choose a different window backend even
-    # when DISPLAY is set.  SeleniumBase's Linux path is intentionally X11.
-    os.environ.pop("WAYLAND_DISPLAY", None)
-    logger.info("[SB] using headed Chrome on dedicated Xvfb display %s", display)
-    return display
+            proc = None
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    xvfb_bin,
+                    f":{display_num}",
+                    "-screen", "0", "1920x1080x24", "-ac",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await asyncio.sleep(0.5)
+                if proc.returncode is not None:
+                    detail = ""
+                    if proc.stderr is not None:
+                        try:
+                            raw = await asyncio.wait_for(proc.stderr.read(), timeout=1.0)
+                            detail = raw.decode("utf-8", errors="replace").strip()
+                        except Exception:
+                            pass
+                    errors.append(
+                        f":{display_num} exited with code {proc.returncode}"
+                        + (f" ({detail[-300:]})" if detail else "")
+                    )
+                    continue
+
+                handle._xvfb_process = proc
+                handle._xvfb_display = f":{display_num}"
+                # Drain the long-lived stderr pipe so Xvfb cannot block after
+                # emitting warnings; startup failures were read above.
+                if proc.stderr is not None:
+                    handle._xvfb_stderr_task = asyncio.create_task(proc.stderr.read())
+                logger.info(
+                    "[SB] created private headed Xvfb display %s for browser",
+                    handle._xvfb_display,
+                )
+                return handle._xvfb_display
+            except Exception as exc:
+                errors.append(f":{display_num} launch failed ({exc})")
+                if proc is not None and proc.returncode is None:
+                    try:
+                        proc.terminate()
+                        await proc.wait()
+                    except Exception:
+                        pass
+
+    detail = "; ".join(errors[-3:])
+    raise RuntimeError(
+        "SeleniumBase could not create a private Xvfb display in :99-:199"
+        + (f": {detail}" if detail else "")
+    )
 
 
 async def _launch_stack(profile_dir: Optional[str], viewport: Dict[str, Any],

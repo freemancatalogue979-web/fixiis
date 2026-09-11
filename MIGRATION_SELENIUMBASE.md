@@ -9,9 +9,10 @@
 > P2: `ARCHIVE_FORMAT=mhtml` via CDP
 > `Page.captureSnapshot`. P5: `CAPTCHA_MODE=auto` probes for checkbox-class challenges after navigations
 > and runs `driver.uc_gui_click_captcha()` (≤2 attempts). **Linux display guarantee:** every
-> SeleniumBase launch now starts/reuses the shared Xvfb manager, overrides `DISPLAY` to that virtual
-> screen, and forces `headless=False`; if Xvfb is unavailable, the SB launch fails loudly instead of
-> silently using a real operator display or plain headless mode. This guard adds no Chrome flags and
+> Each SeleniumBase browser now creates and owns a private Xvfb process/display, uses that display
+> only while its `Driver` is constructed, and stops Xvfb with the browser. It never adopts the shared
+> application display or inherited `DISPLAY`; if Xvfb is unavailable, the SB launch fails loudly instead
+> of silently using a real operator display or plain headless mode. This guard adds no Chrome flags and
 > the SB path does not load/import a browser extension. Mobile iPhone/iPad inputs are normalized to
 > the same Android 15 Pixel 7 Chrome UA in both SB and Playwright paths. Keywords verified byte-for-byte against
 > installed seleniumbase **4.53.7** (chromium_arg comma-join, window_size kwarg, DevToolsActivePort
