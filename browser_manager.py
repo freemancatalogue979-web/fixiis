@@ -491,6 +491,7 @@ class XvfbManager:
         self._check_task = None
         self._lock = asyncio.Lock()
         self._startup_complete = asyncio.Event()
+        self._last_start_error: Optional[str] = None
         # NOTE: the Xvfb availability check is LAZY on purpose - it must not
         # create asyncio tasks here, because this constructor can run outside
         # a running event loop (sync app startup) where create_task() crashes.
@@ -623,50 +624,87 @@ class XvfbManager:
                 and not os.environ.get('WAYLAND_DISPLAY'))
     
     async def start_async(self, display_num: int = 99) -> bool:
-        """Start Xvfb on specified display number - fully async"""
+        """Start Xvfb on a free display, retrying races and stale slots.
+
+        The old implementation only inspected ``:99`` through ``:108`` and
+        discarded Xvfb's stderr. On hosts with a supervisor-owned X server,
+        stale lock files, or several worker processes, every candidate could
+        be rejected even though another display was available. Keep the SB
+        path Xvfb-only, but search a wider range and verify each child before
+        publishing ``DISPLAY``.
+        """
         async with self._lock:
             if self.process is not None:
-                self._startup_complete.set()
-                return True
-            
-            # Wait for xvfb check to complete
+                if self.process.returncode is None:
+                    self._startup_complete.set()
+                    return True
+                # The previous child died between launches. Drop its handle
+                # before searching for a replacement display.
+                self.process = None
+                self.display_num = None
+
+            # Wait for xvfb check to complete.
             await self._check_xvfb_async()
             if not self.xvfb_available:
+                self._last_start_error = "Xvfb executable is not available"
                 return False
-            
-            # Try to find an available display
-            for d in range(display_num, display_num + 10):
+
+            self._last_start_error = None
+            # Do not assume the traditional :99-:108 range is free. The
+            # manager is process-global, while deployments may also run a
+            # display manager, browser workers, or another service using it.
+            candidates = range(display_num, max(display_num + 100, 200))
+            for d in candidates:
                 lock_path = f'/tmp/.X{d}-lock'
                 socket_path = f'/tmp/.X11-unix/X{d}'
-                
-                if not os.path.exists(lock_path) and not os.path.exists(socket_path):
+                if os.path.exists(lock_path) or os.path.exists(socket_path):
+                    continue
+
+                proc = None
+                try:
+                    # Capture only stderr so a failed Xvfb gives the operator
+                    # the real reason (permissions, stale display, missing
+                    # extension, etc.) without buffering normal stdout.
+                    proc = await asyncio.create_subprocess_exec(
+                        'Xvfb', f':{d}', '-screen', '0', '1920x1080x24', '-ac',
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    await asyncio.sleep(0.5)
+                    if proc.returncode is not None:
+                        error = b''
+                        if proc.stderr is not None:
+                            try:
+                                error = await asyncio.wait_for(proc.stderr.read(), timeout=1.0)
+                            except Exception:
+                                pass
+                        detail = error.decode('utf-8', errors='replace').strip()
+                        self._last_start_error = (
+                            f"Xvfb :{d} exited with code {proc.returncode}"
+                            + (f": {detail[-500:]}" if detail else "")
+                        )
+                        continue
+
+                    self.process = proc
                     self.display_num = d
-                    break
-            else:
-                return False
-            
-            try:
-                # Start Xvfb with common screen resolution
-                # FIX: Use asyncio.create_subprocess_exec for non-blocking launch
-                self.process = await asyncio.create_subprocess_exec(
-                    'Xvfb', f':{self.display_num}', '-screen', '0', '1920x1080x24', '-ac',
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL
+                    os.environ['DISPLAY'] = f':{d}'
+                    self._startup_complete.set()
+                    return True
+                except Exception as exc:
+                    self._last_start_error = f"Xvfb :{d} launch failed: {exc}"
+                    if proc is not None and proc.returncode is None:
+                        try:
+                            proc.terminate()
+                            await proc.wait()
+                        except Exception:
+                            pass
+                    continue
+
+            if self._last_start_error is None:
+                self._last_start_error = (
+                    f"no free X display found in :{display_num}-:{max(display_num + 99, 199)}"
                 )
-                
-                # FIX: Use asyncio.sleep instead of blocking time.sleep
-                await asyncio.sleep(0.5)  # Give Xvfb time to start (reduced from 1s)
-                
-                # Set DISPLAY environment variable
-                os.environ['DISPLAY'] = f':{self.display_num}'
-                
-                self._startup_complete.set()
-                return True
-                
-            except Exception as e:
-                logger.error(f"Xvfb start failed: {e}")
-                self.process = None
-                return False
+            return False
     
     def start(self, display_num: int = 99) -> bool:
         """Synchronous wrapper - CRITICAL FIX: Never block in async context"""

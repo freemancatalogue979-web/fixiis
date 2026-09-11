@@ -2000,7 +2000,11 @@ async def _ensure_sb_xvfb() -> Optional[str]:
         process = None
     if process is None:
         if not await xvfb.start_async():
-            raise RuntimeError("SeleniumBase could not start its Xvfb display")
+            detail = getattr(xvfb, "_last_start_error", None)
+            raise RuntimeError(
+                "SeleniumBase could not start its Xvfb display"
+                + (f": {detail}" if detail else "")
+            )
         process = getattr(xvfb, "process", None)
     if process is None or getattr(process, "returncode", None) is not None:
         raise RuntimeError("SeleniumBase Xvfb exited before Chrome could attach")
