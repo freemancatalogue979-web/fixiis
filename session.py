@@ -1613,7 +1613,18 @@ class NeoStreamingSession:
                 await self._send_metadata()
             except Exception as e:
                 log_error(f"[TABS] Error sending metadata: {e}")
-            
+
+            # The shared DOMCaptureSession may still be bound to the tab that
+            # was just replaced. Rebind it immediately and send a navigation
+            # floor for the newly active page; otherwise its URL watcher keeps
+            # polling a closed/previous page and the mirror appears frozen.
+            try:
+                if self.dom_capture is not None:
+                    self._sync_dom_capture()
+                    await self.capture_remote_page(reason="tab_switch", force=True)
+            except Exception as e:
+                log_error(f"[TABS] Error rebinding DOM capture: {e}")
+
             return True
             
         except Exception as e:

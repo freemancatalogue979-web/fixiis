@@ -2780,7 +2780,7 @@ async def _install_delta_observer(page: Any, session: "DOMCaptureSession") -> bo
                 session._delta_active = False
                 if (session.has_initial_capture
                         and not session._explicit_navigation_in_progress):
-                    await session.send_page(reason="navigation")
+                    await session._capture_navigation_once("navigation")
                 return
             if payload_text == '[["overflow"]]':
                 if not session._delta_active or session._send_inflight:
@@ -2995,6 +2995,10 @@ class DOMCaptureSession:
         # websocket.  Without this, an already-validated patch task can yield
         # just as a recovery capture starts and arrive after its newer gen.
         self._ws_send_lock = asyncio.Lock()
+        # Navigation controls and the URL watcher can observe the same change
+        # (especially on SB/history.pushState). Serialize their recovery send
+        # so the mirror never races two full documents for one URL.
+        self._navigation_capture_lock = asyncio.Lock()
         self._pending_reason: Optional[str] = None
         self._overlap_count: int = 0
         # Generation counter — bumped on every full_document send; delta
@@ -3104,13 +3108,45 @@ class DOMCaptureSession:
                 pass
         self.url_watch_task = None
 
+    async def _capture_navigation_once(self, reason: str) -> Optional[str]:
+        """Serialize one navigation recovery send at a time.
+
+        The delta observer emits a control batch for a new document, while
+        the URL watcher also sees same-document history changes. Both are
+        needed: the former catches reloads that keep the same URL, and the
+        latter catches SPA ``pushState``/``replaceState`` changes. A lock
+        keeps the two paths from racing stale full documents.
+        """
+        async with self._navigation_capture_lock:
+            try:
+                current_url = self.page.url if self.page is not None else None
+            except Exception:
+                current_url = None
+            # The adapter's cached URL can briefly lag the document event. Ask
+            # the live document once on navigation so the full frame is labeled
+            # with the page that was actually captured, not the previous URL.
+            if self.page is not None:
+                try:
+                    live_url = await self.page.evaluate("location.href")
+                    if isinstance(live_url, str) and live_url:
+                        current_url = live_url
+                except Exception:
+                    pass
+            if current_url:
+                # The URL watcher is a fallback. If the observer/explicit
+                # navigation already sent this URL while it waited for the
+                # lock, do not rebuild the mirror a second time.
+                if reason == "url_change" and current_url == self.last_sent_url:
+                    return current_url
+            return await self.send_page(reason=reason, _url_override=current_url)
+
     async def watch_url(self, interval_s: float = URL_WATCH_INTERVAL_S) -> None:
         """Watch the page URL as a recovery fallback.
 
-        The persistent delta init script emits a navigation control for the
-        normal path, including same-URL reloads.  This loop only performs the
-        old stability wait/full capture when delta installation is unavailable,
-        and otherwise stays a cheap cached-URL check.
+        The persistent delta init script emits a navigation control for full
+        document loads, including same-URL reloads. This loop also remains a
+        fallback for same-document SPA history changes and missed controls;
+        duplicate sends are serialized and suppressed by the navigation lock.
         """
         last_url: Optional[str] = None
         try:
@@ -3135,6 +3171,16 @@ class DOMCaptureSession:
                     # here; this watcher remains the fallback for pages where
                     # delta installation failed.
                     if self._delta_installed:
+                        # A healthy observer owns normal full-document
+                        # navigations, but it cannot observe SPA
+                        # history.pushState/replaceState. Keep the watcher as
+                        # a cheap URL fallback instead of blindly skipping the
+                        # change; _capture_navigation_once deduplicates a
+                        # navigation control that arrived first.
+                        try:
+                            await self._capture_navigation_once("url_change")
+                        except Exception as exc:
+                            logger.debug("URL-watch delta-path fallback failed: %s", exc)
                         last_url = current_url
                         await asyncio.sleep(interval_s)
                         continue
@@ -3167,7 +3213,7 @@ class DOMCaptureSession:
                     # waiting for stability.  Do not rebuild the iframe twice.
                     if current_url != self.last_sent_url:
                         try:
-                            await self._send_full(current_url, reason="url_change")
+                            await self._capture_navigation_once("url_change")
                         except Exception as exc:
                             logger.debug("URL-watch full capture failed: %s", exc)
                     else:
@@ -3282,9 +3328,13 @@ class DOMCaptureSession:
         """Legacy delta-capture entry point.  No-op in single-capture mode."""
         return None
 
-    async def send_page(self, reason: Optional[str] = None, force: bool = False) -> Optional[str]:  # noqa: ARG002
+    async def send_page(self, reason: Optional[str] = None, force: bool = False,
+                        _url_override: Optional[str] = None) -> Optional[str]:  # noqa: ARG002
         """Run a full SingleFile capture and ship it to the websocket.
         Returns the URL on success, None on failure.
+
+        ``_url_override`` is used only by the navigation recovery path when a
+        backend's cached page URL may lag the live document by one CDP event.
         """
         if self.page is None:
             return None
@@ -3300,10 +3350,13 @@ class DOMCaptureSession:
                 await self.enable_interaction_capture()
             except Exception:
                 pass
-        try:
-            url = self.page.url
-        except Exception:
-            url = None
+        if _url_override is not None:
+            url = _url_override
+        else:
+            try:
+                url = self.page.url
+            except Exception:
+                url = None
         return await self._send_full(url, reason=reason or "manual")
 
     # ------------------------------------------------------------------
@@ -3567,7 +3620,10 @@ class DOMCaptureSession:
                 await _ensure_page_stable(self.page)
             except Exception as exc:
                 logger.debug("post-nav page-stability wait failed: %s", exc)
-            await self._send_full(url, reason="url_change")
+            # Use the live page URL after redirects rather than the requested
+            # URL argument; otherwise the client can remain labeled with the
+            # pre-redirect page even though the DOM is new.
+            await self._capture_navigation_once("url_change")
         except Exception as exc:
             logger.debug("handle_navigation failed: %s", exc)
         finally:

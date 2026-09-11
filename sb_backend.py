@@ -494,6 +494,7 @@ class SBPage:
         self._session = _CDPSession(client, session_id)
         self._closed = False
         self._url: str = "about:blank"
+        self._main_frame_id: Optional[str] = None
         self._listeners: Dict[str, List[Callable]] = {}
         self._bindings: Dict[str, Callable] = {}
         self._mobile = context._mobile
@@ -505,8 +506,18 @@ class SBPage:
     # ---- lifecycle ----------------------------------------------------
 
     async def _init(self) -> None:
+        # Target.targetInfoChanged is not a complete navigation signal on all
+        # Chrome builds. Register page-scoped events before enabling Page so
+        # DOMCaptureSession never reads the previous document URL.
+        self._session.on("Page.frameNavigated", self._on_main_frame_navigated)
+        self._session.on("Page.navigatedWithinDocument", self._on_same_document_navigated)
         await self._session.send("Page.enable")
         await self._session.send("Runtime.enable")
+        try:
+            tree = await self._session.send("Page.getFrameTree", timeout=5)
+            self._main_frame_id = (((tree or {}).get("frameTree") or {}).get("frame") or {}).get("id")
+        except Exception:
+            pass
         # Keep CDP input events flowing even when Chrome is not the OS
         # foreground process.  This is the single biggest reason clicks
         # "do nothing" on the SB backend: Chrome is launched via
@@ -567,6 +578,31 @@ class SBPage:
     def _update_url(self, url: Optional[str]) -> None:
         if url:
             self._url = url
+
+    def _on_main_frame_navigated(self, params: dict) -> None:
+        """Keep the Playwright-shaped ``page.url`` current for SB pages.
+
+        ``Target.targetInfoChanged`` is not emitted consistently for link
+        navigations and history.pushState/replaceState.  The page-scoped CDP
+        navigation events are authoritative for both full and same-document
+        URL changes, and DOM capture reads this cached property.
+        """
+        frame = (params or {}).get("frame") or {}
+        if frame.get("parentId"):
+            return
+        if frame.get("id"):
+            self._main_frame_id = frame.get("id")
+        url = frame.get("url") or frame.get("unreachableUrl")
+        if url:
+            self._update_url(url)
+
+    def _on_same_document_navigated(self, params: dict) -> None:
+        frame_id = (params or {}).get("frameId")
+        if self._main_frame_id and frame_id and frame_id != self._main_frame_id:
+            return
+        url = (params or {}).get("url")
+        if url:
+            self._update_url(url)
 
     # ---- events -------------------------------------------------------
 

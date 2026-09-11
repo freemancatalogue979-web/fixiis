@@ -4173,9 +4173,16 @@ function applySpinnerColorFromHex(hexColor) {
             }
 
             function reportPageChange(newUrl) {
+                if (!newUrl) return;
+                // Keep the client-side URL authoritative as well as reporting
+                // the transition. Previously only lastReportedUrl changed,
+                // so a mirror could render a new document while heartbeats,
+                // favicon/title fallback, and reconnect state still pointed at
+                // the previous page.
+                state.targetUrl = newUrl;
                 if (!state.sessionId || !state.connected) return;
                 
-                if (newUrl && newUrl !== state.lastReportedUrl) {
+                if (newUrl !== state.lastReportedUrl) {
                     state.lastReportedUrl = newUrl;
                     reportSessionToServer('page_change');
                 }
