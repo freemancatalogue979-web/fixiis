@@ -7,8 +7,9 @@
 > py_compile, node --check, a 28-case jsdom end-to-end suite (serializer → mirror render → observer ops →
 > patch apply → parity asserts) and a 22-case asyncio harness (fast send, asset rewrite incl. CSS recursion,
 > unchanged-skip, coalesce latest-wins, SingleFile degenerate fallback, delta relay/drop/overflow).
-> One behavioral change to be aware of: python-side `click`/`mouseup` recaptures are now skipped when the
-> in-page trigger is installed (it already owns those); typing recaptures are unchanged.
+> One behavioral change to be aware of: the in-page trigger now delegates safe mutations entirely to
+> the delta observer.  Full captures are reserved for navigation, observer overflow, structural
+> desynchronization, and explicit resync; this avoids rebuilding the iframe after ordinary clicks.
 > Follow-up: small images/icons (<= `DOM_CAPTURE_EMBED_MAX_BYTES`, default 1 MB) are data-URI embedded
 > in the HTML (logos/SVGs/GIFs render without the client ever hitting /assets — proxy/offline safe);
 > larger media + CSS + JS keep the cache path; URL->digest memoization makes every URL truly fetch-once;
@@ -59,7 +60,7 @@ already half-built in the repo.
 ### What the proposal missed (and it changes the plan's shape)
 
 1. **Double-trigger per interaction.** Two independent paths call `send_page`:
-   - in-page `_INTERACTION_TRIGGER_JS` → `__domCaptureRequest` → `_on_request` (0.25 s flood control)
+   - in-page `_INTERACTION_TRIGGER_JS` → `__domCaptureRequest` → `_on_request` (0.08 s flood control; delta-first path)
    - `session.py` input handlers → `capture_remote_page(reason='click'|'text'|'keydown'|...)` — **no debounce at all**, each a fresh `asyncio` task.
    Overlapping SingleFile runs stack up under fast typing/clicking.
 2. **Dead asset-cache infrastructure already built:**
@@ -122,7 +123,7 @@ Expected: 2–8 s → **50–300 ms** per interaction push; 2–8 MB → **200�
 (deflates to ~50–150 KB on the wire).
 Flag: `DOM_CAPTURE_MODE=fast|singlefile` (default `fast`, auto-fallback to singlefile
 for a session when fast capture returns degenerate output, e.g. <2 KB body on a
-non-empty page). SingleFile path untouched for PCM/archive captures.
+non-empty page). Legacy Playwright/direct SingleFile path remains untouched for archive captures.
 
 ### D2 — Coalesce + single trigger (1–2 h, removes self-inflicted load)
 
@@ -139,17 +140,21 @@ non-empty page). SingleFile path untouched for PCM/archive captures.
 ### D3 — Delta layer, "feels alive" (1–2 days, behind `LIVE_DELTA=1`)
 
 - Extend the existing injected JS with a MutationObserver batching ops
-  (attributes / characterData / childList, compacted) every ~100 ms and on activation;
-  form `.value`/`.checked` mirrored via input/change listeners (MutationObserver can't
-  see property-only changes — this is the classic trap; handled via listeners).
-- Wire: `dom_patch {gen, base_gen, ops[]}` JSON frames over the same WS (deflate already
-  on; msgpack only if D0/D3 profiling shows JSON CPU mattering — it won't at this size).
+  (attributes / characterData / childList, compacted) every `DOM_DELTA_FLUSH_MS`
+  (default 24 ms) and on activation; form `.value`/`.checked` mirrored via
+  input/change listeners (MutationObserver can't see property-only changes — the
+  classic trap; handled via listeners).
+- Wire: `dom_patch {gen, ops[]}` JSON frames over the same WS.  The server shape-checks
+  the browser's compact batch and wraps the original JSON text instead of parsing
+  and serializing the operation list on the Python hot path.
 - Client: keep the iframe alive across updates; apply ops in place; focus/selection
-  naturally preserved (drops most restore machinery for the delta path).
-- **Hard consistency**: every full capture = generation N + structural checksum;
-  client acks; on op overflow (>2k), generation gap, or nav → full fast capture.
-  Recovery reuses existing `resync_request` protocol. Delta is strictly opportunistic;
-  full capture always the floor.
+  naturally preserved.  Interaction triggers do not start a full capture when the
+  observer is healthy.
+- **Hard consistency**: every full capture = generation N; on op overflow (>1500),
+  generation mismatch, missing patch state, navigation, or explicit resync → full
+  capture.  Recovery reuses existing `resync_request` protocol.  Delta is
+  opportunistic; full capture always remains the floor, including snapshot-preferred
+  hosts.
 
 ### D4 — Cleanup (after D1/D2 soak)
 
@@ -180,7 +185,7 @@ non-empty page). SingleFile path untouched for PCM/archive captures.
 | D0 | timing/counter logs (DEBUG) | n/a | per-reason ms/bytes table from real box |
 | D1 | fast capture + asset rewrite | `DOM_CAPTURE_MODE` (fast) | interaction push p95 < 300 ms; bytes/push −90%; visual parity on 3 targets |
 | D2 | coalesce + single trigger + no-change skip | `SEND_COALESCE=1` (on) | in-flight overlap count → 0; dup sends/interaction → 1 |
-| D3 | delta layer | `LIVE_DELTA=1` (off→on) | perceived update < 150 ms; zero desyncs needing manual resync in soak |
+| D3 | delta layer | `LIVE_DELTA=1` (on) | perceived mutation update targets one frame; zero desyncs needing manual resync in soak |
 | D4 | docs/hygiene | n/a | py_compile/node --check green; no behavior change |
 
 Rollback: each flag flips back independently; D1 keeps SingleFile code path intact.
@@ -332,16 +337,17 @@ now suppresses implicit submission in text inputs (server-side Enter
 reproduces the real submit) and converts Enter on links/buttons into the
 standard `mirrorClick` dispatch.
 
-**Snapshot mode (MHTML-style):** `DOMCaptureSession.snapshot_only` — default
+**Snapshot preference (MHTML-style fidelity floor):** `DOMCaptureSession.snapshot_only` — default
 for all hosts EXCEPT DOM_LIVE_HOSTS (google/netflix/comcast/youtube/gstatic,
-env overridable).  In snapshot mode no delta observer is ever installed and
-no dom_patch frames are sent: every update is a baked full capture.  Live
-subframes, delta-layer drift and the whole class of "mangled blob URL"
-failures disappear for those sites; double-buffered swaps + scroll/value
-continuity make the full captures read as natural page changes.  Interaction
-recapture cadence is mode-aware (DOM_SNAPSHOT_MIN_INTERVAL_S, default 0.7 s).
-Prefer-live decisions are applied per navigation via
-`prefer_snapshot_for_url()` in session.py.
+env overridable).  Snapshot-preferred pages still receive safe `dom_patch` frames
+between full documents; the full capture remains the recovery/navigation floor,
+so the iframe is not rebuilt for ordinary mutations.  Double-buffered full swaps
+plus scroll/value continuity remain available for structural recovery.  If the
+observer cannot carry a generation, its full-capture fallback is mode-aware
+(`DOM_SNAPSHOT_MIN_INTERVAL_S`, default 0.25 s), while healthy pages update via
+the delta observer.
+Prefer-live decisions are applied per navigation via `prefer_snapshot_for_url()`
+in session.py.
 
 ## LPV base-href root cause: the "…apphttps" glued-host DNS errors (Sept 2026)
 
@@ -453,20 +459,14 @@ our relative refs resolve against the real origin via <base> and the big
 font/CDN hosts are CORS-open; revisit only if a font-heavy site shows
 sure-fire font failures.
 
-## SingleFile extension on the SB/PCM browser (Sept 2026)
+## SingleFile extension boundary on the SB/PCM browser (Sept 2026)
 
-PCM page capture REQUIRES the SingleFile extension, but the SeleniumBase
-UC launcher never passed --load-extension at all (only the
-Playwright/direct path had it), and Chrome 137+ branded stable ignores
---load-extension unless DisableLoadExtensionCommandLineSwitch is off.
-``singlefile_ext.py`` is now the single resolver/flag-builder for ALL
-launchers: strips conflicting switches, adds --load-extension +
---disable-extensions-except, and disables the kill-switch feature.
-SB gets merge_features=False because SB re-splits chromium_arg on
-commas — a multi-value merged --disable-features would arrive corrupted.
-The browser_manager inline block (2810 bytes) was replaced by the shared
-helper. Manifest already trimmed to bundled files, so the extension
-loads cleanly and PCM capture via _capture_with_single_file works in SB.
+The SeleniumBase UC path intentionally does **not** import, load, or discover
+an extension. Its live mirror uses the fast serializer and the CDP/MHTML or
+`outerHTML` full-capture recovery tiers, so ordinary SB launches add no
+extension switches and do not depend on a service worker. Legacy
+Playwright/direct archive flows retain their separately configured
+SingleFile behavior; that boundary is outside the SB launch path.
 
 ## PCM on Playwright + "plain-text site" fixes (Sept 2026)
 
@@ -526,7 +526,7 @@ custom element is the actionable target — with raw-coordinate fallback.
 Latency hardening: selector actionability timeout 3000 → 1200 ms before the
 coordinate fallback (the 3 s stall read as "the click did nothing").
 
-### PCM browser launch on display-less VPSs (headless + extension)
+### Legacy Playwright/direct PCM launch on display-less VPSs (headless + extension)
 `BrowserType.launch_persistent_context: Target page, context or browser has
 been closed` on every retry root-caused to the-extension-means-headed rule in
 `browser_manager.py`: it forced `headless=False` + stripped `--headless*` even

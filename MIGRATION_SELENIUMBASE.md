@@ -8,7 +8,11 @@
 > both strict when SB is explicitly selected (no hidden Playwright browser after an SB attach failure).
 > P2: `ARCHIVE_FORMAT=mhtml` via CDP
 > `Page.captureSnapshot`. P5: `CAPTCHA_MODE=auto` probes for checkbox-class challenges after navigations
-> and runs `driver.uc_gui_click_captcha()` (≤2 attempts). Keywords verified byte-for-byte against
+> and runs `driver.uc_gui_click_captcha()` (≤2 attempts). **Linux display guarantee:** every
+> SeleniumBase launch now starts/reuses the shared Xvfb manager, overrides `DISPLAY` to that virtual
+> screen, and forces `headless=False`; if Xvfb is unavailable, the SB launch fails loudly instead of
+> silently using a real operator display or plain headless mode. This guard adds no Chrome flags and
+> the SB path does not load/import a browser extension. Keywords verified byte-for-byte against
 > installed seleniumbase **4.53.7** (chromium_arg comma-join, window_size kwarg, DevToolsActivePort
 > discovery — UC/chromedriver owns the debug-port flag, so we never set it). Verified: py_compile all,
 > 31-case fake-CDP adapter harness (navigation/evaluate/input/bindings/cookies/permissions/popups/
@@ -129,11 +133,12 @@ a known `--remote-debugging-port`. So:
 ## 4. What we KEEP custom (SB doesn’t do these)
 
 1. **Screencast streaming** (`Page.startScreencast` w/ PNG crop pipeline).
-2. **DOM capture**: *recommended simplification* — swap the SingleFile
-   extension dance for CDP **`Page.captureSnapshot` (MHTML)**. One call,
-   full serialized page, no extension discovery, no service-worker races
-   (the retry spam source). Keep SingleFile-extension as fallback behind a
-   flag.
+2. **DOM capture**: the live path uses the fast serializer plus CDP
+   **`Page.captureSnapshot` (MHTML)** for full-document recovery. The SB path
+   does not load/import a browser extension, so it never performs extension
+   discovery or service-worker retries; if the fast tier is unavailable it
+   falls back to the page's `outerHTML` tier. Legacy Playwright/direct archive
+   flows retain their separately configured capture behavior.
 3. **Multi-session registry / reconnect / admin cast** — unaffected, they
    consume BrowserHandle.
 4. **Profile persistence** — SB takes `user_data_dir`; our fingerprint
@@ -203,7 +208,7 @@ and exercises screencast + input + rebuilds.
 |---|---|
 | SB is sync; blocking the asyncio loop | dedicated per-driver thread executor; every SB call via `to_thread` |
 | UC mode reconnect cycles (driver↔browser) break attached CDP clients | our CDP socket is browser-level, not WebDriver; add re-attach watchdog (pattern exists in PCM adopt logic) |
-| Extensions under UC (SingleFile) | sidestep via `Page.captureSnapshot` MHTML; extension optional |
+| Extensions under UC (SingleFile) | SB sidesteps them entirely; use CDP `Page.captureSnapshot` MHTML/fast capture |
 | Headless hosts | UC needs a display: Windows headed = fine; Linux → SB auto-Xvfb |
 | Behavior drift (mouse/keyboard fidelity) | SB prefers Selenium/ChromeDriver W3C pointer/key actions on the same UC target, with CDP `Input.dispatch*` as a fallback; failures are logged |
 | Dependency weight | SB pulls selenium + UC; net-neutral once Playwright dropped |

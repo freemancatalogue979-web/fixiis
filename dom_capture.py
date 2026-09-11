@@ -22,8 +22,10 @@ Two-tier live-mirror pipeline (see MIGRATION_LIVE_MIRROR.md):
 
 Between full captures an in-page MutationObserver (``LIVE_DELTA=1``)
 streams compact DOM ops (``dom_patch`` frames) which the client
-applies in place instead of rebuilding the snapshot iframe.  Node
-identity is carried by ``data-mid`` stamps assigned during
+applies in place instead of rebuilding the snapshot iframe.  This
+patch-first path is used for both live-preferred and snapshot-preferred
+hosts; full documents remain the navigation, overflow, and recovery
+floor.  Node identity is carried by ``data-mid`` stamps assigned during
 serialization (WeakMap + counter page-side).
 
 Captures coalesce (``SEND_COALESCE=1``): at most one capture in
@@ -71,20 +73,35 @@ SINGLEFILE_TIMEOUT_S: int = int(os.environ.get("DOM_CAPTURE_SINGLEFILE_TIMEOUT_S
 # Minimum interval between interaction-triggered recaptures.  This is
 # purely a flood-control knob; it does NOT decide whether a click is
 # "real" -- that decision is made in the page by _INTERACTION_TRIGGER_JS.
+# The delta observer carries the first visual update; this only throttles
+# the slower full-document safety capture.
 INTERACTION_CAPTURE_MIN_INTERVAL_S: float = float(
-    os.environ.get("DOM_CAPTURE_INTERACTION_MIN_INTERVAL_S", "0.25")
+    os.environ.get("DOM_CAPTURE_INTERACTION_MIN_INTERVAL_S", "0.08")
 )
 
-# Snapshot-mode interaction recapture cadence (bigger: every recapture is a
-# full snapshot, so flood control matters more than freshness).
+# Snapshot-mode interaction cadence when the delta channel is unavailable.
+# Healthy snapshot-preferred pages patch in place and do not use this full
+# capture throttle for ordinary interactions.
 SNAPSHOT_CAPTURE_MIN_INTERVAL_S: float = float(
-    os.environ.get("DOM_SNAPSHOT_MIN_INTERVAL_S", "0.7")
+    os.environ.get("DOM_SNAPSHOT_MIN_INTERVAL_S", "0.25")
 )
 
-# Hosts that keep the live delta (DOM-mutation) pipeline.  Everything else
-# uses snapshot mode: full baked captures only, no delta observer, no live
-# subframe dependence -- the "page snapshot / mhtml-style" default the user
-# asked for (heavy sites keep deltas: google/netflix/comcast/...).
+# MutationObserver -> websocket batching.  120 ms made typing and dropdowns
+# visibly trail the real browser.  A 24 ms window is close to one 60 Hz frame
+# while still coalescing framework mutation bursts.
+DELTA_FLUSH_MS: int = max(0, int(os.environ.get("DOM_DELTA_FLUSH_MS", "24")))
+
+# URL polling is local (page.url is cached on the adapters), so 100 ms catches
+# a navigation much sooner than the old 500 ms loop without a CDP round-trip.
+URL_WATCH_INTERVAL_S: float = max(
+    0.05, float(os.environ.get("DOM_URL_WATCH_INTERVAL_S", "0.1"))
+)
+
+# Hosts that prefer a full-document consistency cadence.  Every host can
+# still use the live delta (DOM-mutation) pipeline when LIVE_DELTA is enabled;
+# snapshot preference now means "keep full captures as the fidelity floor",
+# not "disable in-place patches".  Heavy sites remain on the more aggressive
+# live cadence (google/netflix/comcast/...).
 _LIVE_DOM_HOSTS_RAW = os.environ.get(
     "DOM_LIVE_HOSTS", "google.com,netflix.com,comcast.com,youtube.com,gstatic.com"
 )
@@ -94,8 +111,12 @@ _LIVE_DOM_HOSTS = tuple(
 
 
 def prefer_snapshot_for_url(url: str) -> bool:
-    """True when the given URL should use snapshot-only captures (default),
-    False for the (small) list of hosts that keep delta updates."""
+    """True when the URL should keep full captures as its fidelity floor.
+
+    The return value no longer disables delta patches; it only selects the
+    more conservative full-capture cadence.  All hosts still get safe
+    in-place updates when LIVE_DELTA is enabled.
+    """
     if not url:
         return True
     try:
@@ -119,7 +140,8 @@ def prefer_snapshot_for_url(url: str) -> bool:
 # Capture backend for the LIVE victim mirror:
 #   fast        — in-page serializer + asset-cache rewrite (default)
 #   singlefile  — legacy SingleFile extension round-trip (pre-overhaul)
-# Archive flows (PCM page manager, LPV store) keep SingleFile regardless:
+# Legacy Playwright/direct archive flows (PCM page manager, LPV store) keep
+# SingleFile regardless; the SeleniumBase path does not load the extension:
 # self-containment is the point there, not latency.
 DOM_CAPTURE_MODE: str = os.environ.get("DOM_CAPTURE_MODE", "fast").strip().lower()
 
@@ -1155,8 +1177,11 @@ async def _rewrite_assets_to_cache(html: str, base_url: str, page: Any = None) -
     # -- 3. Fetch what the memo missed (bounded parallelism + budget) ------
     import httpx  # NOTE: ImportError must propagate (caller kill-switch)
 
+    # User-agent evaluation is only needed when there is an actual network
+    # miss.  Cache hits are the normal recapture path and should not pay a
+    # browser round trip just to construct an unused HTTP client header.
     ua = _FETCH_UA_FALLBACK
-    if page is not None:
+    if fetch_list and page is not None:
         try:
             got = await page.evaluate("() => navigator.userAgent")
             if isinstance(got, str) and got:
@@ -2524,11 +2549,20 @@ _INTERACTION_TRIGGER_JS = r"""
 # per node per batch so fast typing ships the latest value once.
 _DELTA_OBSERVER_JS = r"""
 (() => {
+  // Init scripts also run in child frames.  The live mirror serializes the
+  // main document, so child-frame observers would create colliding mids and
+  // false patches for content the client never received.
+  if (window.top !== window) return;
   if (window.__shifixDeltaInstalled) return;
   window.__shifixDeltaInstalled = true;
   if (!window.__domMidMap) window.__domMidMap = new WeakMap();
   if (!window.__domMidNext) window.__domMidNext = 1;
   const MID = 'data-mid';
+  const DOC_TOKEN = (() => {
+    try {
+      return String(location.href || '') + '|' + String(performance.timeOrigin || Date.now());
+    } catch (e) { return String(Date.now()); }
+  })();
   const midOf = (el) => {
     if (!el || el.nodeType !== 1) return 0;
     let m = window.__domMidMap.get(el);
@@ -2576,53 +2610,78 @@ _DELTA_OBSERVER_JS = r"""
     out.push('</', tag, '>');
   };
   const ops = [];
-  const pendingVals = new Map();   // mid -> [value, checked|null], coalesced per batch
+  // Keep the first occurrence's position (important when a framework inserts
+  // a node and then mutates it), while replacing repeated writes to the same
+  // target with the latest value in this batch.
+  const coalesced = new Map();  // logical op key -> index in ops
   let scheduled = false;
   let overflowed = false;
   const OP_CAP = 1500;
   const schedule = () => {
     if (scheduled) return;
     scheduled = true;
-    setTimeout(flush, 120);
+    setTimeout(flush, __SHIFIX_DELTA_FLUSH_MS__);
+  };
+  const markOverflow = () => {
+    if (overflowed) return;
+    overflowed = true;
+    ops.length = 0;
+    coalesced.clear();
+    ops.push(['overflow']);
+    schedule();
   };
   const flush = () => {
     scheduled = false;
-    if (pendingVals.size) {
-      for (const [id, st] of pendingVals) ops.push(['v', id, st[0], st[1]]);
-      pendingVals.clear();
-    }
     if (!ops.length) return;
     const batch = ops.splice(0, ops.length);
+    coalesced.clear();
     overflowed = false;
     try {
       if (typeof window.__domDelta === 'function') {
-        window.__domDelta(JSON.stringify(batch));
+        window.__domDelta(JSON.stringify(batch), DOC_TOKEN);
       }
     } catch (e) { /* binding not wired yet */ }
   };
   const push = (op) => {
     if (overflowed) return;
     ops.push(op);
-    if (ops.length > OP_CAP) {
-      overflowed = true;
-      ops.length = 0;
-      ops.push(['overflow']);
+    if (ops.length > OP_CAP) markOverflow();
+    schedule();
+  };
+  const pushCoalesced = (key, op) => {
+    if (overflowed) return;
+    const oldIndex = coalesced.get(key);
+    if (oldIndex === undefined) {
+      coalesced.set(key, ops.length);
+      ops.push(op);
+      if (ops.length > OP_CAP) markOverflow();
+    } else {
+      ops[oldIndex] = op;
     }
     schedule();
+  };
+  const pushAttr = (el, name) => {
+    const id = midOf(el);
+    if (!id) return;
+    pushCoalesced('a\\0' + id + '\\0' + name, ['a', id, name, el.getAttribute(name)]);
+  };
+  const pushText = (parent, index, value) => {
+    const id = midOf(parent);
+    if (!id) return;
+    pushCoalesced('t\\0' + id + '\\0' + index, ['t', id, index, value]);
   };
   const pushVal = (el) => {
     const id = midOf(el);
     if (!id) return;
     const checked = (el.tagName === 'INPUT' && (el.type === 'checkbox' || el.type === 'radio')) ? !!el.checked : null;
-    pendingVals.set(id, [(el.value == null ? '' : String(el.value)), checked]);
-    schedule();
+    pushCoalesced('v\\0' + id, ['v', id, (el.value == null ? '' : String(el.value)), checked]);
   };
   const mo = new MutationObserver((recs) => {
     for (const r of recs) {
       if (r.type === 'attributes') {
         const el = r.target;
         if (r.attributeName === MID) continue;   // our own stamping
-        push(['a', midOf(el), r.attributeName, el.getAttribute(r.attributeName)]);
+        pushAttr(el, r.attributeName);
       } else if (r.type === 'characterData') {
         const p = r.target.parentNode;
         if (!p || p.nodeType !== 1) continue;
@@ -2630,21 +2689,24 @@ _DELTA_OBSERVER_JS = r"""
         for (const c of p.childNodes) {
           if (c.nodeType === 3) { if (c === r.target) { idx = i; break; } i++; }
         }
-        if (idx >= 0) push(['t', midOf(p), idx, r.target.nodeValue]);
+        if (idx >= 0) pushText(p, idx, r.target.nodeValue);
       } else if (r.type === 'childList') {
         const pm = midOf(r.target);
+        if (!pm) { markOverflow(); continue; }
         for (const rem of r.removedNodes) {
-          if (rem.nodeType !== 1) continue;
+          if (rem.nodeType !== 1) { markOverflow(); continue; }
           const m = window.__domMidMap.get(rem);
           if (m) push(['r', m]);
+          else markOverflow();
         }
         for (const add of r.addedNodes) {
-          if (add.nodeType !== 1) continue;
+          if (add.nodeType !== 1) { markOverflow(); continue; }
           let ref = r.nextSibling;
           while (ref && ref.nodeType !== 1) ref = ref.nextSibling;
           const refMid = ref ? midOf(ref) : 0;
           const buf = [];
           serSubtree(add, buf);
+          if (!buf.length) { markOverflow(); continue; }
           push(['i', pm, refMid, buf.join('')]);
         }
       }
@@ -2661,55 +2723,106 @@ _DELTA_OBSERVER_JS = r"""
   document.addEventListener('input', onFormEvent, true);
   document.addEventListener('change', onFormEvent, true);
   window.__shifixDeltaFlush = flush;
+  // A document can reload to the same URL.  Its token changes even when the
+  // URL watcher cannot, so the server can force a full navigation resync
+  // instead of letting new-document mids patch the old mirror.
+  setTimeout(() => {
+    try {
+      if (typeof window.__domDelta === 'function') {
+        window.__domDelta(JSON.stringify([['navigation']]), DOC_TOKEN);
+      }
+    } catch (e) { /* binding not wired yet */ }
+  }, 0);
 })();
 """
+
+# Keep the browser-side timer configurable without rebuilding the large script
+# at each install.  The resolved script is persistent across navigations.
+_DELTA_OBSERVER_JS = _DELTA_OBSERVER_JS.replace(
+    "__SHIFIX_DELTA_FLUSH_MS__", str(DELTA_FLUSH_MS)
+)
 
 
 async def _install_delta_observer(page: Any, session: "DOMCaptureSession") -> bool:
     """Install the delta observer + ``__domDelta`` relay binding.
 
-    Idempotent (JS-side guard flag); runs both as an init script (every
-    future navigation) and immediately (current document).  Patches are
-    DROPPED while a full capture is in flight — the pending full snapshot
-    supersedes them by definition.
+    The binding and init script are installed once per page object.  Both
+    survive a normal navigation; only the immediate evaluate is repeated for
+    the current document.  Re-exposing a Playwright/SB binding on every URL
+    change is an avoidable CDP round trip and can fail with "already exists",
+    which used to leave the new document without live patches.
     """
     if not LIVE_DELTA or page is None or session is None:
         return False
 
-    async def _on_delta(payload: Any) -> None:
+    async def _on_delta(payload: Any, doc_token: Any = None) -> None:
         try:
+            if session.page is not page:
+                return
             if session.websocket is None or session._stopped:
                 return
-            if session._send_inflight:
-                return  # pending full snapshot supersedes queued patches
             if not isinstance(payload, str) or not payload or len(payload) > 1_000_000:
                 return
-            ops = _json.loads(payload)
-            if not isinstance(ops, list) or not ops:
+            # JSON.stringify in the page always emits a compact array of
+            # operation arrays.  Shape-check the text and keep it intact for
+            # the normal path: parsing it in Python only to dump it again was
+            # pure CPU/memory churn.  The two control batches are exact strings
+            # emitted by this observer and are handled before the fast path.
+            payload_text = payload.strip()
+            if not payload_text.startswith("[[") or not payload_text.endswith(']]'):
                 return
-            first = ops[0]
-            if isinstance(first, list) and first and first[0] == "overflow":
+            if payload_text == '[["navigation"]]':
+                # The observer runs once per main document.  A reload can keep
+                # the same URL, so this control op is the navigation signal
+                # that the URL poller cannot provide.  Full capture is still
+                # suppressed during initial bootstrap, when the initial sender
+                # owns the first document.
+                session._delta_active = False
+                if (session.has_initial_capture
+                        and not session._explicit_navigation_in_progress):
+                    await session.send_page(reason="navigation")
+                return
+            if payload_text == '[["overflow"]]':
+                if not session._delta_active or session._send_inflight:
+                    return
                 logger.debug("dc delta overflow -> full recapture (client %s)", session.client_id)
                 await session.send_page(reason="delta_overflow")
                 return
-            await session.websocket.send_text(_json.dumps({
-                "type": "dom_patch",
-                "gen": session._gen,
-                "ops": ops,
-            }, ensure_ascii=False))
+            if payload_text == "[[]]":
+                return
+            if not session._delta_active:
+                return  # current full-capture tier cannot carry safe mids
+            if session._send_inflight:
+                return  # pending full snapshot supersedes queued patches
+
+            # The browser already paid for JSON.stringify(batch).  Wrap that
+            # exact JSON text instead of parsing and serializing the operation
+            # list a second time.  Recheck inflight state under the send lock
+            # so a full recovery cannot be followed by an old-generation patch.
+            async with session._ws_send_lock:
+                if session._send_inflight:
+                    return
+                gen = int(session._gen)
+                doc_json = _json.dumps(str(doc_token)[:256], ensure_ascii=False) if doc_token is not None else "null"
+                frame = '{"type":"dom_patch","gen":' + str(gen) + ',"doc":' + doc_json + ',"ops":' + payload_text + '}'
+                await session.websocket.send_text(frame)
         except Exception as exc:
             logger.debug("delta relay failed: %s", exc)
 
-    try:
-        await page.expose_function("__domDelta", _on_delta)
-    except Exception as exc:
-        logger.debug("expose_function(__domDelta) failed: %s", exc)
-        return False
-    try:
-        await page.add_init_script(script=_DELTA_OBSERVER_JS)
-    except Exception as exc:
-        logger.debug("add_init_script(delta observer) failed: %s", exc)
-        return False
+    if not getattr(session, "_delta_binding_installed", False):
+        try:
+            await page.expose_function("__domDelta", _on_delta)
+            session._delta_binding_installed = True
+        except Exception as exc:
+            logger.debug("expose_function(__domDelta) failed: %s", exc)
+            return False
+    if not getattr(session, "_delta_init_script_installed", False):
+        try:
+            await page.add_init_script(script=_DELTA_OBSERVER_JS)
+            session._delta_init_script_installed = True
+        except Exception as exc:
+            logger.debug("add_init_script(delta observer) failed: %s", exc)
+            return False
     try:
         await page.evaluate(_DELTA_OBSERVER_JS)
     except Exception as exc:
@@ -2732,7 +2845,15 @@ async def _install_interaction_trigger(page: Any, session: "DOMCaptureSession") 
         # detection, this side just calls send_page.
         async def _on_request(reason: str, target_desc: str) -> None:
             try:
-                # Flood control -- don't recapture if we just did.
+                # Once the observer is installed, it is the single low-latency
+                # visual path.  Do not launch a full serializer after every
+                # safe click: full documents are reserved for navigation,
+                # observer overflow, structural desync, and explicit resync.
+                if getattr(session, "_delta_active", False):
+                    return
+
+                # Flood control remains for the no-delta fallback path, where
+                # the full document is the only way to reflect an activation.
                 now = asyncio.get_event_loop().time()
                 last = getattr(session, "_last_interaction_capture_t", 0.0)
                 _min_iv = (SNAPSHOT_CAPTURE_MIN_INTERVAL_S
@@ -2749,20 +2870,16 @@ async def _install_interaction_trigger(page: Any, session: "DOMCaptureSession") 
                 full_reason = f"interaction:{reason}"
                 if target_desc:
                     full_reason = f"{full_reason}:{target_desc}"
-                # Don't await capture_page itself to avoid blocking
-                # the JS handler; send_page is a coroutine and
-                # schedules a new task so the page's event loop is
-                # not blocked.
-                asyncio.create_task(
-                    session.send_page(reason=full_reason)
-                )
+                asyncio.create_task(session.send_page(reason=full_reason))
             except Exception as exc:
                 logger.debug("interaction recapture dispatch failed: %s", exc)
 
-        await page.expose_function(
-            "__domCaptureRequest",
-            _on_request,
-        )
+        if not getattr(session, "_interaction_binding_installed", False):
+            await page.expose_function(
+                "__domCaptureRequest",
+                _on_request,
+            )
+            session._interaction_binding_installed = True
     except Exception as exc:
         logger.debug("expose_function(__domCaptureRequest) failed: %s", exc)
         return False
@@ -2782,11 +2899,13 @@ async def _install_interaction_trigger(page: Any, session: "DOMCaptureSession") 
     # We still attempt a one-time page.evaluate so the very first
     # page (if it was already loaded before this function ran) gets
     # the trigger immediately rather than waiting for the next nav.
-    try:
-        await page.add_init_script(script=_INTERACTION_TRIGGER_JS)
-    except Exception as exc:
-        logger.debug("add_init_script(interaction trigger) failed: %s", exc)
-        return False
+    if not getattr(session, "_interaction_init_script_installed", False):
+        try:
+            await page.add_init_script(script=_INTERACTION_TRIGGER_JS)
+            session._interaction_init_script_installed = True
+        except Exception as exc:
+            logger.debug("add_init_script(interaction trigger) failed: %s", exc)
+            return False
 
     try:
         await page.evaluate(_INTERACTION_TRIGGER_JS)
@@ -2795,12 +2914,11 @@ async def _install_interaction_trigger(page: Any, session: "DOMCaptureSession") 
         # add_init_script and the JS-side guard handles that.
         logger.debug("install interaction trigger (immediate) failed: %s", exc)
 
-    # Live-delta layer rides the same install lifecycle (idempotent,
-    # guarded by the LIVE_DELTA env flag).
+    # Live-delta is also installed for snapshot-preferred hosts.  Those hosts
+    # still receive periodic/full recovery documents, but mutation patches
+    # keep the visible mirror current between them (hybrid mode).
     try:
-        # Snapshot mode: no delta observer at all -- every update is a full
-        # baked capture, so there is no live-mutation layer to install.
-        if not getattr(session, "snapshot_only", False) and await _install_delta_observer(page, session):
+        if await _install_delta_observer(page, session):
             session._delta_installed = True
     except Exception as exc:
         logger.debug("delta observer install failed: %s", exc)
@@ -2823,11 +2941,11 @@ class DOMCaptureSession:
         await session.send_page()       # capture again (explicit)
         await session.shutdown()
 
-    Sync strategy: **full capture only**.  Every call to ``send_page`` or
-    ``capture_page`` runs SingleFile and ships the inlined HTML to the
-    client.  No body-swap, no fingerprint polling, no patch grammar.
-    The caller is responsible for triggering captures (initial, on
-    navigation, on demand).
+    Sync strategy: full documents are the fidelity/recovery floor, while the
+    installed MutationObserver ships safe changes as in-place ``dom_patch``
+    frames.  The caller still triggers full captures for initial load,
+    navigation, overflow, and explicit recovery; ordinary interactions do
+    not rebuild the client iframe when the delta generation is healthy.
     """
 
     CAPTURE_STRATEGY: str = "single_capture"
@@ -2854,17 +2972,29 @@ class DOMCaptureSession:
         # _INTERACTION_TRIGGER_JS; this number just prevents an
         # automated click-storm from melting the capture pipeline.
         self._last_interaction_capture_t: float = 0.0
-        # Whether the generic interaction trigger has been installed
-        # on the current page.  Re-install on navigation.
+        # The JS listeners/init scripts and exposed bindings are page-object
+        # scoped and survive ordinary navigations.  Install each once; repeat
+        # only the immediate evaluate for the new document.
         self._interaction_trigger_installed: bool = False
+        self._interaction_binding_installed: bool = False
+        self._interaction_init_script_installed: bool = False
+        self._delta_binding_installed: bool = False
+        self._delta_init_script_installed: bool = False
         # Whether the live-delta observer delivered at least install
         # successfully — typing recaptures are redundant while patches
         # ('v' value ops) carry the keystrokes to the client live.
-        self._delta_installed: bool = False
+        self._delta_installed: bool = False  # observer/binding is ready
+        self._delta_active: bool = False     # current client generation has data-mid
+        self._explicit_navigation_in_progress: bool = False
+        self._capture_install_lock = asyncio.Lock()
         # ---- fast-pipeline state (MIGRATION_LIVE_MIRROR.md) ----
         # Coalesce: at most one capture in flight; overlaps buffer the
         # latest reason and produce exactly one follow-up send.
         self._send_inflight: bool = False
+        # Keep a delta frame and a full-document frame ordered on the same
+        # websocket.  Without this, an already-validated patch task can yield
+        # just as a recovery capture starts and arrive after its newer gen.
+        self._ws_send_lock = asyncio.Lock()
         self._pending_reason: Optional[str] = None
         self._overlap_count: int = 0
         # Generation counter — bumped on every full_document send; delta
@@ -2874,6 +3004,11 @@ class DOMCaptureSession:
         self._last_checksum: Optional[str] = None
         # Kill-switch once httpx turns out to be unavailable.
         self._assets_ok: bool = True
+        # A full document can mention the same immutable /assets digests on
+        # every recovery.  Warm each digest at most once per client session so
+        # asset metadata and browser fetch work do not ride along on every
+        # resync.
+        self._sent_asset_digests: set = set()
         # Consecutive full-capture failures — surfaced as an ERROR once
         # (a client receiving no DOM at all must never be silent).
         self._capture_fail_streak: int = 0
@@ -2883,8 +3018,9 @@ class DOMCaptureSession:
         # Whether the last capture can carry delta patches (has data-mid
         # stamps) and whether asset rewriting applies to it.  fast=True/True;
         # SingleFile=False/False; outerHTML tier3=False/True.
-        # Snapshot mode (default for non-live hosts): no delta observer, no
-        # patches -- every update is a full baked capture.  Set per-site by
+        # Snapshot mode (default for non-live hosts) still keeps full
+        # documents as the fidelity/recovery floor, but the delta observer
+        # can patch safe mutations between those documents.  Set per-site by
         # the owning session via prefer_snapshot_for_url().
         self.snapshot_only: bool = False
         self._last_capture_supports_delta: bool = True
@@ -2905,6 +3041,31 @@ class DOMCaptureSession:
     # Lifecycle
     # ------------------------------------------------------------------
 
+    def bind_page(self, page: Any) -> None:
+        """Move the helper to a different tab/page object.
+
+        A session can switch tabs while reusing one DOMCaptureSession.  The
+        exposed bindings and init-script registrations are page-scoped, so
+        carrying the old "installed" flags to the new page would silently
+        disable interaction/delta delivery there.  Reset only page-local
+        state; keep the generation counter monotonic for the client.
+        """
+        if page is self.page:
+            return
+        self.page = page
+        self._interaction_trigger_installed = False
+        self._interaction_binding_installed = False
+        self._interaction_init_script_installed = False
+        self._delta_binding_installed = False
+        self._delta_init_script_installed = False
+        self._delta_installed = False
+        self._delta_active = False
+        self._explicit_navigation_in_progress = False
+        self._last_checksum = None
+        self.last_sent_url = None
+        self.last_sent_html = None
+        self._sent_asset_digests.clear()
+
     async def start(self) -> None:
         """Install the generic interaction trigger.  Idempotent; safe
         to call multiple times.  Callers that previously relied on
@@ -2924,10 +3085,13 @@ class DOMCaptureSession:
             return False
         if self._stopped:
             return False
-        ok = await _install_interaction_trigger(self.page, self)
-        if ok:
-            self._interaction_trigger_installed = True
-        return ok
+        async with self._capture_install_lock:
+            if self._stopped:
+                return False
+            ok = await _install_interaction_trigger(self.page, self)
+            if ok:
+                self._interaction_trigger_installed = True
+            return ok
 
     async def shutdown(self) -> None:
         """Mark the session stopped and cancel the URL watcher if any."""
@@ -2940,19 +3104,13 @@ class DOMCaptureSession:
                 pass
         self.url_watch_task = None
 
-    async def watch_url(self, interval_s: float = 0.5) -> None:
-        """Watch the page's URL and trigger a full SingleFile resync on
-        change.  Fires on every URL change with no debouncing -- the
-        caller is responsible for how often captures happen.
+    async def watch_url(self, interval_s: float = URL_WATCH_INTERVAL_S) -> None:
+        """Watch the page URL as a recovery fallback.
 
-        Navigation-aware: when the URL changes, the new page is still
-        in flight (subresources streaming, JS framework hydrating).
-        We must NOT capture immediately on URL-string change -- the
-        DOM is unstable.  Instead we wait for the same load /
-        networkidle / readyState-complete sequence the initial
-        capture uses, and only then fire the full resync.  This
-        mirrors the initial-capture behaviour so the client never
-        sees a half-rendered page after a navigation.
+        The persistent delta init script emits a navigation control for the
+        normal path, including same-URL reloads.  This loop only performs the
+        old stability wait/full capture when delta installation is unavailable,
+        and otherwise stays a cheap cached-URL check.
         """
         last_url: Optional[str] = None
         try:
@@ -2969,16 +3127,30 @@ class DOMCaptureSession:
                     except Exception:
                         current_url = None
                 if current_url and last_url and current_url != last_url:
-                    logger.debug("URL changed %s -> %s, waiting for page to settle before resync", last_url, current_url)
+                    self._delta_active = False
+                    logger.debug("URL changed %s -> %s", last_url, current_url)
+                    # With persistent init scripts, the new document's
+                    # navigation control owns the recovery full capture.  Do
+                    # not add a second stability wait or duplicate serializer
+                    # here; this watcher remains the fallback for pages where
+                    # delta installation failed.
+                    if self._delta_installed:
+                        last_url = current_url
+                        await asyncio.sleep(interval_s)
+                        continue
                     # Re-install the interaction trigger on the new
-                    # document; the previous one is gone with the old
-                    # page.  Best-effort: failure just means we won't
-                    # auto-recapture on clicks until the next
-                    # send_page, which is harmless.
-                    try:
-                        await self.enable_interaction_capture()
-                    except Exception as exc:
-                        logger.debug("re-install interaction trigger after URL change: %s", exc)
+                    # document when the delta path is unavailable.  Best-effort:
+                    # the full-capture fallback below remains authoritative.
+                    # Both init scripts persist on this page object across
+                    # navigations.  Avoid two immediate evaluate round trips
+                    # on every URL change when the registrations are already
+                    # present; the new document ran them at parse start.
+                    if (not self._interaction_init_script_installed
+                            or (LIVE_DELTA and not self._delta_init_script_installed)):
+                        try:
+                            await self.enable_interaction_capture()
+                        except Exception as exc:
+                            logger.debug("re-install interaction trigger after URL change: %s", exc)
                     # Wait for the new page to settle -- the same
                     # load/networkidle/readyState sequence the
                     # initial capture uses.  We deliberately do NOT
@@ -2990,10 +3162,16 @@ class DOMCaptureSession:
                         await _ensure_page_stable(self.page)
                     except Exception as exc:
                         logger.debug("post-URL-change page-stability wait failed: %s", exc)
-                    try:
-                        await self._send_full(current_url, reason="url_change")
-                    except Exception as exc:
-                        logger.debug("URL-watch full capture failed: %s", exc)
+                    # A navigation control batch or an explicit goto may
+                    # already have sent this exact URL while the watcher was
+                    # waiting for stability.  Do not rebuild the iframe twice.
+                    if current_url != self.last_sent_url:
+                        try:
+                            await self._send_full(current_url, reason="url_change")
+                        except Exception as exc:
+                            logger.debug("URL-watch full capture failed: %s", exc)
+                    else:
+                        logger.debug("URL-watch resync already sent for %s", current_url)
                 last_url = current_url or last_url
             except Exception as exc:
                 logger.debug("URL watch loop error: %s", exc)
@@ -3116,7 +3294,8 @@ class DOMCaptureSession:
         # it now.  This keeps the interaction-capture guarantee
         # without forcing every caller to remember to call
         # enable_interaction_capture().
-        if not self._interaction_trigger_installed:
+        if (not self._interaction_trigger_installed
+                or (LIVE_DELTA and not self._delta_installed)):
             try:
                 await self.enable_interaction_capture()
             except Exception:
@@ -3159,7 +3338,12 @@ class DOMCaptureSession:
 
             # ---- unchanged-DOM skip (only for hot interaction reasons) ----
             checksum: Optional[str] = None
-            if SKIP_UNCHANGED and settle == "none" and self._last_checksum is not None:
+            if (SKIP_UNCHANGED and settle == "none"
+                    and self._last_checksum is not None
+                    and not str(reason).lower().startswith((
+                        "delta_overflow", "navigation", "coalesce:delta_overflow",
+                        "coalesce:navigation", "resync"
+                    ))):
                 checksum = await self._dom_checksum()
                 if checksum and checksum == self._last_checksum:
                     logger.debug("dc skip(unchanged) reason=%s gen=%s", reason, self._gen)
@@ -3199,14 +3383,25 @@ class DOMCaptureSession:
             # ---- mirror font: Montserrat everywhere in the mirrored page ----
             html_data = _inject_mirror_font(html_data)
 
-            # Snapshot mode: skip byte-identical re-sends.  Idle pages in
-            # snapshot mode otherwise ship a full document on every
-            # interaction cadence — pure waste of WS bytes + client parse.
-            # (Delta/live mode keeps sends so generation anchors keep moving.)
+            # A SingleFile/outerHTML fallback has no data-mid identity map.
+            # Stop relaying patches until a later fast capture restores a
+            # patch-capable generation; otherwise the client would receive
+            # deltas it can never apply and loop through resyncs.
+            capture_delta_active = bool(
+                LIVE_DELTA and self._delta_installed and self._last_capture_supports_delta
+            )
+
+            # Snapshot mode: skip byte-identical re-sends.  Hybrid delta
+            # patches handle the immediate mutation path; this avoids
+            # repeatedly parsing/switching an identical full document while
+            # retaining full captures for recovery and navigation.
             _rs = str(reason)
             if (self.snapshot_only and url == self.last_sent_url
                     and html_data == self.last_sent_html
-                    and not _rs.startswith(("resync", "mirror_err", "recover"))):
+                    and not _rs.startswith((
+                        "resync", "mirror_err", "recover", "delta_overflow",
+                        "navigation", "coalesce:delta_overflow", "coalesce:navigation",
+                    ))):
                 logger.debug("dc skip(identical snapshot) reason=%s", reason)
                 return url
 
@@ -3218,22 +3413,41 @@ class DOMCaptureSession:
                 "html": html_data,
                 "gen": self._gen,
             }
-            if LIVE_DELTA and self._last_capture_supports_delta and not self.snapshot_only:
+            if capture_delta_active:
+                # Snapshot-preferred hosts use the same patch channel between
+                # full fidelity/recovery documents; the client keeps the
+                # generation anchor and can still request a full resync.
                 msg["delta"] = True
-            if assets_meta:
-                msg["assets"] = assets_meta
+            assets_to_send = [
+                meta for meta in assets_meta
+                if isinstance(meta, dict)
+                and meta.get("hash") not in self._sent_asset_digests
+            ]
+            if assets_to_send:
+                msg["assets"] = assets_to_send
             t_send = time.perf_counter()
             try:
-                await self.websocket.send_text(json.dumps(msg, ensure_ascii=False))
+                frame = json.dumps(msg, ensure_ascii=False)
+                async with self._ws_send_lock:
+                    await self.websocket.send_text(frame)
             except Exception as exc:
                 logger.debug("full_document send failed: %s", exc)
                 return None
             send_ms = (time.perf_counter() - t_send) * 1000.0
 
-            if checksum is None:
+            # A patch-capable generation no longer launches interaction full
+            # captures, so there is no hot-path unchanged check to seed.  Do
+            # not add a second browser round trip after every initial/nav
+            # document merely to compute a checksum that will not be used.
+            if checksum is None and not capture_delta_active:
                 checksum = await self._dom_checksum()
             self._last_checksum = checksum or self._last_checksum
             self._capture_fail_streak = 0
+            self._delta_active = capture_delta_active
+            for meta in assets_to_send:
+                digest = meta.get("hash")
+                if digest:
+                    self._sent_asset_digests.add(digest)
             self.last_sent_html = html_data
             self.last_sent_url = url
             self.has_initial_capture = True
@@ -3241,7 +3455,7 @@ class DOMCaptureSession:
                 "dc send reason=%s settle=%s capture_ms=%.0f rewrite_ms=%.0f send_ms=%.0f "
                 "html_bytes=%d assets=%d gen=%d overlaps=%d total_ms=%.0f",
                 reason, settle, capture_ms, rewrite_ms, send_ms, len(html_data),
-                len(assets_meta), self._gen, self._overlap_count,
+                len(assets_to_send), self._gen, self._overlap_count,
                 (time.perf_counter() - t_start) * 1000.0,
             )
             return url
@@ -3329,15 +3543,19 @@ class DOMCaptureSession:
     async def handle_navigation(self, url: str) -> None:
         if self.page is None:
             return
+        self._delta_active = False
+        self._explicit_navigation_in_progress = True
         try:
             await self.page.goto(url, wait_until="domcontentloaded", timeout=60000)
             # Fresh document -> the JS listener from the previous
             # page is gone.  Re-install the generic interaction
             # trigger on the new document.
-            try:
-                await self.enable_interaction_capture()
-            except Exception as exc:
-                logger.debug("re-install interaction trigger after nav: %s", exc)
+            if (not self._interaction_init_script_installed
+                    or (LIVE_DELTA and not self._delta_init_script_installed)):
+                try:
+                    await self.enable_interaction_capture()
+                except Exception as exc:
+                    logger.debug("re-install interaction trigger after nav: %s", exc)
             # IMPORTANT: do NOT fire _send_full immediately.  A page
             # that just changed URL is in an unstable state: the
             # document is parsing, subresources are still in flight,
@@ -3352,6 +3570,8 @@ class DOMCaptureSession:
             await self._send_full(url, reason="url_change")
         except Exception as exc:
             logger.debug("handle_navigation failed: %s", exc)
+        finally:
+            self._explicit_navigation_in_progress = False
 
     async def handle_keypress(self, key: str, selector: Optional[str] = None) -> None:
         if self.page is None:

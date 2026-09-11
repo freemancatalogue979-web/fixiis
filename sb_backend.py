@@ -37,6 +37,7 @@ import logging
 import os
 import re
 import socket
+import sys
 import time
 import urllib.request
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
@@ -1465,15 +1466,8 @@ class SBHandle:
             "--force-device-scale-factor=1",
         ]
         args.extend(self.extra_args)
-        # SingleFile extension for PCM/page capture (user: required, not
-        # optional).  Also re-enables --load-extension on Chrome 137+.
-        try:
-            from singlefile_ext import apply_singlefile_ext_args
-            args = apply_singlefile_ext_args(
-                args, log=lambda m: logger.debug("[SB/SingleFile] %s", m),
-                merge_features=False)  # SB re-splits chromium_arg on commas
-        except Exception as exc:
-            logger.debug("[SB/SingleFile] extension arg wiring failed: %s", exc)
+        # Keep the UC launcher's argument surface minimal: SeleniumBase does
+        # not load/import a browser extension on this path.
         proxy = (self.proxy_url or "").strip() or None
         if proxy and "://" in proxy:
             proxy = proxy.split("://", 1)[1]   # SB wants host:port / user:pass@host:port
@@ -1854,6 +1848,11 @@ class SBHandle:
 
     async def start(self) -> None:
         """Launch the UC browser and resolve its debug endpoint."""
+        if sys.platform.startswith("linux"):
+            await _ensure_sb_xvfb()
+            if self.headless:
+                logger.warning("[SB] ignoring headless=True: SeleniumBase is pinned to Xvfb-headed mode")
+            self.headless = False
         _t0 = time.monotonic()
         if self._ex is None:
             # SeleniumBase/ChromeDriver is thread-affine.  Do not let actions
@@ -1968,6 +1967,54 @@ class SBHandle:
 # ---------------------------------------------------------------------------
 # Launch factories
 # ---------------------------------------------------------------------------
+
+async def _ensure_sb_xvfb() -> Optional[str]:
+    """Give every Linux SeleniumBase launch its own headed X display.
+
+    SeleniumBase is deliberately not allowed to inherit an operator's real
+    ``DISPLAY`` or silently turn into headless Chrome.  Reuse the process-wide
+    Xvfb manager when the application already started one; otherwise start a
+    virtual screen here and fail loudly if Xvfb is unavailable.  No Chrome
+    arguments are added by this guard.
+    """
+    if not sys.platform.startswith("linux"):
+        return None
+
+    # Import lazily to keep sb_backend importable in environments that do not
+    # install the browser stack, and to share the manager with BrowserManager.
+    from browser_manager import get_xvfb_manager
+
+    xvfb = get_xvfb_manager()
+    if not xvfb.ensure_checked():
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, xvfb.try_install)
+    if not xvfb.ensure_checked():
+        raise RuntimeError(
+            "SeleniumBase requires Xvfb on Linux; install xvfb or set "
+            "XVFB_AUTOINSTALL=1 before selecting BROWSER_BACKEND=sb"
+        )
+
+    process = getattr(xvfb, "process", None)
+    if process is not None and getattr(process, "returncode", None) is not None:
+        await xvfb.stop_async()
+        process = None
+    if process is None:
+        if not await xvfb.start_async():
+            raise RuntimeError("SeleniumBase could not start its Xvfb display")
+        process = getattr(xvfb, "process", None)
+    if process is None or getattr(process, "returncode", None) is not None:
+        raise RuntimeError("SeleniumBase Xvfb exited before Chrome could attach")
+
+    display = xvfb.get_display()
+    if not display:
+        raise RuntimeError("SeleniumBase Xvfb started without a usable DISPLAY")
+    os.environ["DISPLAY"] = display
+    # A Wayland value can make Chromium choose a different window backend even
+    # when DISPLAY is set.  SeleniumBase's Linux path is intentionally X11.
+    os.environ.pop("WAYLAND_DISPLAY", None)
+    logger.info("[SB] using headed Chrome on dedicated Xvfb display %s", display)
+    return display
+
 
 async def _launch_stack(profile_dir: Optional[str], viewport: Dict[str, Any],
                         user_agent: Optional[str], proxy_url: Optional[str],

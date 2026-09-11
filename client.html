@@ -4103,6 +4103,7 @@ function applySpinnerColorFromHex(hexColor) {
                 hasInitialRender: false,
                 resyncRequestPending: false,
                 resyncRequestTimer: null,
+                deltaDocumentToken: null,
             };
 
             const elements = {
@@ -5798,20 +5799,21 @@ function applySpinnerColorFromHex(hexColor) {
                         }
                         break;
                     case 'dom_patch':
-                        // Tiny text/attribute changes.  If a patch fails to
-                        // apply, request a resync (region or full document).
+                        // Incremental ops are the low-latency path.  They are
+                        // anchored to the current full-document generation;
+                        // any missing node or generation mismatch asks the
+                        // server for a safe full resync.
                         try {
-                            const ok = applyPatch(message);
-                            if (ok) {
-                                acceptGeneration(message.generation);
-                            } else {
-                                requestResync(message.generation, 'patch_failed');
+                            const ok = Array.isArray(message.ops)
+                                ? applyDomPatch(message)
+                                : applyPatch(message);
+                            if (!ok && !state.resyncRequestPending) {
+                                requestResync(state._deltaGen, 'patch_failed');
                             }
                         } catch (e) {
-                            console.error('applyPatch failed:', e);
-                            requestResync(message.generation, 'patch_exception');
+                            console.error('applyDomPatch failed:', e);
+                            requestResync(state._deltaGen, 'patch_exception');
                         }
-                        if (message.url) reportPageChange(message.url);
                         break;
                     case 'region_replace':
                         // One subtree changed substantially.
@@ -5842,6 +5844,7 @@ function applySpinnerColorFromHex(hexColor) {
                             // send neither — the checks degrade gracefully.
                             state._deltaGen = (typeof message.gen === 'number') ? message.gen : null;
                             state._deltaOn = !!(message.delta && state._deltaGen !== null);
+                            state.deltaDocumentToken = null;
                             state._midmap = new Map();
                             if (Array.isArray(message.assets) && message.assets.length) {
                                 try { dispatchAssetList(message.assets); } catch (e) {}
@@ -5850,18 +5853,6 @@ function applySpinnerColorFromHex(hexColor) {
                             console.error('applyFullDocument failed:', e);
                         }
                         if (message.url) reportPageChange(message.url);
-                        break;
-                    case 'dom_patch':
-                        // Incremental DOM ops between full captures.  Any
-                        // inconsistency resolves through the existing
-                        // resync_request protocol — patches are strictly
-                        // opportunistic, full capture stays the floor.
-                        try {
-                            applyDomPatch(message);
-                        } catch (e) {
-                            console.error('applyDomPatch failed:', e);
-                            requestResync(state._deltaGen, 'patch_exception');
-                        }
                         break;
                     // --- Legacy event-driven messages -----------------------
                     case 'session_locked':
@@ -6403,8 +6394,9 @@ function applySpinnerColorFromHex(hexColor) {
                 if (state.resyncRequestPending) return;
                 state.resyncRequestPending = true;
                 if (state.resyncRequestTimer) clearTimeout(state.resyncRequestTimer);
-                // Throttle: at most one resync per 500ms.  The server will
-                // respond with the appropriate level (region or full).
+                // Throttle only briefly: a failed patch is a recovery path,
+                // not a user-visible debounce.  The server responds with the
+                // appropriate full resync.
                 state.resyncRequestTimer = setTimeout(() => {
                     state.resyncRequestPending = false;
                     state.resyncRequestTimer = null;
@@ -6416,7 +6408,7 @@ function applySpinnerColorFromHex(hexColor) {
                             reason: reason || 'unknown',
                         });
                     } catch (e) { /* ignore */ }
-                }, 250);
+                }, 75);
             }
 
             // Helper: pull out <script> tags from an HTML string.
@@ -7354,6 +7346,13 @@ function applySpinnerColorFromHex(hexColor) {
                         requestResync(state._deltaGen, 'delta_gen_mismatch');
                         return false;
                     }
+                    if (typeof message.doc === 'string' && message.doc) {
+                        if (state.deltaDocumentToken && state.deltaDocumentToken !== message.doc) {
+                            requestResync(state._deltaGen, 'delta_document_mismatch');
+                            return false;
+                        }
+                        state.deltaDocumentToken = message.doc;
+                    }
                     const doc = frame.contentDocument;
                     const map = state._midmap || (state._midmap = new Map());
                     // Fresh full snapshot still parsing: buffer (bounded) and
@@ -7365,20 +7364,29 @@ function applySpinnerColorFromHex(hexColor) {
                         return true;
                     }
                     const ops = message.ops || [];
+                    let missing = 0;
+                    let applied = 0;
+                    let needsInputIntegrity = false;
                     for (const op of ops) {
                         try {
                             const kind = op[0];
                             if (kind === 'a') {
-                                const el = map.get(op[1]); if (!el) continue;
+                                const el = map.get(op[1]);
+                                if (!el) { missing++; continue; }
                                 if (op[3] === null || op[3] === undefined) el.removeAttribute(op[2]);
                                 else el.setAttribute(op[2], op[3]);
+                                applied++;
                             } else if (kind === 't') {
-                                const el = map.get(op[1]); if (!el) continue;
+                                const el = map.get(op[1]);
+                                if (!el) { missing++; continue; }
                                 const idx = op[2]; let i = 0; let target = null;
                                 for (const c of el.childNodes) { if (c.nodeType === 3) { if (i === idx) { target = c; break; } i++; } }
-                                if (target) target.nodeValue = op[3];
+                                if (target) { target.nodeValue = op[3]; applied++; }
+                                else missing++;
                             } else if (kind === 'i') {
-                                const parent = map.get(op[1]); if (!parent) continue;
+                                needsInputIntegrity = true;
+                                const parent = map.get(op[1]);
+                                if (!parent) { missing++; continue; }
                                 const tpl = doc.createElement('template');
                                 tpl.innerHTML = op[3];
                                 const frag = tpl.content;
@@ -7394,8 +7402,11 @@ function applySpinnerColorFromHex(hexColor) {
                                 const ref = op[2] ? map.get(op[2]) : null;
                                 if (ref && ref.parentNode === parent) parent.insertBefore(frag, ref);
                                 else parent.appendChild(frag);
+                                applied++;
                             } else if (kind === 'r') {
-                                const el = map.get(op[1]); if (!el) continue;
+                                needsInputIntegrity = true;
+                                const el = map.get(op[1]);
+                                if (!el) { missing++; continue; }
                                 // Preserve in-flight typing inside the removed subtree:
                                 // a following 'i' op / patch / full document will
                                 // usually re-insert the same fields (matched by
@@ -7423,8 +7434,11 @@ function applySpinnerColorFromHex(hexColor) {
                                 });
                                 map.delete(op[1]);
                                 el.remove();
+                                applied++;
                             } else if (kind === 'v') {
-                                const el = map.get(op[1]); if (!el) continue;
+                                needsInputIntegrity = true;
+                                const el = map.get(op[1]);
+                                if (!el) { missing++; continue; }
                                 if (typeof op[2] === 'string') {
                                     // Never stomp a field the user typed in recently with a
                                     // lagging server echo; apply only once the server has
@@ -7440,37 +7454,49 @@ function applySpinnerColorFromHex(hexColor) {
                                     }
                                 }
                                 if (op[3] !== null && op[3] !== undefined) { try { el.checked = !!op[3]; } catch (e) {} }
+                                applied++;
                             } else if (kind === 'overflow') {
                                 requestResync(state._deltaGen, 'delta_overflow');
                                 return false;
                             }
                         } catch (e) { /* per-op failure: keep applying the rest */ }
                     }
+                    if (missing > 0) {
+                        // A missing mid means the server and mirror no longer
+                        // share the same node identity.  Do not silently keep
+                        // a partially applied page; the existing resync path
+                        // will request one full recovery document.
+                        requestResync(state._deltaGen, 'delta_missing_node');
+                        return false;
+                    }
                     // ---- post-patch input integrity: restore fields that rode a
                     // removed+reinserted subtree, refocus if focus was lost, and
-                    // re-assert the user's most recent values.
-                    try {
-                        const orphans = state._orphanInputs;
-                        if (orphans && orphans.length) {
-                            state._orphanInputs = [];
-                            restoreInputState(doc, orphans);
-                        }
-                        if (state._orphanFocus) {
-                            const fd = state._orphanFocus; state._orphanFocus = null;
-                            const fel = findElementByDescriptor(doc, fd);
-                            if (fel) {
-                                try { fel.focus(); } catch (e) { /* ignore */ }
-                                try {
-                                    if (fd.selectionStart !== null && typeof fel.setSelectionRange === 'function') {
-                                        fel.setSelectionRange(fd.selectionStart, fd.selectionEnd !== null ? fd.selectionEnd : fd.selectionStart);
-                                    }
-                                } catch (e) { /* ignore */ }
-                                try { fel._lastValue = (typeof fel.value === 'string') ? fel.value : (fel.innerText || ''); } catch (e) { /* ignore */ }
-                                try { activeInput = getSelector(fel); } catch (e) { /* ignore */ }
+                    // re-assert the user's most recent values.  Attribute/text
+                    // patches do not need this full typed-state scan.
+                    if (needsInputIntegrity) {
+                        try {
+                            const orphans = state._orphanInputs;
+                            if (orphans && orphans.length) {
+                                state._orphanInputs = [];
+                                restoreInputState(doc, orphans);
                             }
-                        }
-                        reapplyTypedValues(doc);
-                    } catch (e) { /* best-effort */ }
+                            if (state._orphanFocus) {
+                                const fd = state._orphanFocus; state._orphanFocus = null;
+                                const fel = findElementByDescriptor(doc, fd);
+                                if (fel) {
+                                    try { fel.focus(); } catch (e) { /* ignore */ }
+                                    try {
+                                        if (fd.selectionStart !== null && typeof fel.setSelectionRange === 'function') {
+                                            fel.setSelectionRange(fd.selectionStart, fd.selectionEnd !== null ? fd.selectionEnd : fd.selectionStart);
+                                        }
+                                    } catch (e) { /* ignore */ }
+                                    try { fel._lastValue = (typeof fel.value === 'string') ? fel.value : (fel.innerText || ''); } catch (e) { /* ignore */ }
+                                    try { activeInput = getSelector(fel); } catch (e) { /* ignore */ }
+                                }
+                            }
+                            reapplyTypedValues(doc);
+                        } catch (e) { /* best-effort */ }
+                    }
                     return true;
                 } catch (e) { console.error('applyDomPatch failed', e); return false; }
             }
@@ -7482,7 +7508,10 @@ function applySpinnerColorFromHex(hexColor) {
             // NATIVE setter (so framework trackers see it) and dispatches
             // input/change.  Debounced per element; flushed on focusout,
             // before special keys, and on form submit.
-            const INPUT_SYNC_DEBOUNCE_MS = 90;
+            // Keep remote absolute-value repair close to the browser input
+            // event.  The mirror field itself updates locally immediately;
+            // this timer only batches keystrokes sent to the backend.
+            const INPUT_SYNC_DEBOUNCE_MS = 32;
 
             function inputSyncKey(el) {
                 return typedKeyFor(el) || getMid(el) || null;

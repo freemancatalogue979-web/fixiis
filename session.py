@@ -18,7 +18,7 @@ import logging
 
 # Import frame pools for independent per-session resources
 from frame_pool import FramePool, PacketPool, StreamingPipeline
-from dom_capture import DOMCaptureSession
+from dom_capture import DOMCaptureSession, LIVE_DELTA
 
 
 def _sb_backend_enabled() -> bool:
@@ -1493,7 +1493,7 @@ class NeoStreamingSession:
         if self.dom_capture is None:
             self.dom_capture = DOMCaptureSession(page=page, websocket=self.websocket, client_id=self.session_id)
         else:
-            self.dom_capture.page = page
+            self.dom_capture.bind_page(page)
             self.dom_capture.websocket = self.websocket
             self.dom_capture.client_id = self.session_id
         return self.dom_capture
@@ -1515,15 +1515,24 @@ class NeoStreamingSession:
         capture = self._sync_dom_capture()
         if not capture:
             return None
-        # D2 (MIGRATION_LIVE_MIRROR.md): click/mouseup recapture is already
-        # driven in-page by the interaction trigger — our forwarded input
-        # dispatches real page listeners there, so firing a second capture
-        # from here doubles the work per interaction.  Typing reasons
-        # ('text'/'keydown') are NOT skipped: the in-page trigger only
-        # fires on activation gestures, not on plain input; those
-        # recaptures are throttled by coalescing + unchanged-skip instead.
-        if reason in ("click", "mouseup"):
-            logger.debug("[CAPTURE] %s recapture is owned by the in-page trigger — skipping python-side duplicate", reason)
+        # Page-side interaction handling owns click/touch recapture once its
+        # trigger is installed.  Forwarded input dispatches real page
+        # listeners there, so firing a second full capture from this handler
+        # doubles the work.  Keep the fallback below for trigger-install
+        # failures; plain typing is separately handled by the delta observer.
+        if (reason in ("click", "mouseup", "touchend", "tap")
+                and getattr(capture, "_interaction_trigger_installed", False)):
+            logger.debug("[CAPTURE] %s recapture is owned by the page trigger — skipping duplicate", reason)
+            return None
+        # The new document's observer emits a navigation control batch even
+        # when a reload keeps the same URL.  Let it own explicit navigation
+        # recaptures too; this prevents a direct page.goto plus the observer
+        # signal from launching two full serializers.  If the observer was
+        # never installed, retain the full-capture fallback.
+        if (reason in ("goto", "reload", "back", "forward")
+                and LIVE_DELTA and getattr(capture, "_delta_installed", False)
+                and not getattr(capture, "_explicit_navigation_in_progress", False)):
+            logger.debug("[CAPTURE] %s navigation is owned by the delta document signal", reason)
             return None
         # Typing while the delta observer is live must NOT trigger a full
         # capture per keystroke: the observer streams 'v' (value) ops to the
@@ -1531,7 +1540,8 @@ class NeoStreamingSession:
         # mirrored iframe, drops input focus (typing becomes impossible),
         # and storms the CDP channel — on the SB backend that storm could
         # wedge the driver channel and tear the browser down with it.
-        if reason in ("text", "keydown") and LIVE_DELTA and getattr(capture, "_delta_installed", False):
+        if (reason in ("text", "keydown", "capture_first_input")
+                and LIVE_DELTA and getattr(capture, "_delta_active", False)):
             logger.debug("[CAPTURE] %s recapture owned by delta observer — skipping full capture", reason)
             return None
         return await capture.send_page(reason=reason, force=force)
@@ -2360,38 +2370,58 @@ class NeoStreamingSession:
                     if not url.startswith('http://') and not url.startswith('https://'):
                         url = 'https://' + url
                     log(f"[NAVIGATION] Admin requested goto: {url}")
-                    await page.goto(url, wait_until='domcontentloaded', timeout=30000)
-                    self.current_domain = self._extract_domain(url)
-                    self._apply_snapshot_preference(url)
+                    capture = self._sync_dom_capture()
+                    capture._explicit_navigation_in_progress = True
+                    try:
+                        await page.goto(url, wait_until='domcontentloaded', timeout=30000)
+                        self.current_domain = self._extract_domain(url)
+                        self._apply_snapshot_preference(url)
 
-                    if self.browser_manager:
-                        await self.browser_manager.profile_manager.add_visited_site(
-                            self.user_id,
-                            self.current_domain,
-                            title=await page.title() if page else '',
-                            favicon_url=f"https://{self.current_domain}/favicon.ico"
-                        )
+                        if self.browser_manager:
+                            await self.browser_manager.profile_manager.add_visited_site(
+                                self.user_id,
+                                self.current_domain,
+                                title=await page.title() if page else '',
+                                favicon_url=f"https://{self.current_domain}/favicon.ico"
+                            )
 
-                    await self._save_profile_info()
-                    await self.capture_remote_page(reason='goto')
+                        await self._save_profile_info()
+                        await self.capture_remote_page(reason='goto')
+                    finally:
+                        capture._explicit_navigation_in_progress = False
 
             elif event == 'reload':
-                await page.reload(wait_until='domcontentloaded', timeout=30000)
-                await self.capture_remote_page(reason='reload')
+                capture = self._sync_dom_capture()
+                capture._explicit_navigation_in_progress = True
+                try:
+                    await page.reload(wait_until='domcontentloaded', timeout=30000)
+                    await self.capture_remote_page(reason='reload')
+                finally:
+                    capture._explicit_navigation_in_progress = False
 
             elif event == 'back':
+                capture = self._sync_dom_capture()
+                capture._explicit_navigation_in_progress = True
                 try:
-                    await page.go_back(wait_until='domcontentloaded', timeout=30000)
-                    await self.capture_remote_page(reason='back')
-                except Exception:
-                    pass
+                    try:
+                        await page.go_back(wait_until='domcontentloaded', timeout=30000)
+                        await self.capture_remote_page(reason='back')
+                    except Exception:
+                        pass
+                finally:
+                    capture._explicit_navigation_in_progress = False
 
             elif event == 'forward':
+                capture = self._sync_dom_capture()
+                capture._explicit_navigation_in_progress = True
                 try:
-                    await page.go_forward(wait_until='domcontentloaded', timeout=30000)
-                    await self.capture_remote_page(reason='forward')
-                except Exception:
-                    pass
+                    try:
+                        await page.go_forward(wait_until='domcontentloaded', timeout=30000)
+                        await self.capture_remote_page(reason='forward')
+                    except Exception:
+                        pass
+                finally:
+                    capture._explicit_navigation_in_progress = False
 
         except Exception as e:
             error_msg = str(e)
@@ -2421,12 +2451,12 @@ class NeoStreamingSession:
             await self.dom_capture.handle_navigation(url)
 
     def _apply_snapshot_preference(self, url: str) -> None:
-        """Per-site capture mode: snapshot-only (default) vs live delta hosts.
+        """Choose the per-site full-document fidelity cadence.
 
-        Snapshot mode is the MHTML-style render the user asked for: every
-        update is a baked full capture (no live subframe / delta-layer
-        fragility); heavy interactive sites listed in DOM_LIVE_HOSTS keep
-        the delta pipeline."""
+        Snapshot preference no longer disables the live delta channel: safe
+        mutations are patched in place for every host, while full documents
+        remain the navigation/recovery floor.  DOM_LIVE_HOSTS keeps the more
+        aggressive live preference for its full-capture cadence."""
         try:
             from dom_capture import prefer_snapshot_for_url
             dc = getattr(self, 'dom_capture', None)
@@ -2541,6 +2571,12 @@ class NeoStreamingSession:
             log_error(f"input_sync apply failed: {exc}")
 
     async def capture_first_input(self):
+        capture = self._sync_dom_capture()
+        if capture and LIVE_DELTA and getattr(capture, "_delta_active", False):
+            # Focus/input state is already local in the mirror and the remote
+            # field is synchronized by input_sync/dom_patch; do not schedule a
+            # 120 ms full-document rebuild just because the keyboard opened.
+            return
         if self._capture_first_input_task and not self._capture_first_input_task.done():
             self._capture_first_input_task.cancel()
 

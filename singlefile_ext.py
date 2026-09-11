@@ -1,15 +1,11 @@
-"""Shared SingleFile extension resolution + Chrome launch-arg application.
+"""Legacy Direct Chrome SingleFile extension argument helper.
 
-Two failure modes killed the SB/PCM capture path:
-
-1. The SB (UC) browser simply never received ``--load-extension`` — the
-   flag only existed on the Playwright/direct launch path.
-2. Chrome 137+ ignores ``--load-extension`` on branded stable Chrome
-   unless ``DisableLoadExtensionCommandLineSwitch`` is turned off.
-
-This module resolves the extension directory once, applies the flags
-(with correct ``--disable-features`` *merging* — Chrome only honors the of
-LAST occurrence of that switch), and both launchers share it.
+The SeleniumBase UC path intentionally does not import this module or load a
+browser extension.  The helper remains for the separately configured
+Playwright/direct archive path, where SingleFile capture is an explicit
+legacy feature.  Chrome 137+ ignores ``--load-extension`` on branded stable
+Chrome unless ``DisableLoadExtensionCommandLineSwitch`` is turned off; the
+legacy helper handles that switch and merges it correctly.
 """
 
 from __future__ import annotations
