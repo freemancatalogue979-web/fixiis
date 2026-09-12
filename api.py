@@ -4503,6 +4503,22 @@ _lpv_parent_handoff_locks: Dict[str, asyncio.Lock] = {}
 _lpv_parent_handoff_guard = asyncio.Lock()
 
 
+@asynccontextmanager
+async def _lpv_parent_handoff(parent_id: str):
+    """Hold the stable-parent handoff lock across replacement and admission."""
+    key = str(parent_id or "").strip()
+    if not key:
+        yield key
+        return
+    async with _lpv_parent_handoff_guard:
+        lock = _lpv_parent_handoff_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _lpv_parent_handoff_locks[key] = lock
+    async with lock:
+        yield key
+
+
 async def _replace_lpv_parent_connection(
     parent_id: str,
     *,
@@ -4510,15 +4526,9 @@ async def _replace_lpv_parent_connection(
     exclude_websocket: Any = None,
 ) -> int:
     """Serialize replacement handoffs for one stable LPV parent."""
-    key = str(parent_id or "").strip()
-    if not key:
-        return 0
-    async with _lpv_parent_handoff_guard:
-        lock = _lpv_parent_handoff_locks.get(key)
-        if lock is None:
-            lock = asyncio.Lock()
-            _lpv_parent_handoff_locks[key] = lock
-    async with lock:
+    async with _lpv_parent_handoff(parent_id) as key:
+        if not key:
+            return 0
         return await _replace_lpv_parent_connection_locked(
             key,
             exclude_client_id=exclude_client_id,
@@ -5872,19 +5882,33 @@ async def _enter_lpv_only_mode(websocket: WebSocket, init_data: dict) -> None:
         except Exception:
             pass
     lpv_profile_registered = False
-    # A public LPV/workflow link is also a profile-owned runtime.  Reopening
-    # the link must terminate the older tab before this generation starts.
-    await _replace_lpv_parent_connection(
-        profile_parent_id,
-        exclude_client_id=client_id,
-        exclude_websocket=websocket,
-    )
-    # Stable client ids are intentionally reused across reconnects.  This
-    # token makes cleanup/event writes belong to this websocket generation,
-    # so an old disconnect cannot take a fresh reconnect offline.
+    # Stable client ids are intentionally reused across reconnects. This token
+    # makes cleanup/event writes belong to this websocket generation, so an old
+    # disconnect cannot take a fresh reconnect offline.
     connection_token = uuid.uuid4().hex
     init_data["_connection_token"] = connection_token
-    _lpv_connection_tokens[client_id] = connection_token
+    init_data["_lpv_default_page"] = default_url
+
+    # A public LPV/workflow link is also a profile-owned runtime. Hold the
+    # stable-parent handoff lock through old-runtime replacement and ownership
+    # reservation; otherwise a browser takeover and two simultaneous LPV
+    # refreshes could all pass the empty-map check before registering.
+    async with _lpv_parent_handoff(profile_parent_id) as handoff_key:
+        await _replace_lpv_parent_connection_locked(
+            handoff_key,
+            exclude_client_id=client_id,
+            exclude_websocket=websocket,
+        )
+        _lpv_connection_tokens[client_id] = connection_token
+        _lpv_only_ws[client_id] = websocket
+        _lpv_parent_connections[profile_parent_id] = {
+            "client_id": client_id,
+            "websocket": websocket,
+            "connection_token": connection_token,
+            "init_data": dict(init_data),
+            "workflow": {},
+        }
+
     # Resolve the workflow (per-link takes precedence over the global
     # auto-workflow) up-front so the boot message can carry its branded
     # loading screen (custom logo URL + spinner color).
@@ -5896,21 +5920,14 @@ async def _enter_lpv_only_mode(websocket: WebSocket, init_data: dict) -> None:
             wf_boot = lpv_store.get_workflow(auto_id)
         except Exception:
             wf_boot = None
-    # Register the LPV/workflow link in the same admin client inventory as
-    # browser sessions.  This happens before the boot message so an admin
-    # already watching sees the connection immediately.
-    init_data["_lpv_default_page"] = default_url
-    # Reserve both stable-parent and runtime-id ownership before the first
-    # await.  A simultaneous refresh then sees this generation immediately and
-    # cannot leave two LPV loops active during registration.
-    _lpv_only_ws[client_id] = websocket
-    _lpv_parent_connections[profile_parent_id] = {
-        "client_id": client_id,
-        "websocket": websocket,
-        "connection_token": connection_token,
-        "init_data": dict(init_data),
-        "workflow": dict(wf_boot or {}),
-    }
+    parent_connection = _lpv_parent_connections.get(profile_parent_id)
+    if (
+        parent_connection
+        and parent_connection.get("connection_token") == connection_token
+    ):
+        parent_connection["init_data"] = dict(init_data)
+        parent_connection["workflow"] = dict(wf_boot or {})
+
     try:
         await _upsert_lpv_admin_client(
             client_id, init_data, wf_boot, online=True, connection_token=connection_token
@@ -6554,36 +6571,38 @@ async def websocket_endpoint(websocket: WebSocket):
         )
         session_id = provided_session_id or generated_session_id
 
+        async def _admit_browser_session():
+            nonlocal session
+            if not session and session_manager:
+                session = await session_manager.create_session(
+                    session_id, websocket, user_agent, viewport, pixel_ratio, url, device_id, user_id,
+                    is_impersonation=is_hidden,
+                    # A fresh public i.open connection intentionally takes over the
+                    # stable profile. Hidden admin/impersonation sessions remain
+                    # isolated and are allowed to coexist.
+                    replace_existing=not is_hidden,
+                    is_mobile=is_mobile,
+                    client_ip=client_ip,
+                    country=country,
+                    state=state,
+                    city=city,
+                    zip_code=zip_code
+                )
+
         if not is_hidden:
-            # A normal browser connection also replaces an active workflow-link
-            # runtime for this stable parent.  The SessionManager call below
-            # performs the corresponding browser handoff.
-            await _replace_lpv_parent_connection(
-                user_id,
-                exclude_client_id=session_id,
-                exclude_websocket=websocket,
-            )
-
-        if is_hidden:
-            hidden_sessions.add(session_id)
-
-        if not session and session_manager:
-            session = await session_manager.create_session(
-                session_id, websocket, user_agent, viewport, pixel_ratio, url, device_id, user_id,
-                is_impersonation=is_hidden,
-                # A fresh public i.open connection intentionally takes over the
-                # stable profile. Hidden admin/impersonation sessions remain
-                # isolated and are allowed to coexist.
-                replace_existing=not is_hidden,
-                is_mobile=is_mobile,
-                client_ip=client_ip,
-                country=country,
-                state=state,
-                city=city,
-                zip_code=zip_code
-            )
+            # Hold the same stable-parent lock through LPV replacement and
+            # browser admission. This prevents a concurrent workflow-link
+            # connection from reserving the parent between those two steps.
+            async with _lpv_parent_handoff(user_id) as handoff_key:
+                await _replace_lpv_parent_connection_locked(
+                    handoff_key,
+                    exclude_client_id=session_id,
+                    exclude_websocket=websocket,
+                )
+                await _admit_browser_session()
         else:
-            session = None
+            hidden_sessions.add(session_id)
+            await _admit_browser_session()
 
         if not session:
             # Session creation failed - check if it was due to session locking
