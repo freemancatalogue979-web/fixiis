@@ -378,7 +378,17 @@ function parseRgbColor(color) {
     return null;
 }
 
-function applySpinnerColor(colorOrR, g, b) {
+function applySpinnerColor(colorOrR, g, b, forceWorkflow = false) {
+    // Once a workflow palette is active, late favicon/site-color callbacks
+    // must not overwrite it.
+    try {
+        if (!forceWorkflow && typeof lpvBootBranding !== 'undefined' && lpvBootBranding.color) {
+            // Re-apply the workflow value to any newly-created spinner/overlay
+            // nodes instead of allowing a late site-favicon callback to win.
+            applyWorkflowBranding();
+            return;
+        }
+    } catch (e) {}
     const rgb = typeof colorOrR === 'string'
         ? parseRgbColor(colorOrR)
         : (typeof colorOrR === 'number' && typeof g === 'number' && typeof b === 'number'
@@ -3905,10 +3915,25 @@ function hideTransitionOverlay() {
                     try {
                         const parsed = parseRgbColor(b.color);
                         if (parsed) {
-                            applySpinnerColor(parsed.r, parsed.g, parsed.b);
-                            const cssColor = `rgb(${parsed.r}, ${parsed.g}, ${parsed.b})`;
+                            applySpinnerColor(parsed.r, parsed.g, parsed.b, true);
+                            // Keep the configured CSS value itself on the
+                            // workflow spinner. This prevents the target-site
+                            // loader palette from winning and preserves rgba()
+                            // values instead of silently converting them.
+                            const cssColor = /^rgba?\(/i.test(b.color.trim())
+                                ? b.color.trim()
+                                : `rgb(${parsed.r}, ${parsed.g}, ${parsed.b})`;
+                            const workflowSpinner = document.getElementById('loadingSpinner');
+                            if (workflowSpinner) {
+                                workflowSpinner.style.borderColor = cssColor;
+                                workflowSpinner.style.borderTopColor = cssColor;
+                                workflowSpinner.dataset.workflowColor = cssColor;
+                            }
+                            currentBrandColor = cssColor;
                             const lpvRoot = document.getElementById('lpv-root');
                             if (lpvRoot) lpvRoot.style.setProperty('--lpv-brand', cssColor);
+                            const workflowDot = document.getElementById('lpv-dot');
+                            if (workflowDot) workflowDot.style.background = cssColor;
                             if (window.LPV && LPV.overlay) {
                                 LPV.overlay.style.setProperty('--lpv-brand', cssColor);
                             }
@@ -4143,8 +4168,12 @@ function applySpinnerColorFromHex(hexColor) {
                 mobileUserAgent: null,
                 
                 sessionReportTimer: null,
-                reconnectTimer: null,  
+                reconnectTimer: null,
                 reconnectPending: false,
+                // A takeover close is terminal for this page. Without this
+                // guard the old tab would reconnect and immediately evict the
+                // new tab that replaced it.
+                reconnectDisabled: false,
                 lastReportedUrl: null,
                 outgoingQueue: [],
 
@@ -4320,6 +4349,52 @@ function applySpinnerColorFromHex(hexColor) {
                 return null;
             }
 
+            async function disconnectPreviousRuntimeBeforeConnect() {
+                // This is a one-time page-bootstrap handoff, not the normal
+                // reconnect path.  It deliberately releases even the same
+                // runtime id so a full refresh cannot inherit a live old
+                // WebSocket/browser owner.
+                if (state.isHiddenSession || !state.userId) return;
+                const runtimeId = getSessionIdForConnection();
+                state.sessionId = runtimeId;
+                try {
+                    const response = await fetch(CONFIG.apiUrl + '/api/client/session/disconnect', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        credentials: 'same-origin',
+                        keepalive: true,
+                        body: JSON.stringify({
+                            user_id: state.userId,
+                            parent_client_id: state.userId,
+                            session_id: runtimeId,
+                            client_id: runtimeId,
+                            workflow_id: state.workflowParam || ''
+                        })
+                    });
+                    const handoff = await response.json().catch(() => ({}));
+                    if (handoff.parent_client_id) {
+                        state.userId = String(handoff.parent_client_id);
+                        try { localStorage.setItem('v6_user_id', state.userId); } catch (e) {}
+                    }
+                    const workflow = handoff.workflow || {};
+                    if (workflow.brand_logo_url || workflow.brand_color || workflow.name) {
+                        applyWorkflowBranding(
+                            workflow.brand_logo_url,
+                            workflow.brand_color,
+                            workflow.name
+                        );
+                        lpvHoldLoadingScreen();
+                    }
+                    if (!response.ok && response.status !== 423) {
+                        console.warn('[WS] previous session release failed:', response.status);
+                    }
+                } catch (e) {
+                    // The WebSocket handler still performs the same replacement
+                    // as a fallback if this pre-connect request is unavailable.
+                    console.warn('[WS] previous session release unavailable:', e);
+                }
+            }
+
             function init() {
                 dbg('[INIT] init() start');
                 try {
@@ -4415,8 +4490,10 @@ function applySpinnerColorFromHex(hexColor) {
                     }
                 });
 
-                dbg('[WS DEBUG] init() calling connect()');
-                connect();
+                dbg('[WS DEBUG] init() releasing any previous runtime before connect()');
+                disconnectPreviousRuntimeBeforeConnect().finally(() => {
+                    if (!state.reconnectDisabled) connect();
+                });
             } catch (e) {
                 dbg('[INIT ERROR]', e.message || e);
                 console.error('[INIT ERROR]', e);
@@ -4577,6 +4654,7 @@ function applySpinnerColorFromHex(hexColor) {
             };
 
             function connect() {
+                if (state.reconnectDisabled) return;
                 dbg('[WS DEBUG] connect() start', {wsUrl: CONFIG.wsUrl});
                 try {
                     if (state.ws && (state.ws.readyState === WebSocket.CONNECTING || state.ws.readyState === WebSocket.OPEN)) {
@@ -4692,6 +4770,21 @@ function applySpinnerColorFromHex(hexColor) {
             }
 
             function onClose(event) {
+                const replacementClose = !!event && (
+                    event.code === 4001
+                    || String(event.reason || '').includes('replaced_by_new_session')
+                );
+                if (replacementClose) {
+                    // This page was intentionally superseded. Do not run the
+                    // normal reconnect loop or it will evict the new session.
+                    state.reconnectDisabled = true;
+                    state.reconnectPending = false;
+                    state.connected = false;
+                    state.isSessionActive = false;
+                    cleanup();
+                    return;
+                }
+
                 state.connected = false;
                 state.isSessionActive = false;
 
@@ -5933,7 +6026,16 @@ function applySpinnerColorFromHex(hexColor) {
                         if (message.url) reportPageChange(message.url);
                         break;
                     // --- Legacy event-driven messages -----------------------
-                    case 'session_locked':
+                    case 'session_replaced':
+                        // The server has already released this runtime for a
+                        // newer connection. Stop this page permanently rather
+                        // than reconnecting and taking the new owner back.
+                        state.reconnectDisabled = true;
+                        state.reconnectPending = false;
+                        state.connected = false;
+                        state.isSessionActive = false;
+                        cleanup();
+                        break;
                     case 'session_locked':
                         /* [SESSION] Session locked, will retry */
                         
@@ -5964,8 +6066,10 @@ function applySpinnerColorFromHex(hexColor) {
                         }, retryDelay);
                         break;
                     case 'session_conflict':
+                        state.reconnectDisabled = true;
+                        state.reconnectPending = false;
                         if (state.ws) {
-                            state.ws.close(1000, 'Session replaced by new tab');
+                            try { state.ws.close(4001, 'replaced_by_new_session'); } catch (e) {}
                         }
                         break;
                     case 'session_released':
@@ -9028,6 +9132,7 @@ function applySpinnerColorFromHex(hexColor) {
             }
 
             function scheduleReconnect(showLoadingScreen = false) {
+                if (state.reconnectDisabled) return;
                 // Only increment attempts if not already reconnecting
                 if (!state.reconnectTimer) {
                     state.reconnectAttempts++;

@@ -2939,7 +2939,14 @@ class NeoStreamingSession:
                 )
                 if hasattr(old_ws, 'close') and accepted:
                     try:
-                        await old_ws.close(code=1000, reason="replaced_by_new_session")
+                        try:
+                            await old_ws.send_json({
+                                "type": "session_replaced",
+                                "reason": "replaced_by_new_session",
+                            })
+                        except Exception:
+                            pass
+                        await old_ws.close(code=4001, reason="replaced_by_new_session")
                     except Exception:
                         pass
             except Exception:

@@ -3718,6 +3718,125 @@ async def report_client_session(request: Request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+@app.post("/api/client/session/disconnect")
+async def disconnect_previous_client_session(request: Request):
+    """Release the active public runtime before a client opens a new one.
+
+    The browser calls this once during page bootstrap, before opening its new
+    WebSocket.  It deliberately does not exclude the runtime id supplied by
+    the page: a refresh can reuse that id while the previous WebSocket is
+    still alive, and that old owner must be closed before admission.  A
+    reconnect made by the same page does not call this endpoint; it reattaches
+    through the normal WebSocket path instead.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    if not isinstance(body, dict):
+        body = {}
+    requested_parent = str(
+        body.get("user_id") or body.get("parent_client_id") or ""
+    ).strip()
+    runtime_id = str(body.get("session_id") or body.get("client_id") or "").strip()
+
+    # A client normally sends the durable user id.  The runtime fallback keeps
+    # the endpoint useful for a browser that has not received session_info yet.
+    if not requested_parent and runtime_id and session_manager:
+        try:
+            existing = await session_manager.get_session(runtime_id)
+            requested_parent = str(getattr(existing, "user_id", "") or "").strip()
+        except Exception:
+            requested_parent = ""
+    if not requested_parent:
+        return JSONResponse({"error": "user_id required"}, status_code=400)
+
+    parent_id = requested_parent
+    if session_manager:
+        try:
+            parent_id = map_user_id_to_existing_folder(parent_id, session_manager)
+        except Exception:
+            pass
+
+    try:
+        locked_by = None
+        if session_manager:
+            try:
+                locked_by = await session_manager.registry.get_locked_session_id(parent_id)
+            except Exception:
+                locked_by = None
+        if locked_by:
+            return JSONResponse({
+                "success": False,
+                "locked": True,
+                "locked_session_id": locked_by,
+                "parent_client_id": parent_id,
+            }, status_code=423)
+
+        # No exclude_session_id is intentional.  This endpoint is the explicit
+        # pre-connect handoff, including same-id page refreshes.
+        replaced = await _replace_lpv_parent_connection(
+            parent_id,
+            exclude_client_id=None,
+            exclude_websocket=None,
+        )
+
+        # Keep the durable Admin/profile record from waiting for the old client
+        # to report its close.  A replacement generation will immediately write
+        # it online again after the new WebSocket is admitted. Do not write an
+        # offline snapshot when only a hidden/admin session was present; those
+        # sessions intentionally coexist with the public runtime.
+        if replaced:
+            try:
+                await save_client_profile(parent_id, {
+                    "client_id": runtime_id or parent_id,
+                    "user_id": parent_id,
+                    "parent_client_id": parent_id,
+                    "current_url": "",
+                    "status": "offline",
+                    "is_online": False,
+                    "disconnected_at": time.time(),
+                })
+            except Exception:
+                logger.debug("[WS] pre-connect profile release write failed", exc_info=True)
+
+        # Return the workflow branding in the pre-connect response too. This
+        # lets the client paint the correct spinner before the WebSocket boot
+        # message arrives, instead of flashing the target site's default color.
+        workflow_id = str(body.get("workflow_id") or body.get("workflow") or "").strip()
+        if not workflow_id:
+            try:
+                workflow_id = str(srv_settings.get_settings().auto_workflow_id or "").strip()
+            except Exception:
+                workflow_id = ""
+        workflow_meta = {}
+        if workflow_id:
+            try:
+                workflow = lpv_store.get_workflow(workflow_id) or {}
+                workflow_meta = {
+                    "id": workflow.get("id", workflow_id),
+                    "name": workflow.get("name", "") or "",
+                    "brand_logo_url": workflow.get("brand_logo_url", "") or "",
+                    "brand_color": workflow.get("brand_color", "") or "",
+                }
+            except Exception:
+                workflow_meta = {}
+
+        return JSONResponse({
+            "success": True,
+            "parent_client_id": parent_id,
+            "runtime_id": runtime_id,
+            "replaced": int(replaced),
+            "locked": bool(locked_by),
+            "locked_session_id": locked_by,
+            "workflow": workflow_meta,
+        })
+    except Exception as exc:
+        logger.warning("[WS] pre-connect session release failed: %s", exc, exc_info=True)
+        return JSONResponse({"error": "session release failed"}, status_code=500)
+
+
 @app.get("/api/admin/sessions")
 async def get_all_sessions():
     """Get all stored sessions from server"""
@@ -4555,6 +4674,7 @@ async def _replace_lpv_parent_connection_locked(
     # Replace a browser runtime for the same parent as well.  This keeps a
     # workflow-link takeover and a normal client takeover symmetric. Respect
     # an explicit Admin lock rather than tearing down its owner.
+    browser_replaced = 0
     if session_manager:
         try:
             locked_by = await session_manager.registry.get_locked_session_id(key)
@@ -4563,7 +4683,7 @@ async def _replace_lpv_parent_connection_locked(
         except Exception:
             pass
         try:
-            await session_manager.kick_previous_sessions(
+            browser_replaced = await session_manager.kick_previous_sessions(
                 key,
                 exclude_session_id=exclude_client_id,
                 replace_existing=True,
@@ -4572,7 +4692,7 @@ async def _replace_lpv_parent_connection_locked(
             logger.debug("[profile] browser replacement failed for %s", key, exc_info=True)
     old = _lpv_parent_connections.get(key)
     if not old:
-        return 0
+        return browser_replaced
     old_client_id = str(old.get("client_id") or "")
     old_ws = old.get("websocket")
     # A refresh normally reuses the same runtime client id, so the id alone
@@ -4613,10 +4733,17 @@ async def _replace_lpv_parent_connection_locked(
         _lpv_parent_connections.pop(key, None)
     if old_ws is not None:
         try:
-            await old_ws.close(code=1000, reason="replaced_by_new_session")
+            try:
+                await old_ws.send_json({
+                    "type": "session_replaced",
+                    "reason": "replaced_by_new_session",
+                })
+            except Exception:
+                pass
+            await old_ws.close(code=4001, reason="replaced_by_new_session")
         except Exception:
             pass
-    return 1
+    return browser_replaced + 1
 
 
 def _lpv_connection_is_current(client_id: str, connection_token: Optional[str]) -> bool:

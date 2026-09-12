@@ -917,7 +917,16 @@ class SessionManager:
     @staticmethod
     async def _safe_close_ws(ws):
         try:
-            await ws.close(code=1000, reason="replaced_by_new_session")
+            try:
+                await ws.send_json({
+                    "type": "session_replaced",
+                    "reason": "replaced_by_new_session",
+                })
+            except Exception:
+                pass
+            # 4001 is an application close code. The client treats it as a
+            # deliberate takeover and must not reconnect the old runtime.
+            await ws.close(code=4001, reason="replaced_by_new_session")
         except Exception:
             pass
 
