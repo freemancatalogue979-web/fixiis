@@ -30,6 +30,23 @@ from frame_crop import crop_frame_to_content
 
 logger = logging.getLogger(__name__)
 
+# A failed SingleFile bridge used to consume three full timeout windows before
+# PCM fell back to page.content(), which made one Capture click look frozen for
+# roughly a minute. PCM is an explicit archive action, so give it one bounded
+# extension attempt and a hard outer deadline; the live mirror keeps its own
+# retry policy.
+try:
+    PCM_SINGLEFILE_TIMEOUT_S = max(5, int(os.environ.get("PCM_SINGLEFILE_TIMEOUT_S", "20")))
+except (TypeError, ValueError):
+    PCM_SINGLEFILE_TIMEOUT_S = 20
+try:
+    PCM_CAPTURE_HARD_TIMEOUT_S = max(
+        PCM_SINGLEFILE_TIMEOUT_S + 2,
+        int(os.environ.get("PCM_CAPTURE_HARD_TIMEOUT_S", str(PCM_SINGLEFILE_TIMEOUT_S + 7))),
+    )
+except (TypeError, ValueError):
+    PCM_CAPTURE_HARD_TIMEOUT_S = PCM_SINGLEFILE_TIMEOUT_S + 7
+
 
 def _is_page_alive(page: Any) -> bool:
     """Best-effort liveness check for a Playwright page object."""
@@ -782,37 +799,75 @@ class PCMManager:
     async def capture_html(self) -> Optional[str]:
         """Capture current PCM page (archive-quality, self-contained).
 
-        ARCHIVE_FORMAT=mhtml uses a single CDP ``Page.captureSnapshot``
-        (native MHTML — no extension round-trip, no service-worker
-        discovery).  Default stays the SingleFile extension path from
-        dom_capture.  ``page.content()`` remains the last-resort fallback.
+        ``ARCHIVE_FORMAT=mhtml`` uses one CDP ``Page.captureSnapshot`` call.
+        The default SingleFile path is deliberately bounded to one attempt:
+        a broken/idle extension bridge must not make the admin wait through
+        three consecutive 20-second windows before receiving the lightweight
+        ``page.content()`` fallback.
         """
-        if not _is_page_alive(self._page):
+        page = self._page
+        if not _is_page_alive(page):
             return None
+        started = time.perf_counter()
         try:
-            import os as _os
-            if _os.environ.get("ARCHIVE_FORMAT", "singlefile").strip().lower() == "mhtml":
+            if os.environ.get("ARCHIVE_FORMAT", "singlefile").strip().lower() == "mhtml":
                 try:
                     from dom_capture import capture_page_mhtml
-                    mhtml = await capture_page_mhtml(self._page, timeout=20)
+                    mhtml = await capture_page_mhtml(page, timeout=PCM_SINGLEFILE_TIMEOUT_S)
                     if mhtml:
+                        logger.info(
+                            "[PCM] MHTML capture completed in %.2fs (%d bytes)",
+                            time.perf_counter() - started, len(mhtml),
+                        )
                         return mhtml
-                except Exception as _e:
-                    logger.debug(f"[PCM] MHTML capture unavailable, SingleFile path: {_e}")
-            # Prefer extension capture via dom_capture helper
+                except Exception as exc:
+                    logger.debug("[PCM] MHTML capture unavailable, SingleFile path: %s", exc)
+
             from dom_capture import _capture_with_single_file
-            html = await _capture_with_single_file(self._page, timeout=20)
+            sf_started = time.perf_counter()
+            try:
+                html = await asyncio.wait_for(
+                    _capture_with_single_file(
+                        page,
+                        timeout=PCM_SINGLEFILE_TIMEOUT_S,
+                        max_attempts=1,
+                    ),
+                    timeout=PCM_CAPTURE_HARD_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[PCM] SingleFile capture exceeded %ss hard deadline; using page.content()",
+                    PCM_CAPTURE_HARD_TIMEOUT_S,
+                )
+                html = None
+            logger.info(
+                "[PCM] SingleFile capture attempt took %.2fs (result=%s)",
+                time.perf_counter() - sf_started,
+                "ok" if html else "empty",
+            )
             if html:
+                logger.info(
+                    "[PCM] capture completed in %.2fs (%d bytes)",
+                    time.perf_counter() - started, len(html),
+                )
                 return html
-            # fallback: simple page.content
+
+            # Last-resort lightweight snapshot. Keep this bounded too so a
+            # detached CDP target cannot leave the HTTP request hanging.
             try:
-                return await self._page.content()
-            except Exception:
-                return None
-        except Exception as e:
-            logger.warning(f"[PCM] capture_html failed: {e}")
+                html = await asyncio.wait_for(page.content(), timeout=5)
+            except asyncio.TimeoutError:
+                html = None
+            if html:
+                logger.info(
+                    "[PCM] page.content fallback completed in %.2fs (%d bytes)",
+                    time.perf_counter() - started, len(html),
+                )
+            return html
+        except Exception as exc:
+            logger.warning("[PCM] capture_html failed after %.2fs: %s", time.perf_counter() - started, exc)
             try:
-                return await self._page.content()
+                return await asyncio.wait_for(page.content(), timeout=5)
             except Exception:
                 return None
 

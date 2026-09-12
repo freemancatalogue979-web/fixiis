@@ -1506,7 +1506,12 @@ async def capture_page_mhtml(page: Any, *, timeout: float = 15.0) -> Optional[st
 # SingleFile full capture
 # ---------------------------------------------------------------------------
 
-async def _capture_with_single_file(page: Any, *, timeout: int = SINGLEFILE_TIMEOUT_S) -> Optional[str]:
+async def _capture_with_single_file(
+    page: Any,
+    *,
+    timeout: int = SINGLEFILE_TIMEOUT_S,
+    max_attempts: int = 3,
+) -> Optional[str]:
     """Capture the current page using SingleFile.
 
     Default mode is **extension** (the MV3 SingleFile we ship).  We open
@@ -1516,7 +1521,8 @@ async def _capture_with_single_file(page: Any, *, timeout: int = SINGLEFILE_TIME
     HTML.
 
     Set ``SINGLEFILE_CAPTURE_MODE=library`` to use the legacy JS-library
-    injection path instead.
+    injection path instead. ``max_attempts`` lets archive callers bound the
+    retry budget; the live mirror keeps the historical retry default.
     """
     if page is None:
         return None
@@ -1555,19 +1561,20 @@ async def _capture_with_single_file(page: Any, *, timeout: int = SINGLEFILE_TIME
     # "message channel closed" errors.
     if _is_extension_capture_enabled():
         last_exc = None
-        for attempt in range(3):
+        attempts = max(1, int(max_attempts))
+        for attempt in range(attempts):
             try:
                 html = await _capture_via_extension(page, timeout=timeout)
                 if html:
                     if attempt > 0:
-                        logger.debug("SingleFile ext: capture succeeded on retry %s/3 (%d bytes)", attempt + 1, len(html))
+                        logger.debug("SingleFile ext: capture succeeded on retry %s/%s (%d bytes)", attempt + 1, attempts, len(html))
                     return html
                 last_exc = None
-                if attempt < 2:
-                    logger.debug("SingleFile ext: returned no content, retry %s/3", attempt + 1)
+                if attempt < attempts - 1:
+                    logger.debug("SingleFile ext: returned no content, retry %s/%s", attempt + 1, attempts)
                     await asyncio.sleep(0.5 * (attempt + 1))
                     continue
-                logger.warning("SingleFile ext: returned no content after 3 attempts — not falling back to library (disabled)")
+                logger.warning("SingleFile ext: returned no content after %s attempt(s) — not falling back to library (disabled)", attempts)
             except Exception as exc:
                 last_exc = exc
                 msg = str(exc).lower()
@@ -1575,15 +1582,15 @@ async def _capture_with_single_file(page: Any, *, timeout: int = SINGLEFILE_TIME
                 # script hasn't re-attached yet after navigation or when the
                 # service worker was idle. Retry instead of falling back to
                 # the garbled library injection.
-                if ("message channel closed" in msg or "receiving end does not exist" in msg or "could not establish connection" in msg) and attempt < 2:
-                    logger.debug("SingleFile ext: transient failure retry %s/3: %s", attempt + 1, exc)
+                if ("message channel closed" in msg or "receiving end does not exist" in msg or "could not establish connection" in msg) and attempt < attempts - 1:
+                    logger.debug("SingleFile ext: transient failure retry %s/%s: %s", attempt + 1, attempts, exc)
                     await asyncio.sleep(0.5 * (attempt + 1))
                     continue
                 logger.warning("SingleFile ext: capture failed (%s)", exc)
                 break
         # No library fallback — return None so caller can decide (avoids 8 MB duplicate + garbled Yahoo)
         if last_exc:
-            logger.debug("SingleFile ext: giving up after retries, last error: %s", last_exc)
+            logger.debug("SingleFile ext: giving up after %s attempt(s), last error: %s", attempts, last_exc)
         return None
     else:
         logger.debug(
