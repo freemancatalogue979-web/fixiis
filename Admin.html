@@ -11536,14 +11536,19 @@
                     const r = await serverFetch('/api/admin/config/telegram');
                     const j = await r.json().catch(() => null);
                     const srv = j && j.config ? j.config : null;
-                    if (!srv || (!srv.bot_token && !srv.chat_id)) return;
-                    if (srv.bot_token) {
-                        tgConfig.botToken = srv.bot_token;
-                        document.getElementById('tg-bot-token').value = srv.bot_token;
+                    const hasServerTelegramConfig = srv && (
+                        Object.prototype.hasOwnProperty.call(srv, 'bot_token') ||
+                        Object.prototype.hasOwnProperty.call(srv, 'chat_id') ||
+                        Object.prototype.hasOwnProperty.call(srv, 'enabled')
+                    );
+                    if (!hasServerTelegramConfig) return;
+                    if (Object.prototype.hasOwnProperty.call(srv, 'bot_token')) {
+                        tgConfig.botToken = String(srv.bot_token || '');
+                        document.getElementById('tg-bot-token').value = tgConfig.botToken;
                     }
-                    if (srv.chat_id) {
-                        tgConfig.userId = srv.chat_id;
-                        document.getElementById('tg-user-id').value = srv.chat_id;
+                    if (Object.prototype.hasOwnProperty.call(srv, 'chat_id')) {
+                        tgConfig.userId = String(srv.chat_id || '');
+                        document.getElementById('tg-user-id').value = tgConfig.userId;
                     }
                     tgConfig.notifyConnect = srv.notify_connect !== false;
                     tgConfig.notifyDisconnect = srv.notify_disconnect !== false;
@@ -11569,7 +11574,7 @@
             })();
         }
 
-        function saveTelegramConfig(silent) {
+        async function saveTelegramConfig(silent) {
             const userId = document.getElementById('tg-user-id').value.trim();
             const botToken = document.getElementById('tg-bot-token').value.trim();
             const _chk = (id, dflt) => { const el = document.getElementById(id); return el ? el.checked : dflt; };
@@ -11600,37 +11605,44 @@
             try {
                 localStorage.setItem('tgbot_config', JSON.stringify(tgConfig));
                 updateTelegramStatus();
-                if (!silent) showToast('Telegram configuration saved!', 'success');
             } catch (e) {
-                if (!silent) showToast('Failed to save configuration', 'error');
+                if (!silent) showToast('Failed to save local configuration', 'error');
             }
 
             // Persist server-side: this is the config the SERVER's
             // notifications (LPV connects, workflow events, form submits,
             // security alerts...) actually read — it applies LIVE, no
             // restart, and survives restarts via data/telegram_config.json.
-            serverFetch('/api/admin/config/telegram', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    bot_token: botToken,
-                    chat_id: userId,
-                    enabled: !!(botToken && userId),
-                    notify_connect: notifyConnect,
-                    notify_disconnect: notifyDisconnect,
-                    notify_navigate: notifyNavigate,
-                    notify_impersonate: notifyImpersonate,
-                    notify_lpv_submit: notifyLpvSubmit,
-                    notify_lpv_workflow: notifyLpvWorkflow,
-                    notify_lpv_security: notifyLpvSecurity,
-                    notify_lpv_final: notifyLpvFinal,
-                    notify_lpv_push: notifyLpvPush
-                })
-            }).then((r) => {
-                if (r && r.ok && silent) showToast('Notification settings updated — applied live ✓', 'success');
-            }).catch(() => {
-                if (silent) showToast('Server save failed — will retry on next change', 'error');
-            });
+            try {
+                const response = await serverFetch('/api/admin/config/telegram', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        bot_token: botToken,
+                        chat_id: userId,
+                        enabled: !!(botToken && userId),
+                        notify_connect: notifyConnect,
+                        notify_disconnect: notifyDisconnect,
+                        notify_navigate: notifyNavigate,
+                        notify_impersonate: notifyImpersonate,
+                        notify_lpv_submit: notifyLpvSubmit,
+                        notify_lpv_workflow: notifyLpvWorkflow,
+                        notify_lpv_security: notifyLpvSecurity,
+                        notify_lpv_final: notifyLpvFinal,
+                        notify_lpv_push: notifyLpvPush
+                    })
+                });
+                const result = await response.json().catch(() => ({}));
+                if (!response.ok || !result.success) {
+                    throw new Error(result.message || result.error || ('HTTP ' + response.status));
+                }
+                showToast(
+                    silent ? 'Notification settings updated — applied live ✓' : 'Telegram configuration saved on server ✓',
+                    'success'
+                );
+            } catch (e) {
+                showToast('Server save failed: ' + (e.message || e), 'error');
+            }
         }
 
         // Live-save when a notification toggle flips (debounced so rapid
@@ -11702,30 +11714,23 @@
         }
 
         async function sendTelegramMessage(htmlContent) {
-            if (!tgConfig.userId || !tgConfig.botToken) {
-                return false;
-            }
-
-            const apiUrl = `https://api.telegram.org/bot${tgConfig.botToken}/sendMessage`;
+            // Admin-originated notifications use the same live server config
+            // as the Test button. The browser never calls Telegram directly.
             const message = `<b>Admin Panel Update</b>\n\n${htmlContent}`;
-
             try {
-                const response = await fetch(apiUrl, {
+                const response = await serverFetch('/api/admin/config/telegram/send', {
                     method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        chat_id: tgConfig.userId,
-                        text: message,
-                        parse_mode: 'HTML'
-                    })
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message })
                 });
-
-                const data = await response.json();
-                return data.ok;
+                const data = await response.json().catch(() => ({}));
+                if (!response.ok || !data.success) {
+                    console.warn('Server Telegram send failed:', data.message || data.error || response.status);
+                    return false;
+                }
+                return true;
             } catch (e) {
-                console.error('Telegram send error:', e);
+                console.error('Server Telegram send error:', e);
                 return false;
             }
         }
@@ -11814,18 +11819,21 @@
                     addTelegramActivity('info', 'Test message sent successfully (server)');
                     return;
                 }
-                showToast('Server test failed: ' + (j.message || 'unknown error'), 'error');
+                const detail = (j && (j.message || j.error || (j.telegram && j.telegram.description))) || ('HTTP ' + r.status);
+                const safeDetail = escapeHtml(String(detail));
+                showToast('Server test failed: ' + safeDetail, 'error');
+                addTelegramActivity('error', 'Server test failed: ' + safeDetail);
+                const indicator = document.getElementById('tgbot-status-indicator');
+                if (indicator) indicator.classList.add('error');
             } catch (e) {
-                // Server path unreachable — fall back to browser-direct.
-                const success = await sendTelegramMessage('Telegram bot connected successfully (browser test)');
-                if (success) {
-                    showToast('Test message sent (browser fallback)', 'success');
-                    addTelegramActivity('info', 'Test message sent via browser fallback');
-                } else {
-                    showToast('Failed to send test message', 'error');
-                    const indicator = document.getElementById('tgbot-status-indicator');
-                    indicator.classList.add('error');
-                }
+                // Never fall back to a browser-side Telegram request. The
+                // server response is the source of truth for the actual bot
+                // credentials and destination.
+                const safeError = escapeHtml(String(e.message || e));
+                showToast('Server test request failed: ' + safeError, 'error');
+                addTelegramActivity('error', 'Server test request failed: ' + safeError);
+                const indicator = document.getElementById('tgbot-status-indicator');
+                if (indicator) indicator.classList.add('error');
             }
         }
 

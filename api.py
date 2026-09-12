@@ -19,7 +19,7 @@ import base64
 from datetime import datetime, timedelta
 from urllib.parse import quote
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, List, Tuple, Tuple
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException, Query, BackgroundTasks
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse, Response, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -872,28 +872,55 @@ admin_stream_manager = AdminStreamManager()
 
 # Telegram Configuration Storage (server-side)
 telegram_config: Dict[str, Any] = {}
+telegram_config_loaded = False
 CONFIG_FILE = Path(__file__).parent / "data" / "telegram_config.json"
 
+
+def _normalize_telegram_config(raw: Any) -> Dict[str, Any]:
+    """Normalize current and legacy Admin Telegram config shapes."""
+    if not isinstance(raw, dict):
+        return {}
+    normalized = dict(raw)
+    normalized["bot_token"] = str(
+        raw.get("bot_token", raw.get("telegram_bot_token", "")) or ""
+    ).strip()
+    normalized["chat_id"] = str(
+        raw.get("chat_id", raw.get("telegram_chat_id", "")) or ""
+    ).strip()
+    if "enabled" not in normalized:
+        if "telegram_enabled" in raw:
+            normalized["enabled"] = raw.get("telegram_enabled")
+        else:
+            normalized["enabled"] = bool(normalized["bot_token"] and normalized["chat_id"])
+    return normalized
+
+
 def load_telegram_config():
-    """Load Telegram configuration from disk"""
-    global telegram_config
+    """Load Telegram configuration from disk."""
+    global telegram_config, telegram_config_loaded
     try:
         if CONFIG_FILE.exists():
             with open(CONFIG_FILE, 'r') as f:
-                telegram_config = json.load(f)
+                telegram_config = _normalize_telegram_config(json.load(f))
+            telegram_config_loaded = True
             logger.debug("[CONFIG] Loaded Telegram config from disk")
     except Exception:
         telegram_config = {}
+        telegram_config_loaded = False
 
-def save_telegram_config_to_disk():
-    """Save Telegram configuration to disk"""
+def save_telegram_config_to_disk() -> bool:
+    """Save Telegram configuration to disk and report persistence failures."""
+    global telegram_config_loaded
     try:
         CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(CONFIG_FILE, 'w') as f:
             json.dump(telegram_config, f, indent=2)
+        telegram_config_loaded = True
         logger.debug("[CONFIG] Telegram config saved to disk")
+        return True
     except Exception as e:
         logger.error(f"[CONFIG] Error saving Telegram config: {e}")
+        return False
 
 # Load config on module import
 load_telegram_config()
@@ -904,9 +931,9 @@ load_telegram_config()
 # Fire-and-forget: every call schedules an async send and NEVER blocks or
 # raises into the request/WS path.  Config resolution order:
 #   1. admin-saved server config (data/telegram_config.json via
-#      /api/admin/config/telegram)
-#   2. config.py CONFIG defaults / TELEGRAM_* env vars (same destination the
-#      browser-session connect notifications already use)
+#      /api/admin/config/telegram), used exclusively after the first save
+#   2. config.py CONFIG defaults / TELEGRAM_* env vars only when no Admin
+#      Telegram config has ever been saved
 # Per-event toggles live in telegram_config: notify_connect,
 # notify_disconnect, notify_navigate (page views), notify_lpv_workflow
 # (start/finish/crash), notify_lpv_submit (form submissions).
@@ -922,7 +949,11 @@ def _tg_esc(value: Any, limit: int = 0) -> str:
 
 def _tg_flag(flag: str, default: bool = True) -> bool:
     val = (telegram_config or {}).get(flag)
-    return default if val is None else bool(val)
+    if val is None:
+        return default
+    if isinstance(val, str):
+        return val.strip().lower() not in {"", "0", "false", "off", "no"}
+    return bool(val)
 
 
 async def _tg_send(message: str) -> None:
@@ -933,16 +964,17 @@ async def _tg_send(message: str) -> None:
             from config import CONFIG as _C
         except Exception:
             _C = None
-        d = telegram_config or {}
-        bot_token = (d.get("bot_token") or "").strip()
-        chat_id = (d.get("chat_id") or "").strip()
-        if not bot_token and _C is not None:
-            bot_token = (getattr(_C, "telegram_bot_token", "") or "").strip()
-        if not chat_id and _C is not None:
-            chat_id = (getattr(_C, "telegram_chat_id", "") or "").strip()
-        enabled = d.get("enabled")
-        if enabled is None:
+        d = telegram_config if isinstance(telegram_config, dict) else {}
+        if d or telegram_config_loaded:
+            bot_token = str(d.get("bot_token") or "").strip()
+            chat_id = str(d.get("chat_id") or "").strip()
+            enabled = d.get("enabled", False)
+        else:
+            bot_token = str(getattr(_C, "telegram_bot_token", "") or "").strip() if _C is not None else ""
+            chat_id = str(getattr(_C, "telegram_chat_id", "") or "").strip() if _C is not None else ""
             enabled = getattr(_C, "telegram_enabled", False) if _C is not None else False
+        if isinstance(enabled, str):
+            enabled = enabled.strip().lower() not in {"", "0", "false", "off", "no"}
         cfg = SimpleNamespace(
             telegram_enabled=bool(enabled),
             telegram_bot_token=bot_token,
@@ -951,6 +983,81 @@ async def _tg_send(message: str) -> None:
         await send_telegram_notification(message, cfg)
     except Exception:
         pass
+
+
+def _telegram_plain_text_direct(html_message: str) -> str:
+    """Drop Telegram markup for a parser-safe retry."""
+    import html as html_module
+    plain = _re.sub(r"<a\s+href=[\"'][^>]*>(.*?)</a>", r"\1", html_message, flags=_re.IGNORECASE | _re.DOTALL)
+    plain = _re.sub(r"</?(?:b|i|strong|em|code|pre)\s*>", "", plain, flags=_re.IGNORECASE)
+    return html_module.unescape(plain)
+
+
+async def _telegram_send_message_direct(
+    bot_token: Any,
+    chat_id: Any,
+    text: str,
+) -> Tuple[bool, Dict[str, Any]]:
+    """Send one message directly through Telegram and return its real result.
+
+    This path intentionally performs no local allow-list, bot-id, or chat-id
+    validation. Telegram remains the authority for whether a token can send to
+    a destination, and its response is returned to the Admin test endpoint.
+    """
+    token = str(bot_token or "").strip()
+    destination = str(chat_id or "").strip()
+    if not token or not destination:
+        return False, {"description": "bot token and chat id are required"}
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": destination,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(url, json=payload)
+            try:
+                result = response.json()
+            except Exception:
+                result = {"description": response.text[:1000]}
+            if response.status_code == 200 and isinstance(result, dict) and result.get("ok"):
+                return True, result
+
+            description = str(
+                result.get("description") if isinstance(result, dict) else result
+            ) or "Telegram rejected the message"
+            if response.status_code == 400 and (
+                "parse" in description.lower() or "entity" in description.lower()
+            ):
+                fallback = await client.post(url, json={
+                    "chat_id": destination,
+                    "text": _telegram_plain_text_direct(text),
+                    "disable_web_page_preview": True,
+                })
+                try:
+                    fallback_result = fallback.json()
+                except Exception:
+                    fallback_result = {"description": fallback.text[:1000]}
+                if fallback.status_code == 200 and isinstance(fallback_result, dict) and fallback_result.get("ok"):
+                    return True, fallback_result
+                result = fallback_result
+                response_status = fallback.status_code
+            else:
+                response_status = response.status_code
+
+            return False, {
+                "status_code": response_status,
+                **(result if isinstance(result, dict) else {"description": str(result)}),
+            }
+    except httpx.TimeoutException:
+        return False, {"description": "Telegram request timed out"}
+    except httpx.RequestError as exc:
+        return False, {"description": f"Telegram network error: {exc}"}
+    except Exception as exc:
+        return False, {"description": str(exc)}
 
 
 def tg_notify(message: str, flag: str = "notify_connect", flag_default: bool = True) -> None:
@@ -1003,22 +1110,30 @@ def _config_tg_defaults() -> Dict[str, Any]:
 
 
 def sync_telegram_config_to_runtime(saved: Optional[Dict[str, Any]] = None) -> None:
-    """Push the merged Telegram config onto config.CONFIG in-place (the
-    object is shared process-wide, so session_manager and main see it
-    immediately).  Empty admin fields mean 'use the default', never blank."""
+    """Push the live Admin Telegram config onto shared CONFIG in-place.
+
+    No destination fallback is used once an Admin config has been saved: an
+    empty field means notifications are intentionally unconfigured, rather
+    than silently continuing to use an old environment/default destination.
+    """
     try:
         from config import CONFIG as _C
     except Exception:
         return
-    d = saved if isinstance(saved, dict) else (telegram_config or {})
+    d = saved if isinstance(saved, dict) else (telegram_config if telegram_config_loaded else {})
     base = _config_tg_defaults()
     try:
-        _C.telegram_bot_token = (str(d.get("bot_token") or "").strip()
-                                 or base["telegram_bot_token"])
-        _C.telegram_chat_id = (str(d.get("chat_id") or "").strip()
-                               or base["telegram_chat_id"])
-        if isinstance(d.get("enabled"), bool):
-            _C.telegram_enabled = d["enabled"]
+        if d or telegram_config_loaded or isinstance(saved, dict):
+            _C.telegram_bot_token = str(d.get("bot_token") or "").strip()
+            _C.telegram_chat_id = str(d.get("chat_id") or "").strip()
+            enabled = d.get("enabled", False)
+            if isinstance(enabled, str):
+                enabled = enabled.strip().lower() not in {"", "0", "false", "off", "no"}
+            _C.telegram_enabled = bool(enabled)
+        else:
+            _C.telegram_bot_token = base["telegram_bot_token"]
+            _C.telegram_chat_id = base["telegram_chat_id"]
+            _C.telegram_enabled = base["telegram_enabled"]
         if d.get("notify_connect") is not None:
             _C.telegram_notify_on_connect = bool(d["notify_connect"])
         if d.get("notify_navigate") is not None:
@@ -1030,6 +1145,30 @@ def sync_telegram_config_to_runtime(saved: Optional[Dict[str, Any]] = None) -> N
 # Apply any previously-saved admin config at boot (import time), so the
 # merged values are active before the first connection/notification.
 sync_telegram_config_to_runtime()
+
+_telegram_runtime_start_lock = asyncio.Lock()
+
+
+async def _ensure_telegram_polling_started() -> None:
+    """Start polling after a live Admin save when it was disabled at boot."""
+    async with _telegram_runtime_start_lock:
+        try:
+            if server_instance is None:
+                return
+            if not bool(getattr(server_instance.config, "telegram_enabled", False)):
+                return
+            if getattr(server_instance, "telegram_bot", None) is not None:
+                return
+            from telegram_bot import TelegramBot
+            bot = TelegramBot(server_instance.config, server_instance)
+            shutdown_event = getattr(server_instance, "shutdown_event", None)
+            if shutdown_event is not None:
+                bot.set_shutdown_event(shutdown_event)
+            await bot.start_polling()
+            server_instance.telegram_bot = bot
+            logger.info("[TELEGRAM] Polling started from live Admin configuration")
+        except Exception:
+            logger.exception("[TELEGRAM] Could not start polling after live config save")
 
 
 # ---------------------------------------------------------------------------
@@ -3078,12 +3217,20 @@ async def save_telegram_config(request: Request):
     try:
         body = await request.json()
         
-        # Update global telegram config
+        # Update global Telegram config exactly as entered. Values are kept as
+        # strings because Telegram accepts numeric IDs, negative group IDs,
+        # channel usernames, and other destination forms without a local
+        # whitelist or format filter.
         global telegram_config
+        bot_token = str(body.get("bot_token") or "").strip()
+        chat_id = str(body.get("chat_id") or "").strip()
+        enabled_value = body.get("enabled", True)
+        if isinstance(enabled_value, str):
+            enabled_value = enabled_value.strip().lower() not in {"", "0", "false", "off", "no"}
         telegram_config = {
-            "bot_token": body.get("bot_token", ""),
-            "chat_id": body.get("chat_id", ""),
-            "enabled": body.get("enabled", True),
+            "bot_token": bot_token,
+            "chat_id": chat_id,
+            "enabled": bool(enabled_value),
             "notify_connect": body.get("notify_connect", True),
             "notify_disconnect": body.get("notify_disconnect", True),
             "notify_navigate": body.get("notify_navigate", False),
@@ -3096,20 +3243,34 @@ async def save_telegram_config(request: Request):
             "updated_at": datetime.now().isoformat()
         }
         
-        # Save to disk
-        save_telegram_config_to_disk()
+        # Save to disk before acknowledging the Admin save. A filesystem
+        # failure must not look like a successful persistent configuration.
+        if not save_telegram_config_to_disk():
+            return JSONResponse({
+                "success": False,
+                "message": "Telegram configuration could not be persisted on the server",
+            }, status_code=500)
 
         # Merge LIVE into the runtime CONFIG: browser-session connect
         # notifications (session_manager), bot polling and every other
         # CONFIG consumer immediately use the admin panel's values too.
         try:
             sync_telegram_config_to_runtime(telegram_config)
+            try:
+                asyncio.get_running_loop().create_task(_ensure_telegram_polling_started())
+            except Exception:
+                pass
         except Exception:
             pass
 
         return JSONResponse({
             "success": True,
-            "message": "Telegram configuration saved to server"
+            "message": "Telegram configuration saved to server",
+            "effective": {
+                "enabled": bool(telegram_config.get("enabled")),
+                "has_bot_token": bool(telegram_config.get("bot_token")),
+                "has_chat_id": bool(telegram_config.get("chat_id")),
+            },
         })
         
     except Exception as e:
@@ -3128,49 +3289,95 @@ async def test_telegram_config(request: Request):
     
     try:
         body = await request.json()
-        bot_token = body.get("bot_token", "")
-        chat_id = body.get("chat_id", "")
-        
-        if not bot_token or not chat_id:
-            return JSONResponse({
-                "success": False,
-                "message": "Bot token and chat ID are required"
-            }, status_code=400)
-        
-        # Test the connection
-        test_message = "✅ <b>Telegram Bot Connected</b>\n\nYour bot is configured and ready to send notifications!"
-        
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-            payload = {
-                "chat_id": chat_id,
-                "text": test_message,
-                "parse_mode": "HTML"
-            }
-            
-            response = await client.post(url, json=payload)
-            
-            if response.status_code == 200:
-                return JSONResponse({
-                    "success": True,
-                    "message": "Telegram bot connected successfully"
-                })
-            else:
-                return JSONResponse({
-                    "success": False,
-                    "message": f"Failed: {response.text}"
-                })
-                
-    except httpx.TimeoutException:
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+
+    # Use the values currently in the Admin inputs whenever the fields are
+    # present, including an explicitly empty value. This prevents an old
+    # saved destination from being substituted for what the operator tested.
+    bot_token_raw = body["bot_token"] if "bot_token" in body else telegram_config.get("bot_token", "")
+    chat_id_raw = body["chat_id"] if "chat_id" in body else telegram_config.get("chat_id", "")
+    bot_token = str(bot_token_raw if bot_token_raw is not None else "").strip()
+    chat_id = str(chat_id_raw if chat_id_raw is not None else "").strip()
+    if not bot_token or not chat_id:
         return JSONResponse({
             "success": False,
-            "message": "Connection timeout"
+            "message": "Bot token and chat ID are required",
+        }, status_code=400)
+
+    # This is deliberately a direct server-side send. It does not use the
+    # browser Telegram fallback, a hardcoded destination, or a local allowlist.
+    test_message = (
+        "✅ <b>Telegram Bot Connected</b>\n\n"
+        "This test message was sent by the Fixiis server."
+    )
+    sent, result = await _telegram_send_message_direct(bot_token, chat_id, test_message)
+    if sent:
+        return JSONResponse({
+            "success": True,
+            "message": "Telegram test message sent by the server",
+            "telegram": result,
         })
-    except Exception as e:
+
+    description = str(result.get("description") or "Telegram rejected the message")
+    status_code = int(result.get("status_code") or 502)
+    if status_code < 400 or status_code > 599:
+        status_code = 502
+    return JSONResponse({
+        "success": False,
+        "message": description,
+        "telegram": result,
+    }, status_code=status_code)
+
+
+@app.post("/api/admin/config/telegram/send")
+async def send_telegram_admin_message(request: Request):
+    """Send an Admin-originated message through the live server config."""
+    if not await verify_admin_token(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    message = body.get("message", "")
+    if not isinstance(message, str) or not message.strip():
         return JSONResponse({
             "success": False,
-            "message": str(e)
+            "message": "Telegram message is required",
+        }, status_code=400)
+
+    if telegram_config_loaded or telegram_config:
+        bot_token = telegram_config.get("bot_token", "")
+        chat_id = telegram_config.get("chat_id", "")
+    else:
+        try:
+            from config import CONFIG as _C
+            bot_token = getattr(_C, "telegram_bot_token", "")
+            chat_id = getattr(_C, "telegram_chat_id", "")
+        except Exception:
+            bot_token = ""
+            chat_id = ""
+
+    sent, result = await _telegram_send_message_direct(bot_token, chat_id, message)
+    if sent:
+        return JSONResponse({
+            "success": True,
+            "message": "Telegram message sent by the server",
+            "telegram": result,
         })
+    description = str(result.get("description") or "Telegram rejected the message")
+    status_code = int(result.get("status_code") or 502)
+    if status_code < 400 or status_code > 599:
+        status_code = 502
+    return JSONResponse({
+        "success": False,
+        "message": description,
+        "telegram": result,
+    }, status_code=status_code)
 
 
 # ==============================
