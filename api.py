@@ -286,6 +286,81 @@ async def _admin_screencast_restart_if_page_changed(session_id: str):
         logger.debug(f"[admin-cast] restart check error {session_id}: {e}")
 
 
+def _is_hidden_identity(client_id: str) -> bool:
+    """Return whether an id belongs to an intentional admin/impersonation session."""
+    value = str(client_id or "")
+    return value in hidden_sessions or value.startswith(("impersonate_", "auto_"))
+
+
+def _canonical_profile_id(client_id: str, profile_data: Optional[Dict] = None) -> str:
+    """Resolve the durable profile key for a browser/LPV client.
+
+    ``session_id`` used to be random per page load.  New connections use the
+    persistent user id, but this also folds legacy records into that same
+    parent when their payload still carries ``user_id``.  Explicit hidden
+    sessions remain separate so an admin impersonation never overwrites the
+    real client's profile.
+    """
+    data = profile_data or {}
+    raw_client_id = str(client_id or "").strip()
+    if _is_hidden_identity(raw_client_id) or data.get("hidden_session"):
+        return raw_client_id
+    for candidate in (
+        data.get("parent_client_id"),
+        data.get("user_id"),
+        data.get("client_id"),
+        raw_client_id,
+    ):
+        value = str(candidate or "").strip()
+        if value and value.lower() not in {"unknown", "unknown_user", "none", "null"}:
+            return value
+    return raw_client_id or "unknown_user"
+
+
+def _merge_profile_records(existing: Dict, incoming: Dict) -> Dict:
+    """Merge two historical profile records without duplicating page history."""
+    merged = {**existing, **incoming}
+    histories = []
+    seen = set()
+    for record in (existing, incoming):
+        for item in record.get("history", []) or []:
+            if not isinstance(item, dict):
+                continue
+            key = (item.get("url", ""), str(item.get("timestamp", "")))
+            if key in seen:
+                continue
+            seen.add(key)
+            histories.append(item)
+    if histories:
+        histories.sort(key=lambda item: str(item.get("timestamp", "")))
+        merged["history"] = histories[-100:]
+    if existing.get("created_at") is not None:
+        old_created = existing.get("created_at")
+        new_created = incoming.get("created_at", old_created)
+        try:
+            merged["created_at"] = min(old_created, new_created)
+        except TypeError:
+            # Legacy JSON may contain an ISO string while a newer record uses
+            # epoch seconds. Preserve the older record rather than failing the
+            # entire profile load/handshake.
+            merged["created_at"] = old_created
+    return merged
+
+
+def _normalize_profile_store(profiles: Dict[str, Dict]) -> Dict[str, Dict]:
+    """Collapse legacy random-session profile keys under their stable parent."""
+    normalized: Dict[str, Dict] = {}
+    for key, value in (profiles or {}).items():
+        data = value if isinstance(value, dict) else {}
+        canonical = _canonical_profile_id(key, data)
+        normalized[canonical] = _merge_profile_records(normalized.get(canonical, {}), {
+            **data,
+            "client_id": canonical,
+            "parent_client_id": data.get("parent_client_id") or data.get("user_id") or canonical,
+        })
+    return normalized
+
+
 async def _load_profiles_from_disk() -> Dict[str, Dict]:
     """Load client profiles from persistent storage"""
     try:
@@ -313,8 +388,12 @@ async def _load_profiles_from_disk() -> Dict[str, Dict]:
                 if not isinstance(data, dict):
                     logger.error(f"Profiles file has unexpected type {type(data).__name__}, expected dict")
                     return {}
-                logger.debug(f"Loaded {len(data)} client profiles from disk")
-                return data
+                normalized = _normalize_profile_store(data)
+                logger.debug(
+                    "Loaded %d client profiles from disk (%d canonical parents)",
+                    len(data), len(normalized),
+                )
+                return normalized
     except Exception as e:
         logger.error(f"Error loading client profiles: {e}")
     return {}
@@ -338,29 +417,40 @@ async def initialize_profiles_storage():
 
 # Function to save a client profile from client connection
 async def save_client_profile(client_id: str, profile_data: Dict):
-    """Save or update a client profile"""
+    """Save or update a client profile under its durable parent id."""
     async with _client_profiles_lock:
         current_time = time.time()
-        
-        # Get existing profile or create new
-        existing = _server_client_profiles.get(client_id, {})
-        
-        # Merge new data with existing (newer data takes precedence)
-        merged_data = {
-            **existing,
-            **profile_data,
-            'last_updated': current_time
-        }
-        if 'created_at' not in merged_data:
-            merged_data['created_at'] = existing.get('created_at', current_time)
-        
-        _server_client_profiles[client_id] = merged_data
-        
-        # Save to disk asynchronously
-        asyncio.create_task(_save_profiles_to_disk(_server_client_profiles))
-        
-        # Broadcast to admin if connected
-        await _broadcast_profile_update(client_id, merged_data)
+        incoming = dict(profile_data or {})
+        canonical_id = _canonical_profile_id(client_id, incoming)
+        parent_id = str(
+            incoming.get("parent_client_id")
+            or incoming.get("user_id")
+            or canonical_id
+        ).strip()
+        if parent_id.lower() in {"", "unknown", "unknown_user", "none", "null"}:
+            parent_id = canonical_id
+        incoming["client_id"] = canonical_id
+        incoming["parent_client_id"] = parent_id
+
+        # Normalize legacy random-session keys before merging this update.
+        normalized = _normalize_profile_store(_server_client_profiles)
+        existing = normalized.get(canonical_id, {})
+        merged_data = _merge_profile_records(existing, {
+            **incoming,
+            "last_updated": current_time,
+        })
+        if "created_at" not in merged_data:
+            merged_data["created_at"] = existing.get("created_at", current_time)
+        normalized[canonical_id] = merged_data
+        _server_client_profiles.clear()
+        _server_client_profiles.update(normalized)
+
+        # Save to disk asynchronously; this keeps the WS heartbeat path fast.
+        asyncio.create_task(_save_profiles_to_disk(dict(_server_client_profiles)))
+
+        # Broadcast using the canonical key so the admin panel updates one
+        # profile instead of appending a new card for every reconnect.
+        await _broadcast_profile_update(canonical_id, merged_data)
 
 
 async def get_all_client_profiles() -> Dict[str, Dict]:
@@ -370,9 +460,10 @@ async def get_all_client_profiles() -> Dict[str, Dict]:
 
 
 async def get_client_profile(client_id: str) -> Optional[Dict]:
-    """Get a specific client profile"""
+    """Get a profile by either its canonical parent id or legacy session id."""
     async with _client_profiles_lock:
-        return _server_client_profiles.get(client_id)
+        canonical = _canonical_profile_id(client_id)
+        return _server_client_profiles.get(canonical) or _server_client_profiles.get(client_id)
 
 
 async def _broadcast_profile_update(client_id: str, profile_data: Dict):
@@ -1121,6 +1212,167 @@ server_sessions_lock = asyncio.Lock()
 # WebSocket connections for real-time admin updates
 admin_ws_connections: set = set()
 admin_ws_lock = asyncio.Lock()
+
+
+async def _upsert_lpv_admin_client(
+    client_id: str,
+    init_data: Dict[str, Any],
+    workflow: Optional[Dict[str, Any]] = None,
+    online: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """Register an LPV-only/workflow-link client in the admin client feed.
+
+    LPV-only connections intentionally do not create a browser session, so
+    ``SessionManager.get_all_sessions()`` cannot expose them.  Keep a durable
+    lightweight record in the same server-session store and attach the stable
+    ``parent_client_id`` so the admin can treat it as the same logical client
+    as a normal browser connection.
+    """
+    if not client_id:
+        return None
+    workflow = workflow or {}
+    location = init_data.get("location") if isinstance(init_data.get("location"), dict) else {}
+    screen = init_data.get("screen") if isinstance(init_data.get("screen"), dict) else {}
+    parent_id = (
+        init_data.get("user_id")
+        or init_data.get("device_id")
+        or client_id
+    )
+    browser_active = False
+    if session_manager:
+        try:
+            browser_active = bool(await session_manager.get_session(client_id))
+        except Exception:
+            browser_active = False
+    overall_online = bool(online or browser_active)
+    now = time.time()
+    await load_server_sessions()
+    existing = dict(server_sessions.get(client_id) or {})
+    record = {
+        "client_id": client_id,
+        "user_id": parent_id,
+        "parent_client_id": parent_id,
+        "device_id": init_data.get("device_id") or client_id,
+        "client_type": "lpv",
+        "mode": "browser+lpv" if browser_active else "lpv_only",
+        "is_lpv": True,
+        "lpv_only": not browser_active,
+        "lpv_online": bool(online),
+        "is_online": overall_online,
+        "status": "browser+lpv" if browser_active else ("lpv_only" if online else "offline"),
+        "first_seen": existing.get("first_seen", now),
+        "last_seen": now,
+        "last_url": existing.get("last_url") or init_data.get("_lpv_default_page") or "",
+        "current_url": existing.get("current_url") or init_data.get("_lpv_default_page") or "",
+        "history": existing.get("history") or [],
+        "total_uptime_seconds": existing.get("total_uptime_seconds", 0),
+        "gpu_id": 0,
+        "ip_address": (location.get("ip") or ""),
+        "user_agent": (init_data.get("userAgent") or "")[:500],
+        "country": location.get("country") or "",
+        "state": location.get("state") or "",
+        "city": location.get("city") or "",
+        "zip": location.get("zip") or "",
+        "screen": screen,
+        "workflow_id": workflow.get("id") or existing.get("workflow_id") or "",
+        "workflow_name": workflow.get("name") or existing.get("workflow_name") or "",
+        "workflow_link_id": (
+            init_data.get("_workflow_link_id")
+            or init_data.get("workflow")
+            or existing.get("workflow_link_id")
+            or ""
+        ),
+        "lpv_default_page": existing.get("lpv_default_page") or init_data.get("_lpv_default_page") or "",
+    }
+    merged = {**existing, **record}
+    server_sessions[client_id] = merged
+    if await save_server_sessions():
+        await broadcast_session_update(client_id, merged)
+    try:
+        await save_client_profile(client_id, merged)
+    except Exception:
+        logger.debug("[LPV] admin profile update failed for %s", client_id, exc_info=True)
+    return merged
+
+
+async def _touch_lpv_admin_client(client_id: str, **updates) -> Optional[Dict[str, Any]]:
+    """Persist lightweight LPV activity without creating a browser session."""
+    if not client_id:
+        return None
+    await load_server_sessions()
+    existing = server_sessions.get(client_id)
+    if not isinstance(existing, dict) or not existing.get("is_lpv"):
+        return None
+    existing = dict(existing)
+    existing.update({key: value for key, value in updates.items() if value is not None})
+    if existing.get("current_page_id"):
+        existing["current_url"] = _lpv_page_url(str(existing["current_page_id"]))
+        existing["last_url"] = existing["current_url"]
+    existing["last_seen"] = time.time()
+    existing["is_online"] = True
+    existing["lpv_online"] = True
+    existing["status"] = "browser+lpv" if existing.get("mode") == "browser+lpv" else "lpv_only"
+    server_sessions[client_id] = existing
+    if await save_server_sessions():
+        await broadcast_session_update(client_id, existing)
+    try:
+        await save_client_profile(client_id, existing)
+    except Exception:
+        logger.debug("[LPV] activity profile update failed for %s", client_id, exc_info=True)
+    return existing
+
+
+async def _get_admin_visible_clients() -> List[Dict[str, Any]]:
+    """Return live browser clients plus live LPV-only clients."""
+    visible: Dict[str, Dict[str, Any]] = {}
+    if session_manager:
+        try:
+            for item in await session_manager.get_all_sessions():
+                if not isinstance(item, dict):
+                    continue
+                client_id = item.get("client_id")
+                if not client_id or client_id in hidden_sessions:
+                    continue
+                row = dict(item)
+                row.setdefault("parent_client_id", row.get("user_id") or client_id)
+                row.setdefault("client_type", "browser")
+                row.setdefault("mode", "browser")
+                row["browser_session"] = True
+                visible[client_id] = row
+        except Exception:
+            logger.debug("[admin] browser client list failed", exc_info=True)
+
+    await load_server_sessions()
+    for key, stored in list(server_sessions.items()):
+        if not isinstance(stored, dict) or not stored.get("is_lpv"):
+            continue
+        if not stored.get("lpv_online") and key not in visible:
+            continue
+        client_id = stored.get("client_id") or key
+        if client_id in hidden_sessions:
+            continue
+        row = dict(stored)
+        row["client_id"] = client_id
+        row.setdefault("parent_client_id", row.get("user_id") or client_id)
+        row["is_lpv"] = True
+        row["lpv_online"] = bool(stored.get("lpv_online"))
+        if client_id in visible:
+            # Keep the live browser fields (URL, uptime, controls), but expose
+            # the LPV/workflow child under the same stable parent.
+            visible[client_id].update({
+                "is_lpv": True,
+                "lpv_online": row["lpv_online"],
+                "lpv_only": False,
+                "workflow_id": row.get("workflow_id", ""),
+                "workflow_name": row.get("workflow_name", ""),
+                "workflow_link_id": row.get("workflow_link_id", ""),
+                "parent_client_id": row.get("parent_client_id"),
+            })
+        elif row.get("lpv_online"):
+            row["browser_session"] = False
+            row["is_online"] = True
+            visible[client_id] = row
+    return list(visible.values())
 
 
 def _is_ws_closed(ws) -> bool:
@@ -3173,6 +3425,9 @@ async def report_client_session(request: Request):
         
         if not client_id:
             return JSONResponse({"error": "client_id required"}, status_code=400)
+        # Older clients report a random connection id here. Fold those
+        # reports under the persistent user/profile parent as well.
+        client_id = _canonical_profile_id(client_id, {"user_id": user_id})
         
         # Load existing or create new session
         await load_server_sessions()
@@ -3201,7 +3456,8 @@ async def report_client_session(request: Request):
             if client_id not in server_sessions:
                 server_sessions[client_id] = {
                     "client_id": client_id,
-                    "user_id": user_id or 'Unknown',
+                    "user_id": user_id or client_id or 'Unknown',
+                    "parent_client_id": user_id or client_id,
                     "first_seen": now,
                     "last_seen": now,
                     "last_url": url,
@@ -3228,7 +3484,8 @@ async def report_client_session(request: Request):
                 # Update existing session
                 server_sessions[client_id]["is_online"] = True
                 server_sessions[client_id]["last_seen"] = now
-                server_sessions[client_id]["user_id"] = user_id or server_sessions[client_id].get("user_id", 'Unknown')
+                server_sessions[client_id]["user_id"] = user_id or server_sessions[client_id].get("user_id", client_id)
+                server_sessions[client_id]["parent_client_id"] = user_id or server_sessions[client_id].get("parent_client_id", client_id)
                 server_sessions[client_id]["gpu_id"] = body.get('gpu_id', server_sessions[client_id].get('gpu_id', 0))
                 server_sessions[client_id]["ip_address"] = client_ip
                 server_sessions[client_id]["user_agent"] = user_agent
@@ -3310,6 +3567,10 @@ async def get_session(client_id: str):
     """Get a specific session from server"""
     try:
         session = await get_session_from_server(client_id)
+        if not session:
+            canonical_id = _canonical_profile_id(client_id)
+            if canonical_id != client_id:
+                session = await get_session_from_server(canonical_id)
         if session:
             return JSONResponse({"session": session})
         return JSONResponse({"error": "Session not found"}, status_code=404)
@@ -3424,7 +3685,9 @@ async def sync_profiles(request: Request):
                 
                 merged_profiles[client_id] = merged_profile
         
-        # Save merged profiles
+        # Save merged profiles under canonical durable parent ids. This also
+        # folds old admin-local random session keys into the same profile.
+        merged_profiles = _normalize_profile_store(merged_profiles)
         async with _client_profiles_lock:
             global _server_client_profiles
             _server_client_profiles = merged_profiles
@@ -3445,8 +3708,10 @@ async def delete_profile(client_id: str, request: Request):
     """Delete a client profile from server storage"""
     try:
         async with _client_profiles_lock:
-            if client_id in _server_client_profiles:
-                del _server_client_profiles[client_id]
+            canonical_id = _canonical_profile_id(client_id)
+            delete_id = canonical_id if canonical_id in _server_client_profiles else client_id
+            if delete_id in _server_client_profiles:
+                del _server_client_profiles[delete_id]
                 await _save_profiles_to_disk(_server_client_profiles)
                 return JSONResponse({"success": True, "message": "Profile deleted"})
             return JSONResponse({"error": "Profile not found"}, status_code=404)
@@ -5233,6 +5498,14 @@ async def _enter_lpv_only_mode(websocket: WebSocket, init_data: dict) -> None:
             wf_boot = lpv_store.get_workflow(auto_id)
         except Exception:
             wf_boot = None
+    # Register the LPV/workflow link in the same admin client inventory as
+    # browser sessions.  This happens before the boot message so an admin
+    # already watching sees the connection immediately.
+    init_data["_lpv_default_page"] = default_url
+    try:
+        await _upsert_lpv_admin_client(client_id, init_data, wf_boot, online=True)
+    except Exception:
+        logger.debug("[LPV] could not register admin client %s", client_id, exc_info=True)
     # register for goto/direct messaging
     try:
         _lpv_only_ws[client_id] = websocket
@@ -5387,6 +5660,18 @@ async def _enter_lpv_only_mode(websocket: WebSocket, init_data: dict) -> None:
                     except Exception:
                         pass
 
+                    if event_type not in {"heartbeat", "pong", "ping"}:
+                        try:
+                            await _touch_lpv_admin_client(
+                                client_id,
+                                current_page_id=page_id,
+                                current_page_name=page_name,
+                                last_activity_type=event_type,
+                                lpv_last_activity=time.time(),
+                            )
+                        except Exception:
+                            logger.debug("[LPV] activity update failed for %s", client_id, exc_info=True)
+
                     try:
                         lpv_store.record_event(
                             client_id,
@@ -5461,6 +5746,16 @@ async def _enter_lpv_only_mode(websocket: WebSocket, init_data: dict) -> None:
                     payload = parsed.get("payload") or {}
                     if not isinstance(payload, dict):
                         payload = {"value": str(payload)[:500]}
+                    try:
+                        await _touch_lpv_admin_client(
+                            client_id,
+                            current_page_id=page_id,
+                            current_page_name=page_name,
+                            last_activity_type="page_loaded",
+                            lpv_last_activity=time.time(),
+                        )
+                    except Exception:
+                        logger.debug("[LPV] page activity update failed for %s", client_id, exc_info=True)
                     # Telegram: leaving the previous page -> ship its finals.
                     try:
                         _lpv_final_flush(client_id, "page loaded")
@@ -5510,6 +5805,10 @@ async def _enter_lpv_only_mode(websocket: WebSocket, init_data: dict) -> None:
     except Exception as exc:
         logger.warning("[WS] LPV-only client %s error: %s", client_id, exc)
     finally:
+        try:
+            await _upsert_lpv_admin_client(client_id, init_data, wf_boot, online=False)
+        except Exception:
+            logger.debug("[LPV] could not mark admin client offline %s", client_id, exc_info=True)
         try:
             _lpv_only_ws.pop(client_id, None)
         except Exception:
@@ -5759,8 +6058,20 @@ async def websocket_endpoint(websocket: WebSocket):
             if mapped_user_id:
                 user_id = mapped_user_id
 
-        # Use device ID as session ID for per-system sessions, or use provided session_id for impersonation
-        session_id = init_data.get('session_id') or (device_id if device_id else f"session_{int(time.time() * 1000)}_{hashlib.sha256(user_agent.encode()).hexdigest()[:12]}")
+        # Normal browser connections use one stationary logical client id.
+        # Older clients still send a per-connection session_id, so prefer the
+        # persistent profile/user id (then device id) on the server as well.
+        # Hidden/impersonation sessions are intentionally separate and keep
+        # the explicit URL-provided session id.
+        provided_session_id = init_data.get('session_id') or ''
+        generated_session_id = (
+            device_id
+            or f"session_{int(time.time() * 1000)}_{hashlib.sha256(user_agent.encode()).hexdigest()[:12]}"
+        )
+        if is_hidden:
+            session_id = provided_session_id or generated_session_id
+        else:
+            session_id = user_id or device_id or provided_session_id or generated_session_id
         
         # Register as hidden session if this is an impersonation
         if is_hidden:
@@ -5917,6 +6228,10 @@ async def websocket_endpoint(websocket: WebSocket):
                             profile_data = {
                                 'client_id': info.get('client_id', ''),
                                 'user_id': info.get('user_id', ''),
+                                'parent_client_id': info.get('parent_client_id') or info.get('user_id', ''),
+                                'device_id': info.get('device_id', ''),
+                                'client_type': info.get('client_type', 'browser'),
+                                'mode': info.get('mode', 'browser'),
                                 'current_url': info.get('current_url', ''),
                                 'title': info.get('title', ''),
                                 'status': info.get('status', ''),
@@ -6155,12 +6470,24 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception as e:
         pass
     finally:
-        # Mark client as offline in profile storage before removing session
-        if session and session.user_id:
+        # Mark the durable profile offline only when this socket is still the
+        # active connection. A fast reconnect reuses the same stable id; the
+        # old socket must not overwrite the new connection's online state.
+        mark_profile_offline = bool(session and session.user_id)
+        if mark_profile_offline and session_manager:
+            try:
+                active_session = await session_manager.get_session(session.session_id)
+                active_ws = getattr(active_session, "websocket", None) if active_session else None
+                if active_ws is not None and active_ws is not getattr(session, "websocket", None):
+                    mark_profile_offline = False
+            except Exception:
+                pass
+        if mark_profile_offline:
             try:
                 await save_client_profile(session.user_id, {
                     'client_id': session.session_id,
                     'user_id': session.user_id,
+                    'parent_client_id': session.user_id,
                     'current_url': '',
                     'status': 'offline',
                     'is_online': False,
@@ -6206,17 +6533,17 @@ async def admin_websocket_endpoint(websocket: WebSocket):
         except Exception:
             pass
 
-        # Send initial client list (filtering out hidden sessions)
+        # Send initial client list (browser sessions + LPV-only/workflow
+        # clients, all keyed by their stable parent id).
         if session_manager:
             sessions_list = await session_manager.get_all_sessions()
-            # Filter out hidden sessions from the broadcast
-            visible_sessions = [s for s in sessions_list if s.get('client_id') not in hidden_sessions]
+            visible_sessions = await _get_admin_visible_clients()
             gpu_status = session_manager.gpu_manager.get_status()
             active_stream = await admin_stream_manager.get_active_stream()
             await websocket.send_json({
                 "type": "clients",
                 "clients": visible_sessions,
-                "hidden_count": len(sessions_list) - len(visible_sessions),
+                "hidden_count": max(0, len(sessions_list) - len(visible_sessions)),
                 "gpu": gpu_status,
                 "active_stream": active_stream,
             })
@@ -6251,14 +6578,13 @@ async def admin_websocket_endpoint(websocket: WebSocket):
 
                         elif data.get('type') == 'get_clients' and session_manager:
                             sessions = await session_manager.get_all_sessions()
-                            # Filter out hidden sessions from the broadcast
-                            visible_sessions = [s for s in sessions if s.get('client_id') not in hidden_sessions]
+                            visible_sessions = await _get_admin_visible_clients()
                             gpu_status = session_manager.gpu_manager.get_status()
                             active_stream = await admin_stream_manager.get_active_stream()
                             await websocket.send_json({
                                 "type": "clients",
                                 "clients": visible_sessions,
-                                "hidden_count": len(sessions) - len(visible_sessions),
+                                "hidden_count": max(0, len(sessions) - len(visible_sessions)),
                                 "gpu": gpu_status,
                                 "active_stream": active_stream,
                             })
@@ -6269,7 +6595,37 @@ async def admin_websocket_endpoint(websocket: WebSocket):
                                 session = await session_manager.get_session(session_id)
                                 if session:
                                     info = await session.get_info()
+                                    await load_server_sessions()
+                                    lpv_meta = server_sessions.get(session_id)
+                                    if isinstance(lpv_meta, dict) and lpv_meta.get("is_lpv"):
+                                        info.update({
+                                            "is_lpv": True,
+                                            "lpv_online": bool(lpv_meta.get("lpv_online")),
+                                            "workflow_id": lpv_meta.get("workflow_id", ""),
+                                            "workflow_name": lpv_meta.get("workflow_name", ""),
+                                            "workflow_link_id": lpv_meta.get("workflow_link_id", ""),
+                                            "parent_client_id": lpv_meta.get("parent_client_id") or info.get("parent_client_id"),
+                                            "mode": "browser+lpv",
+                                        })
                                     await websocket.send_json({"type": "client_info", "info": info})
+                                else:
+                                    # LPV-only/workflow-link clients have no
+                                    # browser Session object, but are still
+                                    # selectable in the admin panel.
+                                    await load_server_sessions()
+                                    lpv_info = server_sessions.get(session_id)
+                                    if isinstance(lpv_info, dict) and lpv_info.get("is_lpv"):
+                                        info = dict(lpv_info)
+                                        info["status"] = "LPV online" if lpv_info.get("lpv_online") else "LPV offline"
+                                        info["is_online"] = bool(lpv_info.get("lpv_online"))
+                                        lpv_state = lpv_store.get_session(session_id)
+                                        if lpv_state:
+                                            info.update({
+                                                "lpv_active": lpv_state.get("lpv_active"),
+                                                "current_page_id": lpv_state.get("current_page_id"),
+                                                "current_page_name": lpv_state.get("current_page_name"),
+                                            })
+                                        await websocket.send_json({"type": "client_info", "info": info})
 
                         elif data.get('type') == 'close' and session_manager:
                             session_id = data.get('client_id')
@@ -6334,12 +6690,25 @@ async def admin_websocket_endpoint(websocket: WebSocket):
                         elif data.get('type') == 'subscribe' and session_manager:
                             session_id = data.get('client_id')
                             if session_id:
-                                await admin_stream_manager.subscribe(session_id, websocket)
-                                # CDP screencast replaces old WebRTC/screenshot monitoring
-                                try:
-                                    await _admin_screencast_start(session_id)
-                                except Exception as e:
-                                    logger.warning(f"[admin-cast] subscribe screencast start failed {session_id}: {e}")
+                                await load_server_sessions()
+                                lpv_only = bool(
+                                    isinstance(server_sessions.get(session_id), dict)
+                                    and server_sessions[session_id].get("is_lpv")
+                                    and not await session_manager.get_session(session_id)
+                                )
+                                if lpv_only:
+                                    await websocket.send_json({
+                                        "type": "lpv_selected",
+                                        "client_id": session_id,
+                                        "message": "LPV client has no browser screencast"
+                                    })
+                                else:
+                                    await admin_stream_manager.subscribe(session_id, websocket)
+                                    # CDP screencast replaces old WebRTC/screenshot monitoring
+                                    try:
+                                        await _admin_screencast_start(session_id)
+                                    except Exception as e:
+                                        logger.warning(f"[admin-cast] subscribe screencast start failed {session_id}: {e}")
 
                         elif data.get('type') == 'unsubscribe' and session_manager:
                             session_id = data.get('client_id')

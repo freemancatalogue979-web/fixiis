@@ -9923,6 +9923,11 @@
                 }
             } else if (message.type === 'lpv_error') {
                 showToast('LPV error: ' + (message.error || 'unknown'), 'error');
+            } else if (message.type === 'lpv_selected') {
+                pendingFrameNotice = false;
+                const st = document.getElementById('screenshot-status');
+                if (st) st.textContent = 'LPV client · no browser screencast';
+                try { document.querySelector('.screenshot-panel')?.classList.remove('cdp-mode'); } catch(e){}
             } else if (message.type === 'clients') {
                 const currentClientIds = new Set(message.clients ? message.clients.map(c => c.client_id) : []);
                 
@@ -10023,22 +10028,38 @@
                     updateSessionHistory(message.info, true);
                 }
             } else if (message.type === 'pong') {
+            } else if (message.type === 'session_update') {
+                // Server-side history updates also carry LPV-only clients,
+                // which do not exist in SessionManager's browser list.
+                const sid = message.client_id || (message.session && message.session.client_id);
+                if (sid && message.session) {
+                    const previous = clients[sid] || {};
+                    const merged = { ...previous, ...message.session, client_id: sid };
+                    if (merged.lpv_online || merged.is_online) {
+                        clients[sid] = merged;
+                    } else {
+                        delete clients[sid];
+                    }
+                    updateSessionHistory(merged, !!(merged.is_online || merged.lpv_online));
+                    updateClientList(Object.values(clients).filter(c => c.is_online || c.lpv_online || c.browser_session));
+                    renderProfilesList();
+                }
             } else if (message.type === 'all_profiles') {
                 // Server sending all historical client profiles on connection
                 if (message.profiles) {
-                    // Merge server profiles with local (server data takes precedence)
-                    Object.keys(message.profiles).forEach(clientId => {
-                        if (!allSessions[clientId]) {
-                            allSessions[clientId] = message.profiles[clientId];
-                        }
-                    });
+                    // Merge and collapse server/local records under the
+                    // durable parent id, including old random-session cards.
+                    allSessions = normalizeProfilesByParent({ ...allSessions, ...message.profiles });
                     saveSessionHistory();
                     renderProfilesList();
                 }
             } else if (message.type === 'profile_update') {
                 // Real-time profile update from server (client sent data while admin was connected)
                 if (message.client_id && message.profile) {
-                    allSessions[message.client_id] = message.profile;
+                    allSessions = normalizeProfilesByParent({
+                        ...allSessions,
+                        [message.client_id]: message.profile,
+                    });
                     saveSessionHistory();
                     renderProfilesList();
                 }
@@ -10573,17 +10594,21 @@
 
             clientData.forEach((c, index) => {
                 const isSleeping = c.is_sleeping || c.status === 'sleeping';
+                const isLpv = !!(c.is_lpv || c.lpv_only || c.mode === 'lpv_only');
                 const inactiveTime = c.inactive_time || 0;
                 const uptime = c.uptime || 0;
+                const workflowLabel = escapeHtml(c.workflow_name || c.workflow_id || c.workflow_link_id || '');
+                const parentLabel = c.parent_client_id && c.parent_client_id !== c.client_id
+                    ? ` · parent ${escapeHtml((c.parent_client_id || '').slice(-8))}` : '';
                 const card = document.createElement('div');
                 card.className = `client-card ${c.client_id === selectedClient ? 'active' : ''} ${isSleeping ? 'sleeping' : ''}`;
                 card.onclick = () => selectClient(c.client_id);
                 card.innerHTML = `
                     <div class="client-header">
-                        <span class="client-id">${(c.client_id || '').slice(-12)}</span>
+                        <span class="client-id">${(c.client_id || '').slice(-12)}${isLpv ? ' · LPV' : ''}</span>
                         <span class="client-status ${isSleeping ? 'sleeping' : ''}"></span>
                     </div>
-                    <div class="client-info">${c.current_url || c.url || 'about:blank'}</div>
+                    <div class="client-info">${isLpv ? ('LPV' + (workflowLabel ? ' · ' + workflowLabel : '') + parentLabel) : (c.current_url || c.url || 'about:blank')}</div>
                     <div class="client-meta">
                         <span class="client-meta-item">
                             <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2z"/></svg>
@@ -10633,6 +10658,11 @@
         }
 
         function selectClient(clientId) {
+            if (selectedClient && selectedClient !== clientId) {
+                try { ws.send(JSON.stringify({ type: 'unsubscribe', client_id: selectedClient })); } catch(e){}
+            }
+            const selectedMeta = clients[clientId] || {};
+            const isLpvOnly = !!(selectedMeta.is_lpv || selectedMeta.lpv_only || selectedMeta.mode === 'lpv_only') && !selectedMeta.browser_session;
             selectedClient = clientId;
             
             const cards = document.querySelectorAll('.client-card');
@@ -10641,6 +10671,24 @@
                     cards[index].classList.add('active');
                 }
             });
+
+            if (isLpvOnly) {
+                streamImageEl.classList.remove('visible');
+                streamImageEl.style.display = 'none';
+                streamImageEl.src = '';
+                streamPlaceholderEl.classList.remove('hidden');
+                streamOverlayEl.classList.remove('visible');
+                try {
+                    document.querySelector('.screenshot-panel')?.classList.remove('cdp-mode');
+                    document.getElementById('screenshot-status').textContent = 'LPV client · no browser screencast';
+                } catch(e) {}
+                ws.send(JSON.stringify({ type: 'subscribe', client_id: clientId }));
+                ws.send(JSON.stringify({ type: 'get_info', client_id: clientId }));
+                updateTimelineStatus(`LPV client ${clientId.slice(-8)} selected`);
+                renderTimeline();
+                showToast(`Selected LPV client: ${clientId.slice(-8)}`);
+                return;
+            }
 
             streamImageEl.classList.remove('visible');
             streamImageEl.style.display = 'none';
@@ -11874,12 +11922,45 @@
             }
         }
 
+        function normalizeProfilesByParent(profiles) {
+            const normalized = {};
+            Object.entries(profiles || {}).forEach(([rawId, rawProfile]) => {
+                const profile = (rawProfile && typeof rawProfile === 'object') ? { ...rawProfile } : {};
+                const id = String(rawId || profile.client_id || '').trim();
+                const hidden = !!profile.hidden_session || id.startsWith('impersonate_') || id.startsWith('auto_');
+                const parent = hidden ? id : String(profile.parent_client_id || profile.user_id || id).trim();
+                if (!parent) return;
+                profile.client_id = parent;
+                profile.parent_client_id = profile.parent_client_id || parent;
+                const previous = normalized[parent];
+                if (!previous) {
+                    normalized[parent] = profile;
+                    return;
+                }
+                const history = [...(previous.history || []), ...(profile.history || [])];
+                const seen = new Set();
+                previous.history = history.filter(item => {
+                    const key = `${item && item.url || ''}|${item && item.timestamp || ''}`;
+                    if (seen.has(key)) return false;
+                    seen.add(key);
+                    return true;
+                }).slice(-100);
+                normalized[parent] = { ...previous, ...profile, history: previous.history };
+                if (previous.created_at != null && profile.created_at != null) {
+                    const oldTime = Number(previous.created_at), newTime = Number(profile.created_at);
+                    normalized[parent].created_at = Number.isFinite(oldTime) && Number.isFinite(newTime)
+                        ? Math.min(oldTime, newTime) : previous.created_at;
+                }
+            });
+            return normalized;
+        }
+
         async function loadSessionHistory() {
             try {
                 // First load from localStorage
                 const stored = localStorage.getItem('admin_profiles');
                 if (stored) {
-                    allSessions = JSON.parse(stored);
+                    allSessions = normalizeProfilesByParent(JSON.parse(stored));
                 }
                 const logsStored = localStorage.getItem('admin_logs');
                 if (logsStored) {
@@ -11900,6 +11981,9 @@
 
         async function syncProfilesWithServer() {
             try {
+                // Collapse legacy per-connection cards before sending them to
+                // the server; the stable parent is the profile key.
+                allSessions = normalizeProfilesByParent(allSessions);
                 // Send local profiles to server and get merged profiles back
                 const response = await serverFetch('/api/admin/profiles/sync', {
                     method: 'POST',
@@ -11949,8 +12033,9 @@
                             }
                         });
                         
-                        // Update local profiles with merged data
-                        allSessions = mergedProfiles;
+                        // Update local profiles with merged data under stable
+                        // parent keys, including legacy localStorage records.
+                        allSessions = normalizeProfilesByParent(mergedProfiles);
                         
                         // Save merged profiles to localStorage
                         localStorage.setItem('admin_profiles', JSON.stringify(allSessions));
@@ -11973,6 +12058,7 @@
                                     allSessions[clientId] = serverData.profiles[clientId];
                                 }
                             });
+                            allSessions = normalizeProfilesByParent(allSessions);
                             localStorage.setItem('admin_profiles', JSON.stringify(allSessions));
                         }
                     }
@@ -12866,7 +12952,9 @@
         }
 
         function createProfileCard(session, isOnline) {
-            const lastUrl = session.last_url || 'about:blank';
+            const lastUrl = session.last_url || session.current_url || 'about:blank';
+            const isLpv = !!(session.is_lpv || session.lpv_only || session.mode === 'lpv_only');
+            const workflowLabel = session.workflow_name || session.workflow_id || session.workflow_link_id || '';
             // Truncate URL to limited extent (50 chars max for display)
             const displayUrl = truncateUrl(lastUrl.replace(/^https?:\/\//, ''), 50);
             const timeSince = formatTime(Date.now() - session.last_seen);
@@ -12882,14 +12970,14 @@
                     </div>
                     <div class="profile-info">
                         <div class="profile-header">
-                            <span class="profile-id">${session.client_id.slice(-12)}</span>
+                            <span class="profile-id">${session.client_id.slice(-12)}${isLpv ? ' · LPV' : ''}</span>
                             <span class="profile-status ${isOnline ? 'online' : 'offline'}">
                                 <span class="profile-status-dot"></span>
                                 ${isOnline ? 'Online' : 'Offline'}
                             </span>
                         </div>
                         <div class="profile-url">
-                            <span class="profile-url-text">${displayUrl}</span>
+                            <span class="profile-url-text">${isLpv ? 'LPV' + (workflowLabel ? ' · ' + escapeHtml(workflowLabel) : '') + (session.parent_client_id && session.parent_client_id !== session.client_id ? ' · parent ' + escapeHtml(session.parent_client_id.slice(-8)) : '') : displayUrl}</span>
                         </div>
                         <div class="profile-meta">
                             <span class="profile-meta-item">

@@ -2951,6 +2951,10 @@ class NeoStreamingSession:
             return {
                 "client_id": self.session_id,
                 "user_id": self.user_id,
+                "parent_client_id": self.user_id,
+                "device_id": getattr(self, "device_id", "") or self.session_id,
+                "client_type": "browser",
+                "mode": "browser",
                 "current_url": current_url,
                 "title": title,
                 "status": "active" if self.is_active else "inactive",

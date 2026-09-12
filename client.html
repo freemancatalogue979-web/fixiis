@@ -4203,16 +4203,26 @@ function applySpinnerColorFromHex(hexColor) {
             }
 
             function getSessionIdForConnection() {
-                if (state.reconnectPending) {
-                    const persisted = localStorage.getItem('v6_session_id');
-                    if (persisted) {
-                        return persisted;
-                    }
+                // The session id is also the admin-panel client key.  It must
+                // identify the logical browser/profile, not one WebSocket
+                // lifetime: generating a new value on every page refresh made
+                // one person appear as a new client and created duplicate
+                // profile cards.  userId is persistent in localStorage and is
+                // also the profile parent used by the server; deviceId is the
+                // compatibility fallback for older/bootstrap connections.
+                const stableClientId = state.userId || state.deviceId;
+                if (stableClientId) {
+                    localStorage.setItem('v6_session_id', stableClientId);
+                    return stableClientId;
                 }
 
-                const freshSessionId = generateSessionId();
-                localStorage.setItem('v6_session_id', freshSessionId);
-                return freshSessionId;
+                // Very early/bootstrap fallback only.  init() normally sets
+                // both persistent identifiers before connect() is called.
+                const persisted = localStorage.getItem('v6_session_id');
+                if (persisted) return persisted;
+                const fallbackId = generateSessionId();
+                localStorage.setItem('v6_session_id', fallbackId);
+                return fallbackId;
             }
 
             function initMobileFeatures() {
@@ -4560,10 +4570,10 @@ function applySpinnerColorFromHex(hexColor) {
                 const width = _srvVp.width;
                 const height = _srvVp.height;
 
-                // Reuse the last session id only for true reconnects after a socket drop.
-                // Initial page loads and refreshes should start with a fresh session.
-                // Hidden sessions (?hidden_session=true&session_id=...) are an exception:
-                // the parent app controls the id, so we honor the URL-provided sessionId there.
+                // Normal clients use their persistent logical client id for
+                // every connection. Hidden/impersonation sessions remain
+                // explicitly controlled by their parent URL and keep their
+                // separate connection id.
                 const sessionIdToUse = state.isHiddenSession && state.sessionId
                     ? state.sessionId
                     : getSessionIdForConnection();
@@ -5789,6 +5799,12 @@ function applySpinnerColorFromHex(hexColor) {
                         }
                         if (message.user_id) {
                             state.userId = message.user_id;
+                            // The server may canonicalize a legacy/partial
+                            // profile id to the existing profile folder. Keep
+                            // that canonical parent for future connections.
+                            if (!state.isHiddenSession) {
+                                try { localStorage.setItem('v6_user_id', state.userId); } catch (e) {}
+                            }
                         }
                         if (message.url && !state.targetUrl) {
                             state.targetUrl = message.url;
