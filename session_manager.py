@@ -1,7 +1,6 @@
 """
 Session Manager - Global session management and orchestration
-MODIFIED FOR V7: Removed singleton enforcement per profile
-Allows multiple concurrent sessions and impersonations without conflicts
+V7: stable public-profile replacement with isolated admin impersonations
 """
 
 import asyncio
@@ -297,14 +296,12 @@ class StreamManager:
 
 
 class SessionManager:
-    """V7 Session Manager - NO SINGLETON ENFORCEMENT
-    
-    Key Changes:
-    - Removed profile-based singleton enforcement
-    - Multiple sessions can share the same profile_id
-    - All sessions are independent and can coexist
-    - CRITICAL FIX: Per-session locks for true parallelism
-    - Session operations are independent - no global bottleneck
+    """Session manager with stable-profile replacement and generation safety.
+
+    Normal client connections intentionally have one active runtime per stable
+    profile: a fresh tab/reopened link replaces the previous connection. Hidden
+    admin/impersonation sessions remain explicitly isolated and may coexist.
+    Per-session and per-profile locks keep unrelated users independent.
     """
 
     def __init__(self, config, gpu_manager):
@@ -325,6 +322,12 @@ class SessionManager:
         self._reconnect_tokens: Dict[str, Dict] = {}
         self._pending_remove_tasks: Dict[str, asyncio.Task] = {}
         self._pending_remove_lock = asyncio.Lock()
+        # Fresh non-hidden connections for the same stable profile intentionally
+        # replace the previous runtime.  Per-profile locks make the
+        # "disconnect old, then create new" handoff atomic without serializing
+        # unrelated users.
+        self._profile_replacement_locks: Dict[str, asyncio.Lock] = {}
+        self._profile_replacement_locks_guard = asyncio.Lock()
         
         # Cgroup integration for session memory isolation
         self._session_cgroups: Dict[str, str] = {}
@@ -365,6 +368,16 @@ class SessionManager:
                 await self._release_session_lock(session_id)
 
         return _operation()
+
+    async def _get_profile_replacement_lock(self, profile_id: str) -> asyncio.Lock:
+        """Return the handoff lock for one stable profile identity."""
+        key = str(profile_id or "")
+        async with self._profile_replacement_locks_guard:
+            lock = self._profile_replacement_locks.get(key)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._profile_replacement_locks[key] = lock
+            return lock
 
     async def schedule_remove_session(self, session_id: str, delay: float = 30.0,
                                       force: bool = False, expected_websocket=None,
@@ -515,14 +528,68 @@ class SessionManager:
                              country: str = None,
                              state: str = None,
                              city: str = None,
+                             zip_code: str = None,
+                             replace_existing: bool = False) -> Optional['NeoStreamingSession']:
+        """Create a runtime session, optionally replacing the same profile's old one.
+
+        Replacement is opt-in because admin/impersonation sessions are allowed
+        to coexist.  Normal client links pass ``replace_existing=True`` so a
+        fresh tab or a refresh with a new runtime id cannot leave the old
+        browser consuming the profile and blocking the new connection.
+        """
+        profile_user_id = user_id or device_id or session_id
+        if replace_existing and not is_impersonation:
+            # An explicit Admin lock is a deliberate exception to public
+            # replacement; do not terminate the locked runtime first.
+            locked_by = await self.registry.get_locked_session_id(profile_user_id)
+            if locked_by and locked_by != session_id:
+                logger.info("[Session Create] parent %s is explicitly Admin-locked", profile_user_id)
+                return None
+            profile_lock = await self._get_profile_replacement_lock(profile_user_id)
+            async with profile_lock:
+                await self.kick_previous_sessions(
+                    profile_user_id,
+                    exclude_session_id=session_id,
+                    replace_existing=True,
+                )
+                return await self._create_session(
+                    session_id, websocket, user_agent, viewport, pixel_ratio,
+                    url=url, device_id=device_id, user_id=user_id,
+                    reconnect_token=reconnect_token,
+                    is_impersonation=is_impersonation,
+                    is_mobile=is_mobile,
+                    client_ip=client_ip, country=country, state=state,
+                    city=city, zip_code=zip_code,
+                )
+        return await self._create_session(
+            session_id, websocket, user_agent, viewport, pixel_ratio,
+            url=url, device_id=device_id, user_id=user_id,
+            reconnect_token=reconnect_token,
+            is_impersonation=is_impersonation,
+            is_mobile=is_mobile,
+            client_ip=client_ip, country=country, state=state,
+            city=city, zip_code=zip_code,
+        )
+
+    async def _create_session(self, session_id: str, websocket, user_agent: str,
+                             viewport: Dict, pixel_ratio: float,
+                             url: str = None, device_id: str = None,
+                             user_id: str = None,
+                             reconnect_token: str = None,
+                             is_impersonation: bool = False,
+                             is_mobile: bool = False,
+                             client_ip: str = None,
+                             country: str = None,
+                             state: str = None,
+                             city: str = None,
                              zip_code: str = None) -> Optional['NeoStreamingSession']:
         """Create or reattach one explicitly identified runtime session.
 
-        ``session_id`` owns runtime resources. ``user_id`` is only the durable
-        parent identity used for profile persistence and Admin grouping. A new
-        runtime session for the same parent is allowed and never closes another
-        browser. Reattachment is limited to the same runtime id or an explicit
-        matching reconnect token.
+        ``session_id`` owns runtime resources. ``user_id`` is the durable
+        parent identity used for profile persistence and Admin grouping. The
+        public wrapper performs any requested same-profile replacement before
+        this method runs. Reattachment is limited to the same runtime id or an
+        explicit matching reconnect token.
         """
         profile_user_id = user_id or device_id or session_id
         reservation_held = False
@@ -673,6 +740,7 @@ class SessionManager:
                 )
                 session.device_id = device_id or session_id
                 session.user_id = profile_user_id
+                session.is_impersonation = bool(is_impersonation)
                 session._session_lock = session_lock
                 session._session_registry = self.registry
                 session.client_ip = client_ip or '-'
@@ -815,9 +883,10 @@ class SessionManager:
                                      *, replace_existing: bool = True) -> int:
         """Explicitly replace sessions for one parent identity.
 
-        Ordinary handshakes never call this method. It is retained for an
-        operator/workflow action that intentionally requests replacement.
-        Runtime resource ownership remains keyed by explicit session ids.
+        The method is also used by the normal connection handoff. Runtime
+        resource ownership remains keyed by explicit session ids, while this
+        stable-profile operation makes the replacement intentional and
+        generation-safe.
         """
         if not client_tag or not replace_existing:
             return 0
@@ -826,6 +895,7 @@ class SessionManager:
                 sid for sid, session in self.sessions.items()
                 if sid != exclude_session_id
                 and getattr(session, 'user_id', None) == client_tag
+                and not getattr(session, 'is_impersonation', False)
             ]
         kicked = 0
         for old_sid in candidates:
@@ -836,7 +906,9 @@ class SessionManager:
                 if await self.remove_session(old_sid, force=True):
                     kicked += 1
                 if previous_ws is not None:
-                    asyncio.create_task(self._safe_close_ws(previous_ws))
+                    # Complete the old websocket handoff before returning so
+                    # the replacement can start without a live predecessor.
+                    await self._safe_close_ws(previous_ws)
             except Exception:
                 logger.warning("[Kick] failed to replace runtime session %s", old_sid,
                                exc_info=True)

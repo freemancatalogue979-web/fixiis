@@ -349,14 +349,16 @@ function parseRgbColor(color) {
     if (!color) return null;
     if (typeof color === 'string') {
         const trimmed = color.trim();
-        if (/^#([0-9a-f]{3}){1,2}$/i.test(trimmed)) {
-            const hex = trimmed.substring(1);
-            if (hex.length === 3) {
-                return {
-                    r: parseInt(hex[0] + hex[0], 16),
-                    g: parseInt(hex[1] + hex[1], 16),
-                    b: parseInt(hex[2] + hex[2], 16)
-                };
+        const hexMatch = trimmed.match(/^#([0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i);
+        if (hexMatch) {
+            // The admin stores opaque hex colours.  Accept CSS shorthand and
+            // alpha forms too, ignoring alpha because the spinner needs a
+            // solid accent colour.
+            let hex = hexMatch[1];
+            if (hex.length === 3 || hex.length === 4) {
+                hex = hex.slice(0, 3).split('').map(ch => ch + ch).join('');
+            } else if (hex.length === 8) {
+                hex = hex.slice(0, 6);
             }
             return {
                 r: parseInt(hex.substring(0, 2), 16),
@@ -367,9 +369,9 @@ function parseRgbColor(color) {
         const rgba = trimmed.match(/^rgba?\((\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
         if (rgba) {
             return {
-                r: Number(rgba[1]),
-                g: Number(rgba[2]),
-                b: Number(rgba[3])
+                r: Math.max(0, Math.min(255, Number(rgba[1]))),
+                g: Math.max(0, Math.min(255, Number(rgba[2]))),
+                b: Math.max(0, Math.min(255, Number(rgba[3])))
             };
         }
     }
@@ -413,6 +415,11 @@ function applySpinnerColor(colorOrR, g, b) {
         const lpvRoot = document.getElementById('lpv-root');
         if (lpvRoot) lpvRoot.style.setProperty('--lpv-brand', cssVar);
         document.documentElement.style.setProperty('--lpv-brand', cssVar);
+        const lpvDot = document.getElementById('lpv-dot');
+        if (lpvDot) {
+            lpvDot.style.background = cssVar;
+            lpvDot.style.boxShadow = `0 0 0 2px rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.18), 0 0 10px rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.6)`;
+        }
     } catch (e) { /* ignore */ }
 }
 
@@ -3871,34 +3878,85 @@ function hideTransitionOverlay() {
             // workflow editor: a custom logo (URL) + spinner color. Stored so
             // every loader re-show (reconnects, LPV start) re-applies it, and
             // the LPV overlay ring/dot inherit the color via --lpv-brand too.
-            let lpvBootBranding = { logoUrl: '', color: '' };
+            let lpvBootBranding = { logoUrl: '', color: '', workflowName: '' };
 
-            function applyWorkflowBranding(logoUrl, color) {
-                if (logoUrl) lpvBootBranding.logoUrl = logoUrl;
-                if (color) lpvBootBranding.color = color;
-                const b = lpvBootBranding;
-                if (b.color) {
-                    try { currentBrandColor = b.color; } catch (e) {}
-                    try { document.documentElement.style.setProperty('--lpv-brand', b.color); } catch (e) {}
-                    try { if (window.LPV && LPV.overlay) LPV.overlay.style.setProperty('--lpv-brand', b.color); } catch (e) {}
-                    try { applySpinnerColorFromHex(b.color); } catch (e) {}
+            function applyWorkflowBranding(logoUrl, color, workflowName) {
+                // Explicit values replace the current workflow overrides;
+                // omitted values are retained when the loader is re-shown.
+                if (typeof logoUrl === 'string') lpvBootBranding.logoUrl = logoUrl.trim();
+                if (typeof color === 'string') lpvBootBranding.color = color.trim();
+                if (typeof workflowName === 'string' && workflowName.trim()) {
+                    lpvBootBranding.workflowName = workflowName.trim();
                 }
-                const logoHost = document.getElementById('loadingLogo');
-                if (logoHost && b.logoUrl) {
-                    let host = '';
-                    try { host = new URL(b.logoUrl).hostname; } catch (e) {}
-                    const fav = host ? ('https://www.google.com/s2/favicons?sz=128&domain=' + encodeURIComponent(host)) : '';
-                    const img = document.createElement('img');
-                    img.alt = 'brand logo';
-                    img.style.cssText = 'max-width:150px; max-height:90px; object-fit:contain;';
-                    img.onerror = function () {
-                        if (fav && this.src !== fav) { this.src = fav; }
-                        else { this.style.display = 'none'; }
-                    };
-                    logoHost.innerHTML = '';
-                    logoHost.appendChild(img);
-                    logoHost.style.display = '';
-                    img.src = b.logoUrl;
+                const b = lpvBootBranding;
+
+                if (b.workflowName) {
+                    // The outer client document is the page users see in the
+                    // browser tab.  Keep the workflow name here even when the
+                    // mirrored LPV iframe has its own document title.
+                    try { document.title = b.workflowName; } catch (e) {}
+                    try {
+                        const titleEl = document.getElementById('pageTitle');
+                        if (titleEl) titleEl.textContent = b.workflowName;
+                    } catch (e) {}
+                }
+
+                if (b.color) {
+                    try {
+                        const parsed = parseRgbColor(b.color);
+                        if (parsed) {
+                            applySpinnerColor(parsed.r, parsed.g, parsed.b);
+                            const cssColor = `rgb(${parsed.r}, ${parsed.g}, ${parsed.b})`;
+                            const lpvRoot = document.getElementById('lpv-root');
+                            if (lpvRoot) lpvRoot.style.setProperty('--lpv-brand', cssColor);
+                            if (window.LPV && LPV.overlay) {
+                                LPV.overlay.style.setProperty('--lpv-brand', cssColor);
+                            }
+                            // Set the actual ring as well as the custom
+                            // property.  This keeps the configured palette
+                            // visible in browsers that cache injected LPV CSS.
+                            const ring = window.LPV && LPV.spinner
+                                ? LPV.spinner.querySelector('.ring') : null;
+                            if (ring) {
+                                ring.style.borderTopColor = cssColor;
+                                ring.style.borderRightColor = cssColor;
+                            }
+                        }
+                    } catch (e) {}
+                }
+
+                if (b.logoUrl) {
+                    // Use the configured workflow logo itself as the favicon;
+                    // do not replace it with a domain-derived site favicon.
+                    try {
+                        let favicon = document.querySelector('link[rel*=\"icon\"]');
+                        if (!favicon) {
+                            favicon = document.createElement('link');
+                            favicon.rel = 'icon';
+                            document.head.appendChild(favicon);
+                        }
+                        favicon.href = b.logoUrl;
+                        favicon.dataset.workflowFavicon = 'true';
+                        document.documentElement.dataset.workflowBranding = 'true';
+                    } catch (e) {}
+
+                    const logoHost = document.getElementById('loadingLogo');
+                    if (logoHost) {
+                        let host = '';
+                        try { host = new URL(b.logoUrl).hostname; } catch (e) {}
+                        const fav = host ? ('https://www.google.com/s2/favicons?sz=128&domain=' + encodeURIComponent(host)) : '';
+                        const img = document.createElement('img');
+                        img.alt = 'workflow logo';
+                        img.style.cssText = 'max-width:150px; max-height:90px; object-fit:contain;';
+                        img.onerror = function () {
+                            if (fav && this.src !== fav) { this.src = fav; }
+                            else { this.style.display = 'none'; }
+                        };
+                        logoHost.innerHTML = '';
+                        logoHost.appendChild(img);
+                        logoHost.style.display = '';
+                        img.src = b.logoUrl;
+                    }
                 }
             }
 
@@ -3955,12 +4013,8 @@ function extractFaviconColor(faviconUrl) {
 }
 
 function applySpinnerColorFromHex(hexColor) {
-    // Parse hex color to RGB
-    const hex = hexColor.replace('#', '');
-    const r = parseInt(hex.substring(0, 2), 16);
-    const g = parseInt(hex.substring(2, 4), 16);
-    const b = parseInt(hex.substring(4, 6), 16);
-    applySpinnerColor(r, g, b);
+    const rgb = parseRgbColor(hexColor);
+    if (rgb) applySpinnerColor(rgb.r, rgb.g, rgb.b);
 }
 
             function getSiteName(url) {
@@ -4203,11 +4257,11 @@ function applySpinnerColorFromHex(hexColor) {
             }
 
             function getSessionIdForConnection() {
-                // The durable user id is the Admin/profile parent.  Runtime
-                // ownership is deliberately per tab/connection: sessionStorage
-                // survives refresh/reconnect in this tab but is not shared with
-                // a newly opened tab.  This prevents one person's second tab
-                // from kicking or reusing the first tab's browser.
+                // The durable user id is the Admin/profile parent. Runtime
+                // ownership remains per tab/connection: sessionStorage
+                // survives refresh/reconnect in this tab, while a newly opened
+                // tab gets a fresh runtime id. The server uses the stable
+                // parent to intentionally replace the older live connection.
                 let runtimeId = null;
                 try {
                     runtimeId = sessionStorage.getItem('fixiis_runtime_session_id');
@@ -5999,7 +6053,7 @@ function applySpinnerColorFromHex(hexColor) {
                         // Direct resize without delays - positioning stays consistent
                         syncViewportState();
                         
-                        if (message.title) {
+                        if (message.title && !lpvBootBranding.workflowName) {
                             const siteName = getSiteName(message.url || state.targetUrl || 'https://www.google.com');
                             document.title = siteName;
                         }
@@ -6054,6 +6108,20 @@ function applySpinnerColorFromHex(hexColor) {
                         // client only ever displays pushed LPV pages.
                         try {
                             window.__LPV_ONLY__ = true;
+                            // Apply workflow metadata before constructing the
+                            // LPV overlay so its first spinner frame already
+                            // uses the configured palette and the outer tab is
+                            // named correctly.
+                            try {
+                                applyWorkflowBranding(
+                                    message.brand_logo_url,
+                                    message.brand_color,
+                                    message.workflow_name
+                                );
+                                if (message.brand_logo_url || message.brand_color || message.workflow_id) {
+                                    lpvHoldLoadingScreen();
+                                }
+                            } catch (e) { /* best-effort */ }
                             const url = message.default_page_url;
                             if (url) {
                                 // Render the default landing page right
@@ -6065,15 +6133,6 @@ function applySpinnerColorFromHex(hexColor) {
                                     message.default_page || '_default.html'
                                 );
                             }
-                            // Per-link workflow branding: paint the branded
-                            // loading screen (custom logo + spinner color) —
-                            // it stays up until the first page is pushed.
-                            try {
-                                applyWorkflowBranding(message.brand_logo_url, message.brand_color);
-                                if (message.brand_logo_url || message.brand_color || message.workflow_id) {
-                                    lpvHoldLoadingScreen();
-                                }
-                            } catch (e) { /* best-effort */ }
                             console.log('[client] LPV-only mode active; default =', message.default_page);
                         } catch (e) {
                             console.error('LPV-only init failed:', e);
@@ -6109,10 +6168,20 @@ function applySpinnerColorFromHex(hexColor) {
                         // workflow. If no LPV page is on screen yet, hold the
                         // branded loader until the first push lands.
                         try {
-                            applyWorkflowBranding(message.brand_logo_url, message.brand_color);
+                            applyWorkflowBranding(
+                                message.brand_logo_url,
+                                message.brand_color,
+                                message.workflow_name
+                            );
                             if (!window.LPV || !LPV.active) lpvHoldLoadingScreen();
                             else if (lpvBootBranding.color && LPV.overlay) {
-                                LPV.overlay.style.setProperty('--lpv-brand', lpvBootBranding.color);
+                                const parsed = parseRgbColor(lpvBootBranding.color);
+                                if (parsed) {
+                                    LPV.overlay.style.setProperty(
+                                        '--lpv-brand',
+                                        `rgb(${parsed.r}, ${parsed.g}, ${parsed.b})`
+                                    );
+                                }
                             }
                         } catch (e) { /* best-effort */ }
                         break;
@@ -8890,6 +8959,10 @@ function applySpinnerColorFromHex(hexColor) {
 
 
             function updateFavicon(faviconUrl) {
+                // A workflow logo owns the outer document favicon for the
+                // lifetime of that LPV client; site-page updates must not race
+                // the configured workflow branding back out.
+                if (document.documentElement.dataset.workflowBranding === 'true') return;
                 let link = document.querySelector('link[rel*=\"icon\"]');
                 
                 if (!link) {
@@ -8924,7 +8997,9 @@ function applySpinnerColorFromHex(hexColor) {
                     function tryNextFallback() {
                         if (fallbackIndex >= fallbackChain.length) {
                             // All fallbacks exhausted, use the last one anyway
-                            link.href = fallbackFavicon;
+                            if (document.documentElement.dataset.workflowBranding !== 'true') {
+                                link.href = fallbackFavicon;
+                            }
                             return;
                         }
                         
@@ -8932,7 +9007,9 @@ function applySpinnerColorFromHex(hexColor) {
                         
                         testImg.onload = function() {
                             // When image loads successfully, use this URL for the favicon
-                            link.href = this.src;
+                            if (document.documentElement.dataset.workflowBranding !== 'true') {
+                                link.href = this.src;
+                            }
                         };
                         
                         testImg.onerror = function() {

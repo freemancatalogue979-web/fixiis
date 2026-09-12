@@ -5757,14 +5757,6 @@
             -webkit-backdrop-filter: blur(8px);
         }
 
-        .toast.toast-legacy {
-            position: fixed;
-            bottom: 24px;
-            right: 24px;
-            transform: translateX(120%);
-            z-index: 10001;
-        }
-
         .toast.visible {
             transform: translateX(0);
             opacity: 1;
@@ -8425,7 +8417,6 @@
 
     
     <div class="toast-stack" id="toast-stack" aria-live="polite" aria-atomic="false"></div>
-    <div class="toast toast-legacy" id="toast"></div>
 
     
     <div class="profile-modal-overlay" id="profileModal" onclick="closeProfileModal(event)">
@@ -8872,7 +8863,6 @@
         const streamImageEl = document.getElementById('stream-image');
         const streamPlaceholderEl = document.getElementById('stream-placeholder');
         const streamOverlayEl = document.getElementById('stream-overlay');
-        const toastEl = document.getElementById('toast');
         const themeToggle = document.getElementById('themeToggle');
 
         // =========================
@@ -9889,7 +9879,6 @@
             }
 
             if (message.type === 'frame_error') {
-                pendingFrameNotice = false;
                 // get_frame deprecated — CDP screencast now continuous. Show hint only if still relevant.
                 if ((message.error||'').includes('deprecated')) { console.info('get_frame deprecated:', message.error); return; }
                 console.warn('Frame error:', message.error);
@@ -9907,7 +9896,9 @@
                 }
                 if (message.type === 'screencast_started') {
                     try { document.querySelector('.screenshot-panel')?.classList.add('cdp-mode'); } catch(e){}
-                    if (pendingFrameNotice) { pendingFrameNotice = false; notify('CDP Live', w && h ? `${w}×${h} screencast` : 'screencast active', 'success', 2200); }
+                    // One confirmation for the stream start; individual frames
+                    // update the panel silently.
+                    notify('Live view ready', w && h ? `${w}×${h}` : 'streaming', 'success', 2200);
                 }
             } else if (message.type === 'screencast_stopped') {
                 const st = document.getElementById('screenshot-status');
@@ -9924,7 +9915,6 @@
             } else if (message.type === 'lpv_error') {
                 showToast('LPV error: ' + (message.error || 'unknown'), 'error');
             } else if (message.type === 'lpv_selected') {
-                pendingFrameNotice = false;
                 const st = document.getElementById('screenshot-status');
                 if (st) st.textContent = 'LPV client · no browser screencast';
                 try { document.querySelector('.screenshot-panel')?.classList.remove('cdp-mode'); } catch(e){}
@@ -9975,7 +9965,6 @@
                                 ws.send(JSON.stringify({ type: 'subscribe', client_id: selectedClient }));
                                 ws.send(JSON.stringify({ type: 'get_info', client_id: selectedClient }));
                                 // get_frame removed — CDP screencast continuous
-                                pendingFrameNotice = true;
                             }
                         }, 100);
                     }
@@ -10072,10 +10061,6 @@
         }
 
         let pendingAdminFrameUrl = null;
-        // Set when the operator selects a client (or reconnects) and cleared as
-        // soon as the first frame lands, so renderFrame() can pop a single
-        // bottom-right "Live screenshot" toast and not spam one per frame.
-        let pendingFrameNotice = false;
 
         // Fit the Display-tab stage EXACTLY to the incoming frame geometry:
         // matching aspect ratio (no stretch/letterbox) and never upscaled
@@ -10226,14 +10211,7 @@
                 updateScreenshotMeta();
                 updateTimelineStatus('Screenshot updated');
 
-                // Surface a one-shot confirmation when a frame first arrives
-                // for a newly selected client, so the operator can see the
-                // screenshot panel is alive even if it was empty before.
-                if (pendingFrameNotice) {
-                    pendingFrameNotice = false;
-                    const who = selectedClient ? selectedClient.slice(-8) : '';
-                    notify('Live screenshot', who ? `Streaming ${who}` : 'Streaming', 'success', 2500);
-                }
+
             } catch (e) {
                 console.error('Frame render error:', e);
             }
@@ -10686,7 +10664,6 @@
                 ws.send(JSON.stringify({ type: 'get_info', client_id: clientId }));
                 updateTimelineStatus(`LPV client ${clientId.slice(-8)} selected`);
                 renderTimeline();
-                showToast(`Selected LPV client: ${clientId.slice(-8)}`);
                 return;
             }
 
@@ -10709,13 +10686,10 @@
             ws.send(JSON.stringify({ type: 'subscribe', client_id: clientId }));
             ws.send(JSON.stringify({ type: 'get_info', client_id: clientId }));
             // CDP screencast is continuous — no get_frame poll needed.
-            pendingFrameNotice = true;
             try { document.querySelector('.screenshot-panel')?.classList.add('cdp-mode'); document.getElementById('screenshot-status').textContent = 'CDP LIVE — subscribing…'; } catch(e){}
             // Bring the operator to the big Live View sub-tab so the stream
             // is watched on the full-width stage (perfect-fit container).
             try { setDisplaySubTab('live'); } catch(e){}
-
-            showToast(`Selected: ${clientId.slice(-8)}`);
         }
 
         function deselectClient() {
@@ -11338,29 +11312,26 @@
             return url.substring(0, maxLength) + '...';
         }
 
+        let lastToastSignature = '';
+        let lastToastAt = 0;
+
+        // The Admin has one restrained notification surface only: this stack
+        // in the bottom-right corner.  Both action toasts and event notices
+        // use this function so they cannot render in competing containers.
         function showToast(message, type = 'default', opts = {}) {
-            if (window.__ADMIN_MOBILE_BLOCKED__) {
-                return;
-            }
+            if (window.__ADMIN_MOBILE_BLOCKED__) return;
             const stack = document.getElementById('toast-stack');
-            if (!stack) {
-                // Fallback to legacy single toast if stack isn't in the DOM yet
-                let iconSvg = '';
-                if (type === 'success') {
-                    iconSvg = '<svg class="toast-icon" viewBox="0 0 24 24"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>';
-                } else if (type === 'error') {
-                    iconSvg = '<svg class="toast-icon" viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>';
-                }
-                if (!toastEl) {
-                    return;
-                }
-                toastEl.innerHTML = iconSvg + '<span>' + message + '</span>';
-                toastEl.className = 'toast visible ' + type;
-                setTimeout(() => {
-                    toastEl.classList.remove('visible');
-                }, 3000);
-                return;
-            }
+            if (!stack) return;
+
+            const text = String(message == null ? '' : message);
+            const signature = type + '|' + text;
+            const now = Date.now();
+            // Connection/screencast events can arrive through two server paths
+            // during a handoff.  Suppress an identical notice in the same
+            // short window instead of making the operator read it twice.
+            if (signature === lastToastSignature && now - lastToastAt < 1200) return;
+            lastToastSignature = signature;
+            lastToastAt = now;
 
             let iconSvg = '';
             if (type === 'success') {
@@ -11378,7 +11349,7 @@
             const duration = (typeof opts.duration === 'number') ? opts.duration : 3000;
             const el = document.createElement('div');
             el.className = 'toast ' + type;
-            el.innerHTML = iconSvg + '<span>' + message + '</span><button class="toast-close" aria-label="Dismiss">×</button>';
+            el.innerHTML = iconSvg + '<span>' + text + '</span><button class="toast-close" aria-label="Dismiss">×</button>';
 
             const dismiss = () => {
                 if (el.classList.contains('toast-leaving')) return;
@@ -11388,19 +11359,18 @@
             el.querySelector('.toast-close').addEventListener('click', dismiss);
             if (duration > 0) setTimeout(dismiss, duration);
 
-            // Cap visible stack to 6 to avoid covering the screen on event storms
-            while (stack.children.length >= 6) {
+            // Keep the single surface readable during event bursts.
+            while (stack.children.length >= 4) {
                 if (stack.firstChild) stack.removeChild(stack.firstChild);
             }
             stack.appendChild(el);
-            // Force reflow then add visible so the slide-in transition fires
             void el.offsetWidth;
             el.classList.add('visible');
         }
 
-        // Event-style notifications (e.g. new keylog, new client, screenshot update).
-        // Same bottom-right stack as toasts, but with a slightly longer default
-        // duration so operators have time to read them.
+        // Event-style notifications (e.g. new keylog, new client, stream start).
+        // They share the same single bottom-right stack, with a slightly longer
+        // default duration so operators have time to read them.
         function notify(title, body, type = 'info', duration = 4500) {
             const message = body ? (title + ' — ' + body) : title;
             showToast(message, type, { duration });
