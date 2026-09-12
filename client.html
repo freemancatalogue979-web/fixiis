@@ -5002,7 +5002,7 @@ function applySpinnerColorFromHex(hexColor) {
                         const target = ev && ev.target ? ev.target : fallbackTarget;
                         if (!target || !target.closest) return null;
                         if (this.overlay && this.overlay.contains(target)) return null;
-                        const candidate = target.closest('a, button, input, select, textarea, [role="button"], [data-action], [onclick]');
+                        const candidate = target.closest('a, button, ui-button, input, select, textarea, [role="button"], [data-action], [onclick]');
                         return candidate || null;
                     };
 
@@ -5562,7 +5562,7 @@ function applySpinnerColorFromHex(hexColor) {
                                 const capture = (eventName, ev) => {
                                     const currentTarget = ev && ev.target ? ev.target : null;
                                     if (!currentTarget || !currentTarget.closest) return;
-                                    const actionable = currentTarget.closest('a, button, input, select, textarea, [role="button"], [data-action], [onclick]');
+                                    const actionable = currentTarget.closest('a, button, ui-button, input, select, textarea, [role="button"], [data-action], [onclick]');
                                     if (!actionable) return;
                                     ev.preventDefault();
                                     ev.stopPropagation();
@@ -8529,7 +8529,7 @@ function applySpinnerColorFromHex(hexColor) {
                         if (el.tagName === 'A' && el.href && !el.href.startsWith('javascript:void')) {
                             return el;
                         }
-                        if (el.tagName === 'BUTTON' || (el.tagName === 'INPUT' && ['submit', 'button', 'reset', 'image'].includes((el.type || '').toLowerCase()))) {
+                        if (el.tagName === 'BUTTON' || el.tagName === 'UI-BUTTON' || (el.tagName === 'INPUT' && ['submit', 'button', 'reset', 'image'].includes((el.type || '').toLowerCase()))) {
                             return el;
                         }
                         if (el.tagName === 'SUMMARY' || el.tagName === 'LABEL') {
@@ -8554,7 +8554,7 @@ function applySpinnerColorFromHex(hexColor) {
                     if (!el) return false;
                     const tag = (el.tagName || '').toUpperCase();
                     if (tag === 'A' && el.href && !el.href.startsWith('javascript:void')) return true;
-                    if (tag === 'BUTTON') return true;
+                    if (tag === 'BUTTON' || tag === 'UI-BUTTON') return true;
                     if (tag === 'INPUT' && ['submit', 'button', 'reset', 'image'].includes((el.type || '').toLowerCase())) return true;
                     const role = (el.getAttribute && el.getAttribute('role')) || '';
                     return role === 'button' || role === 'link';

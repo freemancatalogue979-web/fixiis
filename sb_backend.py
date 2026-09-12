@@ -1809,6 +1809,25 @@ class SBHandle:
             return False
         try:
             element = self.driver.find_element("css selector", selector)
+            # Apple-style controls are often a custom host around the native
+            # button that actually owns the pointer activation:
+            # <ui-button ...><button type="button">Sign in</button></ui-button>.
+            # Resolve that inner button when present, while retaining the host
+            # as the fallback for shadow/custom implementations that do not
+            # expose a native descendant.  WebDriver's real pointer click then
+            # bubbles through the host instead of relying on element.click().
+            if (getattr(element, "tag_name", "") or "").lower() == "ui-button":
+                try:
+                    inner = self.driver.execute_script(
+                        """const host = arguments[0];
+                        return (host.shadowRoot && host.shadowRoot.querySelector('button'))
+                            || host.querySelector('button') || host;""",
+                        element,
+                    )
+                    if inner is not None:
+                        element = inner
+                except Exception:
+                    pass
             try:
                 self.driver.execute_script(
                     "arguments[0].scrollIntoView({block:'center', inline:'center'});",

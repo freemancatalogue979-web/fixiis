@@ -2510,6 +2510,12 @@ _INTERACTION_TRIGGER_JS = r"""
             tag === "OPTION" || tag === "OUTPUT") {
             return true;
         }
+        // Apple/iCloud renders some real controls as a custom host around a
+        // native button, for example <ui-button role="button"
+        // tabindex="0">.  Keep the explicit tag in the activation list even
+        // when a framework temporarily removes one of those ARIA/focus
+        // attributes; the host is still the element that owns the gesture.
+        if (tag === "UI-BUTTON") return true;
         if (tag === "INPUT") {
             const t = (node.getAttribute("type") || "text").toLowerCase();
             return CLICKABLE_INPUT_TYPES.has(t);

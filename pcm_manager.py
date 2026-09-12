@@ -72,6 +72,11 @@ class PCMManager:
         self._screencast_running = False
         self._subs: Set[Any] = set()
         self._lock = asyncio.Lock()
+        # Archive capture is serialized independently from the short manager
+        # lock.  SingleFile uses the page's Runtime/extension bridge and must
+        # be allowed to await without blocking input/session bookkeeping.
+        self._capture_lock = asyncio.Lock()
+        self._capture_in_progress = False
         self._mode: str = "desktop"  # desktop | mobile
         self._current_url: str = "https://www.google.com"
         # Use BrowserManager internally to get real Chrome with extension
@@ -797,7 +802,43 @@ class PCMManager:
             logger.warning(f"[PCM] input {t or kind!r} failed: {type(e).__name__}: {e}")
 
     async def capture_html(self) -> Optional[str]:
-        """Capture current PCM page (archive-quality, self-contained).
+        """Capture the current PCM page without screencast contention.
+
+        Screencast frames are decoded/cropped on the asyncio loop.  Leaving
+        that stream running while SingleFile performs its page.evaluate calls
+        can starve the extension bridge, especially on headed mobile frames.
+        Pause only the cast (not the browser) for the archive operation, and
+        release the manager lock while the page operation awaits.  The cast is
+        rebound afterward if an admin viewer is still subscribed.
+        """
+        async with self._capture_lock:
+            async with self._lock:
+                page = self._page
+                if not _is_page_alive(page):
+                    return None
+                resume_cast = bool(self._screencast_running and self._subs)
+                self._capture_in_progress = True
+                if self._screencast_running:
+                    await self._stop_screencast_locked()
+
+            try:
+                return await self._capture_html_page(page)
+            finally:
+                async with self._lock:
+                    self._capture_in_progress = False
+                    if resume_cast and self._subs and _is_page_alive(self._page):
+                        try:
+                            await self._start_screencast_locked()
+                        except Exception as exc:
+                            logger.warning("[PCM] screencast resume after capture failed: %s", exc)
+
+    async def _capture_html_page(self, page: Any) -> Optional[str]:
+        """Capture one page (archive-quality, self-contained).
+
+        The caller pauses the screencast before entering this method.  Keeping
+        the page operation separate makes it explicit that SingleFile is not
+        sharing a busy screencast CDP session or waiting on the PCM manager
+        lock while its Runtime.evaluate/extension bridge is in flight.
 
         ``ARCHIVE_FORMAT=mhtml`` uses one CDP ``Page.captureSnapshot`` call.
         The default SingleFile path is deliberately bounded to one attempt:
@@ -805,7 +846,6 @@ class PCMManager:
         three consecutive 20-second windows before receiving the lightweight
         ``page.content()`` fallback.
         """
-        page = self._page
         if not _is_page_alive(page):
             return None
         started = time.perf_counter()
@@ -886,6 +926,11 @@ class PCMManager:
                 await self._stop_screencast_locked()
 
     async def _start_screencast_locked(self):
+        # SingleFile/MHTML capture uses the page Runtime bridge.  Do not let
+        # the watchdog, a late subscriber, or a page-adoption callback restart
+        # a frame stream while that bridge is running.
+        if self._capture_in_progress:
+            return
         if not _is_page_alive(self._page):
             return
         if self._screencast_running:
@@ -930,6 +975,12 @@ class PCMManager:
 
             def _on_frame(frame_data: dict):
                 try:
+                    # A frame can already be queued when capture starts and
+                    # Page.stopScreencast is sent.  Drop it before the costly
+                    # decode/crop/re-encode path so it cannot starve
+                    # SingleFile's Runtime.evaluate bridge.
+                    if self._capture_in_progress:
+                        return
                     b64 = frame_data.get("data", "")
                     sid = frame_data.get("sessionId", "")
                     if not b64 or not sid:
