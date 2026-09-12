@@ -4565,9 +4565,10 @@ async def _replace_lpv_parent_connection_locked(
         return 0
     old_client_id = str(old.get("client_id") or "")
     old_ws = old.get("websocket")
-    if (exclude_websocket is not None and old_ws is exclude_websocket) or (
-        exclude_client_id and old_client_id == str(exclude_client_id)
-    ):
+    # A refresh normally reuses the same runtime client id, so the id alone
+    # must not exclude this map entry. Only the exact websocket object can be
+    # the current caller's connection.
+    if exclude_websocket is not None and old_ws is exclude_websocket:
         return 0
 
     old_token = old.get("connection_token")
