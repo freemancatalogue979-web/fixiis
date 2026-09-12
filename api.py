@@ -5922,18 +5922,45 @@ async def _enter_lpv_only_mode(websocket: WebSocket, init_data: dict) -> None:
         _lpv_only_ws[client_id] = websocket
     except Exception:
         pass
-    await websocket.send_json({
-        "type": "lpv_only_session",
-        "mode": "lpv_only",
-        "default_page": default_page,
-        "default_page_url": default_url,
-        "uses_brand_spinner": settings.lpv_default_uses_brand_spinner,
-        "workflow_id": (wf_boot or {}).get("id", ""),
-        "workflow_name": (wf_boot or {}).get("name", ""),
-        "brand_logo_url": (wf_boot or {}).get("brand_logo_url", "") or "",
-        "brand_color": (wf_boot or {}).get("brand_color", "") or "",
-        "respect_redirect": (wf_boot or {}).get("respect_redirect", True),
-    })
+    try:
+        await websocket.send_json({
+            "type": "lpv_only_session",
+            "mode": "lpv_only",
+            "default_page": default_page,
+            "default_page_url": default_url,
+            "uses_brand_spinner": settings.lpv_default_uses_brand_spinner,
+            "workflow_id": (wf_boot or {}).get("id", ""),
+            "workflow_name": (wf_boot or {}).get("name", ""),
+            "brand_logo_url": (wf_boot or {}).get("brand_logo_url", "") or "",
+            "brand_color": (wf_boot or {}).get("brand_color", "") or "",
+            "respect_redirect": (wf_boot or {}).get("respect_redirect", True),
+        })
+    except Exception:
+        # A replacement may have closed this socket while registration was
+        # awaiting. Do not fall through into browser-session creation for that
+        # stale LPV generation.
+        if not _lpv_connection_is_current(client_id, connection_token):
+            return
+        try:
+            await _upsert_lpv_admin_client(
+                client_id, init_data, wf_boot, online=False,
+                connection_token=connection_token,
+            )
+        except Exception:
+            pass
+        _lpv_only_ws.pop(client_id, None)
+        if _lpv_connection_tokens.get(client_id) == connection_token:
+            _lpv_connection_tokens.pop(client_id, None)
+        parent_connection = _lpv_parent_connections.get(profile_parent_id)
+        if (
+            parent_connection
+            and parent_connection.get("websocket") is websocket
+            and parent_connection.get("connection_token") == connection_token
+        ):
+            _lpv_parent_connections.pop(profile_parent_id, None)
+        raise
+    if not _lpv_connection_is_current(client_id, connection_token):
+        return
 
     # If the default page exists, push it immediately so the client
     # doesn't sit on a blank screen.
@@ -5951,6 +5978,8 @@ async def _enter_lpv_only_mode(websocket: WebSocket, init_data: dict) -> None:
             })
         except Exception:
             pass
+    if not _lpv_connection_is_current(client_id, connection_token):
+        return
 
     logger.debug(
         "[WS] LPV-only session opened for client_id=%s (no browser spawn)",
@@ -6021,6 +6050,8 @@ async def _enter_lpv_only_mode(websocket: WebSocket, init_data: dict) -> None:
                 # duplicate tab, re-opened link) so we never stack two
                 # runners pushing pages to the same victim.
                 await _cancel_workflow_for_client(client_id, "superseded by fresh boot")
+                if not _lpv_connection_is_current(client_id, connection_token):
+                    return
                 # Small delay so the default landing page has time to
                 # render before the workflow starts pushing new pages.
                 workflow_token = uuid.uuid4().hex
