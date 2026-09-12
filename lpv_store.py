@@ -853,7 +853,8 @@ def save_workflow(workflow_id: Optional[str], name: str, description: str, steps
     Branding/behavior kwargs (per-workflow "LPV loading screen"):
        brand_logo_url   custom logo shown on the branded loading screen;
                         '' clears it, None keeps the previous value.
-       brand_color      hex spinner color ('' = default/inherit, None = keep).
+       brand_color      hex, rgb(), or rgba() spinner color ('' = default/inherit,
+                        None = keep).
        respect_redirect False -> redirect steps just sleep wait_seconds and
                         continue instead of waiting forever for the client's
                         spinner click ("redirect logic is optional").
@@ -870,9 +871,20 @@ def save_workflow(workflow_id: Optional[str], name: str, description: str, steps
             raise ValueError("brand logo URL too long")
     if brand_color is not None:
         brand_color = (brand_color or "").strip()
+        # Admin normally emits a hex value, but keep API-created workflows
+        # compatible with CSS rgb()/rgba() palette values as well. The client
+        # normalizes all three forms before applying them to the spinner/LPV.
+        _hex_color = r"#[0-9a-fA-F]{3,4}|#[0-9a-fA-F]{6}|#[0-9a-fA-F]{8}"
+        _rgb_color = (
+            r"rgba?\(\s*[0-9]{1,3}\s*,\s*[0-9]{1,3}\s*,\s*[0-9]{1,3}"
+            r"(?:\s*,\s*(?:0|1|0?\.[0-9]+))?\s*\)"
+        )
         if brand_color and not re.fullmatch(
-                r"#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})", brand_color):
-            raise ValueError("brand color must be a hex color like #4285F4 (or empty for default)")
+                rf"(?:{_hex_color}|{_rgb_color})", brand_color, flags=re.IGNORECASE):
+            raise ValueError(
+                "brand color must be a hex, rgb(), or rgba() CSS color "
+                "(or empty for default)"
+            )
     if respect_redirect is not None:
         respect_redirect = bool(respect_redirect)
     # Validate steps
