@@ -30,22 +30,18 @@ from frame_crop import crop_frame_to_content
 
 logger = logging.getLogger(__name__)
 
-# A failed SingleFile bridge used to consume three full timeout windows before
-# PCM fell back to page.content(), which made one Capture click look frozen for
-# roughly a minute. PCM is an explicit archive action, so give it one bounded
-# extension attempt and a hard outer deadline; the live mirror keeps its own
-# retry policy.
+# PCM archive capture is intentionally extension-only.  It must never switch
+# to page.content(), MHTML/CDP snapshots, or the legacy in-page library: those
+# outputs are not the SingleFile archive requested by the operator.  A capture
+# therefore waits and retries while the current page remains alive.
 try:
     PCM_SINGLEFILE_TIMEOUT_S = max(5, int(os.environ.get("PCM_SINGLEFILE_TIMEOUT_S", "20")))
 except (TypeError, ValueError):
     PCM_SINGLEFILE_TIMEOUT_S = 20
 try:
-    PCM_CAPTURE_HARD_TIMEOUT_S = max(
-        PCM_SINGLEFILE_TIMEOUT_S + 2,
-        int(os.environ.get("PCM_CAPTURE_HARD_TIMEOUT_S", str(PCM_SINGLEFILE_TIMEOUT_S + 7))),
-    )
+    PCM_SINGLEFILE_RETRY_DELAY_S = max(0.5, float(os.environ.get("PCM_SINGLEFILE_RETRY_DELAY_S", "2")))
 except (TypeError, ValueError):
-    PCM_CAPTURE_HARD_TIMEOUT_S = PCM_SINGLEFILE_TIMEOUT_S + 7
+    PCM_SINGLEFILE_RETRY_DELAY_S = 2.0
 
 
 def _is_page_alive(page: Any) -> bool:
@@ -558,10 +554,11 @@ class PCMManager:
                 self._browser = None
         except Exception:
             pass
-        # Clean up from BrowserManager registry (playwright mode)
+        # Clean up the session-scoped BrowserManager ownership record.
         try:
-            if self._browser_manager and self._session_id in getattr(self._browser_manager, 'active_browsers', {}):
-                del self._browser_manager.active_browsers[self._session_id]
+            if self._browser_manager and hasattr(self._browser_manager, 'remove_active_browser'):
+                await self._browser_manager.remove_active_browser(self._session_id)
+            elif self._browser_manager:
                 try:
                     self._browser_manager.gpu_manager.unregister_session(self._session_id)
                 except Exception:
@@ -833,83 +830,57 @@ class PCMManager:
                             logger.warning("[PCM] screencast resume after capture failed: %s", exc)
 
     async def _capture_html_page(self, page: Any) -> Optional[str]:
-        """Capture one page (archive-quality, self-contained).
+        """Wait for a real SingleFile extension capture.
 
-        The caller pauses the screencast before entering this method.  Keeping
-        the page operation separate makes it explicit that SingleFile is not
-        sharing a busy screencast CDP session or waiting on the PCM manager
-        lock while its Runtime.evaluate/extension bridge is in flight.
-
-        ``ARCHIVE_FORMAT=mhtml`` uses one CDP ``Page.captureSnapshot`` call.
-        The default SingleFile path is deliberately bounded to one attempt:
-        a broken/idle extension bridge must not make the admin wait through
-        three consecutive 20-second windows before receiving the lightweight
-        ``page.content()`` fallback.
+        PCM is an archive-quality operator action, not a best-effort DOM
+        snapshot.  Never use ``page.content()``, MHTML/CDP snapshots, or the
+        legacy SingleFile library here.  If the extension is still waking up
+        after navigation, retry patiently until it returns HTML or the page is
+        gone/cancelled.
         """
         if not _is_page_alive(page):
             return None
-        started = time.perf_counter()
-        try:
-            if os.environ.get("ARCHIVE_FORMAT", "singlefile").strip().lower() == "mhtml":
-                try:
-                    from dom_capture import capture_page_mhtml
-                    mhtml = await capture_page_mhtml(page, timeout=PCM_SINGLEFILE_TIMEOUT_S)
-                    if mhtml:
-                        logger.info(
-                            "[PCM] MHTML capture completed in %.2fs (%d bytes)",
-                            time.perf_counter() - started, len(mhtml),
-                        )
-                        return mhtml
-                except Exception as exc:
-                    logger.debug("[PCM] MHTML capture unavailable, SingleFile path: %s", exc)
+        from dom_capture import _capture_with_single_file
 
-            from dom_capture import _capture_with_single_file
-            sf_started = time.perf_counter()
+        started = time.perf_counter()
+        attempt = 0
+        delay = PCM_SINGLEFILE_RETRY_DELAY_S
+        while _is_page_alive(page):
+            attempt += 1
             try:
                 html = await asyncio.wait_for(
                     _capture_with_single_file(
                         page,
                         timeout=PCM_SINGLEFILE_TIMEOUT_S,
                         max_attempts=1,
+                        extension_only=True,
                     ),
-                    timeout=PCM_CAPTURE_HARD_TIMEOUT_S,
+                    timeout=PCM_SINGLEFILE_TIMEOUT_S + 2,
                 )
-            except asyncio.TimeoutError:
+                if html:
+                    logger.info(
+                        "[PCM] SingleFile extension capture completed after %d attempt(s) in %.2fs (%d bytes)",
+                        attempt, time.perf_counter() - started, len(html),
+                    )
+                    return html
                 logger.warning(
-                    "[PCM] SingleFile capture exceeded %ss hard deadline; using page.content()",
-                    PCM_CAPTURE_HARD_TIMEOUT_S,
+                    "[PCM] SingleFile extension returned no HTML on attempt %d; waiting %.1fs before retry",
+                    attempt, delay,
                 )
-                html = None
-            logger.info(
-                "[PCM] SingleFile capture attempt took %.2fs (result=%s)",
-                time.perf_counter() - sf_started,
-                "ok" if html else "empty",
-            )
-            if html:
-                logger.info(
-                    "[PCM] capture completed in %.2fs (%d bytes)",
-                    time.perf_counter() - started, len(html),
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "[PCM] SingleFile extension attempt %d failed (%s); waiting %.1fs",
+                    attempt, exc, delay,
                 )
-                return html
-
-            # Last-resort lightweight snapshot. Keep this bounded too so a
-            # detached CDP target cannot leave the HTTP request hanging.
-            try:
-                html = await asyncio.wait_for(page.content(), timeout=5)
-            except asyncio.TimeoutError:
-                html = None
-            if html:
-                logger.info(
-                    "[PCM] page.content fallback completed in %.2fs (%d bytes)",
-                    time.perf_counter() - started, len(html),
-                )
-            return html
-        except Exception as exc:
-            logger.warning("[PCM] capture_html failed after %.2fs: %s", time.perf_counter() - started, exc)
-            try:
-                return await asyncio.wait_for(page.content(), timeout=5)
-            except Exception:
-                return None
+            # A bounded backoff prevents a broken extension from busy-looping,
+            # while the absence of a terminal fallback preserves the requested
+            # SingleFile-only contract.
+            await asyncio.sleep(delay)
+            delay = min(10.0, delay * 1.5)
+        logger.warning("[PCM] SingleFile capture stopped because the page is no longer alive")
+        return None
 
     # --- screencast relay ---
     async def subscribe(self, ws):

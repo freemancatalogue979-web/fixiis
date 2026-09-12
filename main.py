@@ -267,8 +267,8 @@ class Server:
         self.shutdown_event.set()
 
     async def restart(self):
-        """Full restart - forcefully kills ALL browser processes and restarts completely"""
-        logger.debug("Full server restart initiated - killing all processes...")
+        """Restart after closing only browsers owned by this server."""
+        logger.debug("Full server restart initiated - closing owned sessions...")
         
         # Step 1: Forcefully close all sessions and browsers
         try:
@@ -281,22 +281,14 @@ class Server:
         except Exception as e:
             logger.error(f"Error stopping session manager: {e}")
         
-        # Step 2: Kill all Chrome/Chromium processes forcefully
+        # Step 2: Reap only stale private runtime profiles owned by this
+        # service.  Never issue a machine-wide Chrome kill during restart.
         try:
-            if is_windows():
-                # Windows: Use taskkill
-                subprocess.run(['taskkill', '/F', '/IM', 'chrome.exe'], capture_output=True)
-                subprocess.run(['taskkill', '/F', '/IM', 'chromium.exe'], capture_output=True)
-                logger.debug("All browser processes killed (Windows)")
-            else:
-                # Linux: Use pkill
-                subprocess.run(['pkill', '-9', '-f', 'chrome'], capture_output=True)
-                subprocess.run(['pkill', '-9', '-f', 'chromium'], capture_output=True)
-                subprocess.run(['pkill', '-9', '-f', 'chrome-linux'], capture_output=True)
-                subprocess.run(['pkill', '-9', '-f', 'headless_shell'], capture_output=True)
-                logger.debug("All browser processes killed (Linux)")
+            killed = self.gpu_manager.cleanup_orphaned_chrome_processes()
+            if killed:
+                logger.debug("Restart reaped %s stale owned browser processes", killed)
         except Exception as e:
-            logger.error(f"Error killing browser processes: {e}")
+            logger.error(f"Error cleaning owned browser processes: {e}")
         
         # Step 3: Stop cloudflare tunnel
         try:

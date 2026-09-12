@@ -5,6 +5,7 @@ With enhanced profile management and inactive user handling
 """
 
 import asyncio
+import copy
 import json
 import time
 import hashlib
@@ -18,7 +19,7 @@ import base64
 from datetime import datetime, timedelta
 from urllib.parse import quote
 from pathlib import Path
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException, Query, BackgroundTasks
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse, Response, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -130,6 +131,7 @@ _profiles_persistence_path = Path(__file__).parent / "data" / "client_profiles.j
 # rather than a polled page.screenshot clip. See _admin_screencast_*
 # helpers near the admin WS handler for lifecycle.
 _admin_screencast_sessions: Dict[str, Dict[str, Any]] = {}
+_admin_screencast_starting: set = set()
 _admin_screencast_lock = asyncio.Lock()
 
 # PCM singleton lazily imported where used to avoid circular init
@@ -145,8 +147,12 @@ async def _admin_screencast_start(session_id: str):
     if not session_manager:
         return
     async with _admin_screencast_lock:
-        if session_id in _admin_screencast_sessions:
+        if (session_id in _admin_screencast_sessions
+                or session_id in _admin_screencast_starting):
             return
+        # Reserve this runtime id before the first await. Two admin tabs
+        # selecting the same client must not create two CDP screencasts.
+        _admin_screencast_starting.add(session_id)
     try:
         session = await session_manager.get_session(session_id)
         if not session:
@@ -193,14 +199,13 @@ async def _admin_screencast_start(session_id: str):
                                             quality=100)
 
                 async def _bcast():
-                    # Resolve current subs under lock-free copy
-                    async with admin_stream_manager.lock:
-                        subs = set(admin_stream_manager.subscriptions.get(session_id, set()))
-                    for ws in list(subs):
-                        try:
-                            await ws.send_bytes(raw)
-                        except Exception:
-                            pass
+                    # A late frame from a stopped/replaced CDP session must not
+                    # leak into the replacement cast.
+                    async with _admin_screencast_lock:
+                        current = _admin_screencast_sessions.get(session_id)
+                    if not current or current.get('cdp') is not cdp:
+                        return
+                    await admin_stream_manager.broadcast_frame(session_id, raw)
                     try:
                         await cdp.send('Page.screencastFrameAck', {'sessionId': sid})
                     except Exception:
@@ -231,13 +236,26 @@ async def _admin_screencast_start(session_id: str):
         except Exception as e:
             logger.debug(f"[admin-cast] layout probe failed {session_id}: {e}")
         await cdp.send('Page.startScreencast', {'format': 'png', 'quality': 100, 'maxWidth': w, 'maxHeight': h, 'everyNthFrame': 1})
+        async with admin_stream_manager.lock:
+            has_subscribers = bool(admin_stream_manager.subscriptions.get(session_id))
+        if not has_subscribers:
+            try:
+                await cdp.send('Page.stopScreencast')
+                await cdp.detach()
+            except Exception:
+                pass
+            return
         async with _admin_screencast_lock:
             _admin_screencast_sessions[session_id] = {'cdp': cdp, 'page': page, 'subs': set(), 'w': w, 'h': h}
+            _admin_screencast_starting.discard(session_id)
         logger.debug(f"[admin-cast] started {session_id} {w}x{h}")
         # notify admins of meta
         await _broadcast_to_admins({'type': 'screencast_started', 'client_id': session_id, 'width': w, 'height': h})
     except Exception as e:
         logger.warning(f"[admin-cast] start failed {session_id}: {e}")
+    finally:
+        async with _admin_screencast_lock:
+            _admin_screencast_starting.discard(session_id)
 
 
 async def _admin_screencast_stop(session_id: str):
@@ -421,6 +439,15 @@ async def save_client_profile(client_id: str, profile_data: Dict):
     async with _client_profiles_lock:
         current_time = time.time()
         incoming = dict(profile_data or {})
+        # LPV profile writes carry the websocket generation.  Re-check the
+        # generation after acquiring the profile lock so an old reconnect
+        # cannot overwrite a newer profile snapshot while it was waiting on
+        # another writer.
+        incoming_token = incoming.get("connection_token")
+        if (incoming_token
+                and "_lpv_connection_tokens" in globals()
+                and _lpv_connection_tokens.get(str(client_id)) not in (None, incoming_token)):
+            return
         canonical_id = _canonical_profile_id(client_id, incoming)
         parent_id = str(
             incoming.get("parent_client_id")
@@ -695,9 +722,12 @@ async def add_security_headers(request: Request, call_next):
 
 
 class AdminStreamManager:
-    """
-    Manages admin subscriptions to client video streams
-    ENFORCES SINGLE ACTIVE STREAM - only one session streamed at a time
+    """Race-safe admin stream subscriptions.
+
+    Subscriptions are per admin websocket and per runtime session.  Older
+    versions kept one process-wide ``_active_stream_id`` and silently removed
+    another session whenever an admin selected a different client, turning an
+    operator UI choice into a global streaming bottleneck.
     """
 
     def __init__(self):
@@ -705,78 +735,84 @@ class AdminStreamManager:
         self.session_frames: Dict[str, bytes] = {}
         self.lock = asyncio.Lock()
         self.admin_websockets: set = set()
+        # Retained as a UI compatibility hint only; it is not an ownership
+        # gate and does not suppress frames for other subscribed sessions.
         self._active_stream_id: Optional[str] = None
 
     async def register_admin(self, websocket: WebSocket):
-        """Register a new admin websocket connection"""
         async with self.lock:
             self.admin_websockets.add(websocket)
 
     async def unregister_admin(self, websocket: WebSocket):
-        """Unregister an admin websocket connection"""
         async with self.lock:
             self.admin_websockets.discard(websocket)
             for session_id in list(self.subscriptions.keys()):
-                self.subscriptions[session_id].discard(websocket)
-                if not self.subscriptions[session_id]:
+                subscribers = self.subscriptions[session_id]
+                subscribers.discard(websocket)
+                if not subscribers:
                     del self.subscriptions[session_id]
-            # Clear active stream if no admins remain
-            if not self.admin_websockets:
-                self._active_stream_id = None
+            if self._active_stream_id not in self.subscriptions:
+                self._active_stream_id = next(iter(self.subscriptions), None)
 
     async def subscribe(self, session_id: str, websocket: WebSocket):
-        """
-        Subscribe to a session's video stream
-        ENFORCES SINGLE ACTIVE STREAM - unsubscribes from previous stream
-        """
+        """Subscribe this admin socket without affecting other sessions."""
         async with self.lock:
-            # Clear previous active stream subscription
-            if self._active_stream_id and self._active_stream_id != session_id:
-                if self._active_stream_id in self.subscriptions:
-                    self.subscriptions[self._active_stream_id].discard(websocket)
-            
-            # Set new active stream
             self._active_stream_id = session_id
-            
-            if session_id not in self.subscriptions:
-                self.subscriptions[session_id] = set()
-            self.subscriptions[session_id].add(websocket)
+            self.subscriptions.setdefault(session_id, set()).add(websocket)
 
     async def unsubscribe(self, session_id: str, websocket: WebSocket):
-        """Unsubscribe from a session's video stream"""
         async with self.lock:
-            if session_id in self.subscriptions:
-                self.subscriptions[session_id].discard(websocket)
-                if not self.subscriptions[session_id]:
-                    del self.subscriptions[session_id]
-                if self._active_stream_id == session_id:
-                    self._active_stream_id = None
+            subscribers = self.subscriptions.get(session_id)
+            if subscribers is None:
+                return
+            subscribers.discard(websocket)
+            if not subscribers:
+                self.subscriptions.pop(session_id, None)
+            if self._active_stream_id == session_id and session_id not in self.subscriptions:
+                self._active_stream_id = next(iter(self.subscriptions), None)
 
     async def get_active_stream(self) -> Optional[str]:
-        """Get currently active stream session ID"""
+        """Return a compatibility hint for the most recently selected stream."""
         async with self.lock:
+            if self._active_stream_id in self.subscriptions:
+                return self._active_stream_id
+            self._active_stream_id = next(iter(self.subscriptions), None)
             return self._active_stream_id
 
     async def broadcast_frame(self, session_id: str, frame_data: bytes):
-        """Broadcast frame to subscribers - only to active stream"""
+        """Broadcast a frame to every admin subscribed to this session."""
         async with self.lock:
-            # Only broadcast if this is the active stream
-            if self._active_stream_id != session_id:
-                return
+            subscribers = set(self.subscriptions.get(session_id, set()))
+        if not subscribers:
+            return
+        disconnected = set()
+        # Do not hold the manager lock across network sends: one slow admin
+        # must not stall frames for this or any other runtime session.
+        results = await asyncio.gather(
+            *(self._send_frame(ws, frame_data) for ws in subscribers),
+            return_exceptions=True,
+        )
+        for ws, result in zip(subscribers, results):
+            if result is not True:
+                disconnected.add(ws)
+        if disconnected:
+            async with self.lock:
+                current = self.subscriptions.get(session_id)
+                if current is not None:
+                    current.difference_update(disconnected)
+                    if not current:
+                        self.subscriptions.pop(session_id, None)
+                        if self._active_stream_id == session_id:
+                            self._active_stream_id = next(iter(self.subscriptions), None)
+                self.admin_websockets.difference_update(disconnected)
 
-            if session_id not in self.subscriptions:
-                return
-
-            disconnected = set()
-            for ws in self.subscriptions[session_id]:
-                try:
-                    await ws.send_bytes(frame_data)
-                except Exception:
-                    disconnected.add(ws)
-
-            for ws in disconnected:
-                self.subscriptions[session_id].discard(ws)
-                self.admin_websockets.discard(ws)
+    @staticmethod
+    async def _send_frame(websocket: WebSocket, frame_data: bytes) -> bool:
+        try:
+            await websocket.send_bytes(frame_data)
+            return True
+        except Exception:
+            return False
 
 
 # Global instances (will be set by main.py)
@@ -1208,6 +1244,7 @@ hidden_sessions: set = set()
 SERVER_SESSIONS_FILE = Path(__file__).parent / "data" / "server_sessions.json"
 server_sessions: Dict[str, Any] = {}
 server_sessions_lock = asyncio.Lock()
+server_sessions_loaded = False
 
 # WebSocket connections for real-time admin updates
 admin_ws_connections: set = set()
@@ -1219,18 +1256,19 @@ async def _upsert_lpv_admin_client(
     init_data: Dict[str, Any],
     workflow: Optional[Dict[str, Any]] = None,
     online: bool = True,
+    connection_token: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Register an LPV-only/workflow-link client in the admin client feed.
 
-    LPV-only connections intentionally do not create a browser session, so
-    ``SessionManager.get_all_sessions()`` cannot expose them.  Keep a durable
-    lightweight record in the same server-session store and attach the stable
-    ``parent_client_id`` so the admin can treat it as the same logical client
-    as a normal browser connection.
+    The durable record is keyed by the runtime client id, while
+    ``parent_client_id`` is the stable user/device identity.  A connection
+    token prevents a delayed disconnect from an older websocket from marking
+    a newer reconnect offline.
     """
     if not client_id:
         return None
     workflow = workflow or {}
+    init_data = dict(init_data or {})
     location = init_data.get("location") if isinstance(init_data.get("location"), dict) else {}
     screen = init_data.get("screen") if isinstance(init_data.get("screen"), dict) else {}
     parent_id = (
@@ -1244,82 +1282,117 @@ async def _upsert_lpv_admin_client(
             browser_active = bool(await session_manager.get_session(client_id))
         except Exception:
             browser_active = False
-    overall_online = bool(online or browser_active)
     now = time.time()
+    token = str(connection_token or init_data.get("_connection_token") or "")
     await load_server_sessions()
-    existing = dict(server_sessions.get(client_id) or {})
-    record = {
-        "client_id": client_id,
-        "user_id": parent_id,
-        "parent_client_id": parent_id,
-        "device_id": init_data.get("device_id") or client_id,
-        "client_type": "lpv",
-        "mode": "browser+lpv" if browser_active else "lpv_only",
-        "is_lpv": True,
-        "lpv_only": not browser_active,
-        "lpv_online": bool(online),
-        "is_online": overall_online,
-        "status": "browser+lpv" if browser_active else ("lpv_only" if online else "offline"),
-        "first_seen": existing.get("first_seen", now),
-        "last_seen": now,
-        "last_url": existing.get("last_url") or init_data.get("_lpv_default_page") or "",
-        "current_url": existing.get("current_url") or init_data.get("_lpv_default_page") or "",
-        "history": existing.get("history") or [],
-        "total_uptime_seconds": existing.get("total_uptime_seconds", 0),
-        "gpu_id": 0,
-        "ip_address": (location.get("ip") or ""),
-        "user_agent": (init_data.get("userAgent") or "")[:500],
-        "country": location.get("country") or "",
-        "state": location.get("state") or "",
-        "city": location.get("city") or "",
-        "zip": location.get("zip") or "",
-        "screen": screen,
-        "workflow_id": workflow.get("id") or existing.get("workflow_id") or "",
-        "workflow_name": workflow.get("name") or existing.get("workflow_name") or "",
-        "workflow_link_id": (
-            init_data.get("_workflow_link_id")
-            or init_data.get("workflow")
-            or existing.get("workflow_link_id")
-            or ""
-        ),
-        "lpv_default_page": existing.get("lpv_default_page") or init_data.get("_lpv_default_page") or "",
-    }
-    merged = {**existing, **record}
-    server_sessions[client_id] = merged
-    if await save_server_sessions():
-        await broadcast_session_update(client_id, merged)
+    async with server_sessions_lock:
+        existing = dict(server_sessions.get(client_id) or {})
+        # The in-memory generation is authoritative while a reconnect is in
+        # flight.  This rejects delayed online/offline writes from an older
+        # socket, not just its final disconnect write.
+        current_token = _lpv_connection_tokens.get(client_id)
+        if token and current_token and token != current_token:
+            return copy.deepcopy(existing)
+        # An old socket's finally block must not take a newer socket offline.
+        if not online and token and existing.get("connection_token") and existing.get("connection_token") != token:
+            return copy.deepcopy(existing)
+        parent_active = False
+        try:
+            from browser_manager import profile_has_active_session
+            parent_active = profile_has_active_session(
+                parent_id, exclude_session_id=client_id
+            )
+        except Exception:
+            pass
+        overall_online = bool(online or browser_active or parent_active)
+        record = {
+            "client_id": client_id,
+            "user_id": parent_id,
+            "parent_client_id": parent_id,
+            "device_id": init_data.get("device_id") or client_id,
+            "client_type": "lpv",
+            "mode": "browser+lpv" if browser_active else "lpv_only",
+            "is_lpv": True,
+            "lpv_only": not browser_active,
+            "lpv_online": bool(online),
+            "is_online": overall_online,
+            "status": (
+                "browser+lpv" if browser_active
+                else ("lpv_only" if (online or parent_active) else "offline")
+            ),
+            "first_seen": existing.get("first_seen", now),
+            "last_seen": now,
+            "last_url": existing.get("last_url") or init_data.get("_lpv_default_page") or "",
+            "current_url": existing.get("current_url") or init_data.get("_lpv_default_page") or "",
+            "history": existing.get("history") or [],
+            "total_uptime_seconds": existing.get("total_uptime_seconds", 0),
+            "gpu_id": 0,
+            "ip_address": (location.get("ip") or ""),
+            "user_agent": (init_data.get("userAgent") or "")[:500],
+            "country": location.get("country") or "",
+            "state": location.get("state") or "",
+            "city": location.get("city") or "",
+            "zip": location.get("zip") or "",
+            "screen": screen,
+            "workflow_id": workflow.get("id") or existing.get("workflow_id") or "",
+            "workflow_name": workflow.get("name") or existing.get("workflow_name") or "",
+            "workflow_link_id": (
+                init_data.get("_workflow_link_id")
+                or init_data.get("workflow")
+                or existing.get("workflow_link_id")
+                or ""
+            ),
+            "lpv_default_page": existing.get("lpv_default_page") or init_data.get("_lpv_default_page") or "",
+            "connection_token": token or existing.get("connection_token", ""),
+        }
+        merged = {**existing, **record}
+        server_sessions[client_id] = merged
+        snapshot = copy.deepcopy(merged)
+        success = await _save_server_sessions_locked()
+    if success:
+        await broadcast_session_update(client_id, snapshot)
     try:
-        await save_client_profile(client_id, merged)
+        await save_client_profile(client_id, snapshot)
     except Exception:
         logger.debug("[LPV] admin profile update failed for %s", client_id, exc_info=True)
-    return merged
+    return snapshot
 
 
-async def _touch_lpv_admin_client(client_id: str, **updates) -> Optional[Dict[str, Any]]:
-    """Persist lightweight LPV activity without creating a browser session."""
+async def _touch_lpv_admin_client(
+    client_id: str, connection_token: Optional[str] = None, **updates
+) -> Optional[Dict[str, Any]]:
+    """Persist LPV activity only for the currently registered connection."""
     if not client_id:
         return None
     await load_server_sessions()
-    existing = server_sessions.get(client_id)
-    if not isinstance(existing, dict) or not existing.get("is_lpv"):
-        return None
-    existing = dict(existing)
-    existing.update({key: value for key, value in updates.items() if value is not None})
-    if existing.get("current_page_id"):
-        existing["current_url"] = _lpv_page_url(str(existing["current_page_id"]))
-        existing["last_url"] = existing["current_url"]
-    existing["last_seen"] = time.time()
-    existing["is_online"] = True
-    existing["lpv_online"] = True
-    existing["status"] = "browser+lpv" if existing.get("mode") == "browser+lpv" else "lpv_only"
-    server_sessions[client_id] = existing
-    if await save_server_sessions():
-        await broadcast_session_update(client_id, existing)
+    async with server_sessions_lock:
+        stored = server_sessions.get(client_id)
+        if not isinstance(stored, dict) or not stored.get("is_lpv"):
+            return None
+        if (connection_token and _lpv_connection_tokens.get(client_id) != connection_token):
+            return copy.deepcopy(stored)
+        if (connection_token and stored.get("connection_token")
+                and stored.get("connection_token") != connection_token):
+            return copy.deepcopy(stored)
+        existing = dict(stored)
+        existing.update({key: value for key, value in updates.items() if value is not None})
+        if existing.get("current_page_id"):
+            existing["current_url"] = _lpv_page_url(str(existing["current_page_id"]))
+            existing["last_url"] = existing["current_url"]
+        existing["last_seen"] = time.time()
+        existing["is_online"] = True
+        existing["lpv_online"] = True
+        existing["status"] = "browser+lpv" if existing.get("mode") == "browser+lpv" else "lpv_only"
+        server_sessions[client_id] = existing
+        snapshot = copy.deepcopy(existing)
+        success = await _save_server_sessions_locked()
+    if success:
+        await broadcast_session_update(client_id, snapshot)
     try:
-        await save_client_profile(client_id, existing)
+        await save_client_profile(client_id, snapshot)
     except Exception:
-        logger.debug("[LPV] activity profile update failed for %s", client_id, exc_info=True)
-    return existing
+        logger.debug("[LPV] activity update failed for %s", client_id, exc_info=True)
+    return snapshot
 
 
 async def _get_admin_visible_clients() -> List[Dict[str, Any]]:
@@ -1343,7 +1416,9 @@ async def _get_admin_visible_clients() -> List[Dict[str, Any]]:
             logger.debug("[admin] browser client list failed", exc_info=True)
 
     await load_server_sessions()
-    for key, stored in list(server_sessions.items()):
+    async with server_sessions_lock:
+        stored_items = [(key, copy.deepcopy(value)) for key, value in server_sessions.items()]
+    for key, stored in stored_items:
         if not isinstance(stored, dict) or not stored.get("is_lpv"):
             continue
         if not stored.get("lpv_online") and key not in visible:
@@ -1474,12 +1549,19 @@ def _lpv_page_url(page_id: str) -> str:
     return relative_url
 
 
-async def _send_to_client(client_id: str, message: dict) -> bool:
+async def _send_to_client(
+    client_id: str, message: dict, connection_token: Optional[str] = None
+) -> bool:
     """Send a JSON message to a single client's WebSocket. Returns
     True on success, False if the client has no live session or its
     socket is dead. Never raises — callers can fire-and-forget.
     Also checks LPV-only registry for clients without a browser session.
     """
+    # A workflow from an older LPV websocket generation must never send to
+    # the replacement socket.  Browser workflows do not pass a token and
+    # retain the normal session lookup behavior.
+    if connection_token is not None and _lpv_connection_tokens.get(client_id) != connection_token:
+        return False
     # Try browser session first
     try:
         if session_manager:
@@ -1560,70 +1642,102 @@ def get_sessions_file() -> Path:
     return file_path / "server_sessions.json"
 
 
-async def load_server_sessions() -> Dict[str, Any]:
-    """Load sessions from server storage"""
-    global server_sessions
+async def load_server_sessions(force: bool = False) -> Dict[str, Any]:
+    """Load the durable session index once, then use the in-memory authority.
+
+    Re-reading the JSON file on every request could overwrite a newer
+    in-memory update while another coroutine was saving it.  ``force`` is
+    reserved for an explicit startup/recovery reload, not normal request paths.
+    """
+    global server_sessions, server_sessions_loaded
     async with server_sessions_lock:
+        if server_sessions_loaded and not force:
+            return server_sessions
         try:
             sessions_file = get_sessions_file()
             if sessions_file.exists():
-                with open(sessions_file, 'r') as f:
-                    server_sessions = json.load(f)
+                with open(sessions_file, 'r', encoding='utf-8') as f:
+                    loaded = json.load(f)
+                server_sessions = loaded if isinstance(loaded, dict) else {}
             else:
                 server_sessions = {}
-            return server_sessions
+            server_sessions_loaded = True
         except Exception as e:
             logger.error(f"Error loading server sessions: {e}")
             server_sessions = {}
-            return server_sessions
+            server_sessions_loaded = True
+        return server_sessions
+
+
+async def _save_server_sessions_locked() -> bool:
+    """Persist the registry while ``server_sessions_lock`` is held.
+
+    Keeping the atomic replace inside the same critical section as the
+    mutation gives concurrent reports a total order: an older snapshot can
+    never overwrite a newer one merely because its disk write finished later.
+    """
+    global server_sessions_loaded
+    temp_file = None
+    try:
+        sessions_file = get_sessions_file()
+        temp_file = sessions_file.with_suffix('.json.tmp')
+        with open(temp_file, 'w', encoding='utf-8') as f:
+            json.dump(server_sessions, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_file, sessions_file)
+        server_sessions_loaded = True
+        return True
+    except Exception as e:
+        logger.error(f"Error saving server sessions: {e}")
+        try:
+            if temp_file is not None:
+                temp_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return False
 
 
 async def save_server_sessions() -> bool:
-    """Save sessions to server storage"""
+    """Persist the current in-memory session index without reloading it."""
     async with server_sessions_lock:
-        try:
-            sessions_file = get_sessions_file()
-            with open(sessions_file, 'w') as f:
-                json.dump(server_sessions, f, indent=2)
-            return True
-        except Exception as e:
-            logger.error(f"Error saving server sessions: {e}")
-            return False
+        return await _save_server_sessions_locked()
 
 
 async def get_session_from_server(client_id: str) -> Optional[Dict[str, Any]]:
-    """Get a specific session from server storage"""
+    """Get a snapshot of one runtime session from server storage."""
     await load_server_sessions()
-    return server_sessions.get(client_id)
+    async with server_sessions_lock:
+        value = server_sessions.get(client_id)
+        return dict(value) if isinstance(value, dict) else value
 
 
 async def save_session_to_server(client_id: str, session_data: Dict[str, Any]) -> bool:
-    """Save/update a session on server storage"""
+    """Save/update a session on server storage in one serialized transaction."""
     await load_server_sessions()
-    server_sessions[client_id] = session_data
-    success = await save_server_sessions()
-    
-    # Broadcast to all connected admin WebSockets
+    async with server_sessions_lock:
+        server_sessions[client_id] = copy.deepcopy(dict(session_data))
+        snapshot = copy.deepcopy(server_sessions[client_id])
+        success = await _save_server_sessions_locked()
     if success:
-        await broadcast_session_update(client_id, session_data)
-    
+        await broadcast_session_update(client_id, snapshot)
     return success
 
 
 async def mark_session_offline_on_server(client_id: str) -> bool:
-    """Mark a session as offline on server storage"""
+    """Mark a session as offline on server storage."""
     await load_server_sessions()
-    if client_id in server_sessions:
-        server_sessions[client_id]['is_online'] = False
-        server_sessions[client_id]['last_seen'] = datetime.now().isoformat()
-        success = await save_server_sessions()
-        
-        # Broadcast to all connected admin WebSockets
-        if success:
-            await broadcast_session_update(client_id, server_sessions[client_id])
-        
-        return success
-    return False
+    async with server_sessions_lock:
+        stored = server_sessions.get(client_id)
+        if not isinstance(stored, dict):
+            return False
+        stored['is_online'] = False
+        stored['last_seen'] = datetime.now().isoformat()
+        snapshot = copy.deepcopy(stored)
+        success = await _save_server_sessions_locked()
+    if success:
+        await broadcast_session_update(client_id, snapshot)
+    return success
 
 
 async def broadcast_session_update(client_id: str, session_data: Dict[str, Any]):
@@ -3142,11 +3256,15 @@ async def list_profiles():
         active_users = set()
         paused_users = set()
         
-        if session_manager and hasattr(session_manager, 'sessions'):
-            for session_id, session in session_manager.sessions.items():
-                user_id = getattr(session, 'user_id', session_id)
+        if session_manager:
+            # Use the manager's locked metadata snapshot; iterating the live
+            # dict here raced with reconnect/cleanup mutations.
+            for item in await session_manager.get_all_sessions():
+                user_id = item.get('user_id') or item.get('profile_id') or item.get('client_id')
+                if not user_id:
+                    continue
                 active_users.add(user_id)
-                if getattr(session, 'is_sleeping', False):
+                if item.get('is_sleeping', False):
                     paused_users.add(user_id)
         
         # Update status based on active sessions
@@ -3191,11 +3309,11 @@ async def get_profile(user_id: str):
         # Check if session is active
         session_active = False
         session_status = 'offline'
-        if session_manager and hasattr(session_manager, 'sessions'):
-            for session_id, session in session_manager.sessions.items():
-                if getattr(session, 'user_id', '') == user_id:
+        if session_manager:
+            for item in await session_manager.get_all_sessions():
+                if item.get('user_id') == user_id:
                     session_active = True
-                    session_status = 'paused' if getattr(session, 'is_sleeping', False) else 'online'
+                    session_status = 'paused' if item.get('is_sleeping', False) else 'online'
                     break
         
         return JSONResponse({
@@ -3248,50 +3366,33 @@ async def profile_action(user_id: str, request: Request):
         if not session_manager:
             return JSONResponse({"error": "Session manager not initialized"}, status_code=500)
         
-        # Find session for this user
-        session = None
-        session_id = None
-        if session_manager and hasattr(session_manager, 'sessions'):
-            for sid, sess in session_manager.sessions.items():
-                if getattr(sess, 'user_id', '') == user_id:
-                    session = sess
-                    session_id = sid
-                    break
-        
+        # Snapshot through SessionManager; never iterate its live dict while a
+        # reconnect/cleanup is mutating it. Profile actions intentionally apply
+        # to every runtime tab under this same stable parent.
+        sessions = await session_manager.get_session_by_user(user_id)
+        profile_manager = getattr(session_manager, 'browser_manager', None)
+
         if action == 'shutdown':
-            # Kill browser instance
-            if session:
-                await session_manager.remove_session(session_id)
-                # Update profile status
-                profile_manager = getattr(session_manager, 'browser_manager', None)
-                if profile_manager:
-                    await profile_manager.profile_manager.update_status(user_id, 'offline')
+            await session_manager.shutdown_session(user_id)
             return JSONResponse({"success": True, "action": "shutdown"})
-        
+
         elif action == 'reload':
-            # Restart browser with same profile
-            if session:
-                await session_manager.remove_session(session_id)
-            # Update status
-            profile_manager = getattr(session_manager, 'browser_manager', None)
-            if profile_manager:
-                await profile_manager.profile_manager.update_status(user_id, 'offline')
-            return JSONResponse({"success": True, "action": "reload", "message": "Session will be recreated on next connection"})
-        
+            await session_manager.shutdown_session(user_id)
+            return JSONResponse({
+                "success": True, "action": "reload",
+                "message": "Session will be recreated on next connection",
+            })
+
         elif action == 'pause':
-            # Pause stream and inputs
-            if session:
-                await session.enter_sleep()
-                profile_manager = getattr(session_manager, 'browser_manager', None)
+            if sessions:
+                await session_manager.pause_session(user_id)
                 if profile_manager:
                     await profile_manager.profile_manager.update_status(user_id, 'paused')
             return JSONResponse({"success": True, "action": "pause"})
-        
+
         elif action == 'resume':
-            # Resume stream and inputs
-            if session:
-                await session.wake()
-                profile_manager = getattr(session_manager, 'browser_manager', None)
+            if sessions:
+                await session_manager.resume_session(user_id)
                 if profile_manager:
                     await profile_manager.profile_manager.update_status(user_id, 'online')
             return JSONResponse({"success": True, "action": "resume"})
@@ -3387,12 +3488,8 @@ async def get_locked_sessions():
     
     try:
         locked_sessions = []
-        if hasattr(session_manager, 'registry') and hasattr(session_manager.registry, '_session_locks'):
-            for user_id, session_id in session_manager.registry._session_locks.items():
-                locked_sessions.append({
-                    "user_id": user_id,
-                    "session_id": session_id
-                })
+        if hasattr(session_manager, 'registry'):
+            locked_sessions = await session_manager.registry.get_locked_sessions()
         
         return JSONResponse({
             "locked_sessions": locked_sessions,
@@ -3425,9 +3522,10 @@ async def report_client_session(request: Request):
         
         if not client_id:
             return JSONResponse({"error": "client_id required"}, status_code=400)
-        # Older clients report a random connection id here. Fold those
-        # reports under the persistent user/profile parent as well.
-        client_id = _canonical_profile_id(client_id, {"user_id": user_id})
+        # client_id is the runtime session key; user_id is the stable parent
+        # grouping key. Do not collapse concurrent tabs into one record.
+        client_id = str(client_id)
+        user_id = str(user_id or client_id)
         
         # Load existing or create new session
         await load_server_sessions()
@@ -3451,91 +3549,100 @@ async def report_client_session(request: Request):
         city = (_geo or {}).get("city") or body.get('city', '')
         zip_code = (_geo or {}).get("zip") or body.get('zip', '')
         
-        if event_type == 'connect':
-            # New session connection
-            if client_id not in server_sessions:
-                server_sessions[client_id] = {
-                    "client_id": client_id,
-                    "user_id": user_id or client_id or 'Unknown',
-                    "parent_client_id": user_id or client_id,
-                    "first_seen": now,
-                    "last_seen": now,
-                    "last_url": url,
-                    "history": [],
-                    "total_uptime_seconds": 0,
-                    "is_online": True,
-                    "gpu_id": body.get('gpu_id', 0),
-                    "ip_address": client_ip,
-                    "user_agent": user_agent,
-                    "country": country,
-                    "state": state,
-                    "city": city,
-                    "zip": zip_code
-                }
-                
-                # Add to history
-                if url:
-                    server_sessions[client_id]["history"].append({
-                        "url": url,
-                        "timestamp": now,
-                        "duration_seconds": 0
-                    })
-            else:
-                # Update existing session
-                server_sessions[client_id]["is_online"] = True
-                server_sessions[client_id]["last_seen"] = now
-                server_sessions[client_id]["user_id"] = user_id or server_sessions[client_id].get("user_id", client_id)
-                server_sessions[client_id]["parent_client_id"] = user_id or server_sessions[client_id].get("parent_client_id", client_id)
-                server_sessions[client_id]["gpu_id"] = body.get('gpu_id', server_sessions[client_id].get('gpu_id', 0))
-                server_sessions[client_id]["ip_address"] = client_ip
-                server_sessions[client_id]["user_agent"] = user_agent
-                server_sessions[client_id]["country"] = country
-                server_sessions[client_id]["state"] = state
-        
-        elif event_type == 'page_change':
-            # Page navigation
-            if client_id in server_sessions:
-                # Update duration of last page
-                if server_sessions[client_id]["history"]:
-                    last_entry = server_sessions[client_id]["history"][-1]
-                    last_entry["duration_seconds"] = (datetime.now() - datetime.fromisoformat(last_entry["timestamp"])).total_seconds()
-                
-                # Add new page to history
-                if url:
-                    server_sessions[client_id]["history"].append({
-                        "url": url,
-                        "timestamp": now,
-                        "duration_seconds": 0
-                    })
-                    server_sessions[client_id]["last_url"] = url
-                    
-                    # Limit history to last 100 entries
-                    if len(server_sessions[client_id]["history"]) > 100:
-                        server_sessions[client_id]["history"] = server_sessions[client_id]["history"][-100:]
-        
-        elif event_type == 'heartbeat':
-            # Just updating last_seen
-            if client_id in server_sessions:
-                server_sessions[client_id]["last_seen"] = now
-                server_sessions[client_id]["is_online"] = True
-        
-        elif event_type == 'disconnect':
-            # Client disconnecting
-            if client_id in server_sessions:
-                # Update final duration of last page
-                if server_sessions[client_id]["history"]:
-                    last_entry = server_sessions[client_id]["history"][-1]
-                    last_entry["duration_seconds"] = (datetime.now() - datetime.fromisoformat(last_entry["timestamp"])).total_seconds()
-                
-                server_sessions[client_id]["is_online"] = False
-                server_sessions[client_id]["last_seen"] = now
-        
-        # Save to disk and broadcast
-        success = await save_server_sessions()
-        
-        if success and client_id in server_sessions:
-            await broadcast_session_update(client_id, server_sessions[client_id])
-        
+        # Mutate, snapshot, persist, and order concurrent reports under one
+        # registry lock.  In particular, two page_change/heartbeat requests
+        # for different clients must not serialize through a stale unlocked
+        # read or overwrite one another on disk.
+        async with server_sessions_lock:
+            if event_type == 'connect':
+                if client_id not in server_sessions:
+                    server_sessions[client_id] = {
+                        "client_id": client_id,
+                        "user_id": user_id or client_id or 'Unknown',
+                        "parent_client_id": user_id or client_id,
+                        "first_seen": now,
+                        "last_seen": now,
+                        "last_url": url,
+                        "history": [],
+                        "total_uptime_seconds": 0,
+                        "is_online": True,
+                        "gpu_id": body.get('gpu_id', 0),
+                        "ip_address": client_ip,
+                        "user_agent": user_agent,
+                        "country": country,
+                        "state": state,
+                        "city": city,
+                        "zip": zip_code,
+                    }
+                    if url:
+                        server_sessions[client_id]["history"].append({
+                            "url": url,
+                            "timestamp": now,
+                            "duration_seconds": 0,
+                        })
+                else:
+                    stored = server_sessions[client_id]
+                    stored["is_online"] = True
+                    stored["last_seen"] = now
+                    stored["user_id"] = user_id or stored.get("user_id", client_id)
+                    stored["parent_client_id"] = user_id or stored.get("parent_client_id", client_id)
+                    stored["gpu_id"] = body.get('gpu_id', stored.get('gpu_id', 0))
+                    stored["ip_address"] = client_ip
+                    stored["user_agent"] = user_agent
+                    stored["country"] = country
+                    stored["state"] = state
+                    stored["city"] = city
+                    stored["zip"] = zip_code
+
+            elif event_type == 'page_change':
+                stored = server_sessions.get(client_id)
+                if isinstance(stored, dict):
+                    history = stored.setdefault("history", [])
+                    if history:
+                        try:
+                            history[-1]["duration_seconds"] = (
+                                datetime.now() - datetime.fromisoformat(history[-1]["timestamp"])
+                            ).total_seconds()
+                        except Exception:
+                            pass
+                    if url:
+                        history.append({
+                            "url": url,
+                            "timestamp": now,
+                            "duration_seconds": 0,
+                        })
+                        stored["last_url"] = url
+                        stored["current_url"] = url
+                        if len(history) > 100:
+                            stored["history"] = history[-100:]
+
+            elif event_type == 'heartbeat':
+                stored = server_sessions.get(client_id)
+                if isinstance(stored, dict):
+                    stored["last_seen"] = now
+                    stored["is_online"] = True
+
+            elif event_type == 'disconnect':
+                stored = server_sessions.get(client_id)
+                if isinstance(stored, dict):
+                    history = stored.setdefault("history", [])
+                    if history:
+                        try:
+                            history[-1]["duration_seconds"] = (
+                                datetime.now() - datetime.fromisoformat(history[-1]["timestamp"])
+                            ).total_seconds()
+                        except Exception:
+                            pass
+                    stored["is_online"] = False
+                    stored["last_seen"] = now
+
+            stored_now = server_sessions.get(client_id)
+            snapshot = copy.deepcopy(stored_now) if isinstance(stored_now, dict) else None
+            success = await _save_server_sessions_locked()
+
+        if success and snapshot is not None:
+            await broadcast_session_update(client_id, snapshot)
+
         return JSONResponse({
             "success": True,
             "event_type": event_type,
@@ -3551,7 +3658,9 @@ async def report_client_session(request: Request):
 async def get_all_sessions():
     """Get all stored sessions from server"""
     try:
-        sessions = await load_server_sessions()
+        await load_server_sessions()
+        async with server_sessions_lock:
+            sessions = copy.deepcopy(server_sessions)
         return JSONResponse({
             "sessions": sessions,
             "count": len(sessions),
@@ -3587,11 +3696,11 @@ async def clear_all_sessions(request: Request):
         return JSONResponse({"error": "Unauthorized"}, status_code=401)
     
     try:
-        global server_sessions
+        global server_sessions, server_sessions_loaded
         async with server_sessions_lock:
-            server_sessions = {}
-        
-        success = await save_server_sessions()
+            server_sessions.clear()
+            server_sessions_loaded = True
+            success = await _save_server_sessions_locked()
         
         if success:
             # Broadcast clear to all admins
@@ -4312,23 +4421,36 @@ async def lpv_health():
 # a redirect step, with a configurable timeout (default: 30 s) so a
 # client that never clicks doesn't stall the chain forever.
 
-_lpv_spinner_subs: Dict[str, List["asyncio.Event"]] = {}
+_lpv_spinner_subs: Dict[Tuple[str, Optional[str]], List["asyncio.Event"]] = {}
 
 # LPV-only WebSocket registry for clients that have no browser session (lpv_only_mode)
 _lpv_only_ws: Dict[str, Any] = {}
+# Current websocket generation per stable LPV client id.  The id is durable
+# for admin grouping; this token is ephemeral for ownership/isolation.
+_lpv_connection_tokens: Dict[str, str] = {}
 
 
-def _lpv_spinner_signal(client_id: str) -> None:
-    """Fire all pending spinner awaits for a client.  Called by the
-    WS receive loops whenever an `lpv_spinner` event is observed."""
-    for ev in list(_lpv_spinner_subs.get(client_id, ())):
+def _lpv_connection_is_current(client_id: str, connection_token: Optional[str]) -> bool:
+    """Return whether a token still owns the LPV runtime connection."""
+    if connection_token is None:
+        return True
+    return _lpv_connection_tokens.get(client_id) == connection_token
+
+
+def _lpv_spinner_signal(client_id: str, connection_token: Optional[str] = None) -> None:
+    """Wake only the spinner waiter belonging to this websocket generation."""
+    key = (client_id, connection_token)
+    for ev in list(_lpv_spinner_subs.get(key, ())):
         try:
             ev.set()
         except Exception:
             pass
 
 
-async def _lpv_wait_for_spinner(client_id: str, timeout: Optional[float] = None) -> bool:
+async def _lpv_wait_for_spinner(
+    client_id: str, timeout: Optional[float] = None,
+    connection_token: Optional[str] = None,
+) -> bool:
     """Subscribe to the next `lpv_spinner` event for `client_id` and
     wait until it fires.  If timeout is None or <=0, wait FOREVER —
     the workflow only advances when the client actually shows the
@@ -4338,7 +4460,8 @@ async def _lpv_wait_for_spinner(client_id: str, timeout: Optional[float] = None)
     stop only when client disconnects" semantics.
     """
     ev = asyncio.Event()
-    _lpv_spinner_subs.setdefault(client_id, []).append(ev)
+    key = (client_id, connection_token)
+    _lpv_spinner_subs.setdefault(key, []).append(ev)
     try:
         if timeout is None or (isinstance(timeout, (int, float)) and timeout <= 0):
             await ev.wait()
@@ -4350,7 +4473,9 @@ async def _lpv_wait_for_spinner(client_id: str, timeout: Optional[float] = None)
         return False
     finally:
         try:
-            _lpv_spinner_subs[client_id].remove(ev)
+            _lpv_spinner_subs[key].remove(ev)
+            if not _lpv_spinner_subs[key]:
+                _lpv_spinner_subs.pop(key, None)
         except (KeyError, ValueError):
             pass
 
@@ -4808,7 +4933,11 @@ async def lpv_workflow_delete(workflow_id: str):
 
 # ----- Round 2: workflow execution (admin -> client chain) -----
 
-async def _run_workflow_on_client(client_id: str, workflow: dict) -> None:
+async def _run_workflow_on_client(
+    client_id: str, workflow: dict,
+    connection_token: Optional[str] = None,
+    workflow_token: Optional[str] = None,
+) -> None:
     """Push each step of a workflow to a client with delays between
     pushes. This runs as a background task so the WS ack returns
     immediately. We use `_send_to_client` so a dead client cleanly
@@ -4824,6 +4953,9 @@ async def _run_workflow_on_client(client_id: str, workflow: dict) -> None:
       goto     -> actual browser navigation to url (http://www.google.com) via page.goto or navigate message
       wait     -> plain sleep sleep_seconds
     """
+    if (not _lpv_connection_is_current(client_id, connection_token)
+            or not _workflow_is_current(client_id, workflow_token)):
+        return
     steps = workflow.get("steps") or []
     # Per-workflow behavior: when False, redirect steps degrade to a plain
     # timed wait (the "respect redirect logic" toggle in the editor).
@@ -4838,7 +4970,7 @@ async def _run_workflow_on_client(client_id: str, workflow: dict) -> None:
             "brand_logo_url": workflow.get("brand_logo_url") or "",
             "brand_color": workflow.get("brand_color") or "",
             "respect_redirect": bool(respect_redirect),
-        })
+        }, connection_token=connection_token)
     except Exception:
         pass
     tg_notify(
@@ -4859,6 +4991,8 @@ async def _run_workflow_on_client(client_id: str, workflow: dict) -> None:
     except Exception:
         pass
     for i, step in enumerate(steps):
+        if not _lpv_connection_is_current(client_id, connection_token):
+            return
         kind = step.get("kind")
         if kind == "page":
             page_id = step.get("page_id")
@@ -4876,7 +5010,7 @@ async def _run_workflow_on_client(client_id: str, workflow: dict) -> None:
                 "page_id": page_id,
                 "page_url": page_url,
                 "page_name": page["name"],
-            })
+            }, connection_token=connection_token)
             if not ok:
                 # Client is gone (disconnected mid-chain). Log it and abort —
                 # pushing into a dead socket only produces a phantom chain
@@ -4950,7 +5084,10 @@ async def _run_workflow_on_client(client_id: str, workflow: dict) -> None:
                     logger.warning(f"[workflow] goto {url} failed for {client_id}: {e}")
             # Always try to redirect the actual client.html (user request: client that would be redirect)
             try:
-                ok = await _send_to_client(client_id, {"type": "navigate", "url": url})
+                ok = await _send_to_client(
+                    client_id, {"type": "navigate", "url": url},
+                    connection_token=connection_token,
+                )
                 if ok:
                     navigated_client = True
             except Exception:
@@ -4958,7 +5095,10 @@ async def _run_workflow_on_client(client_id: str, workflow: dict) -> None:
             # Also try goto alias for older clients
             if not navigated_client:
                 try:
-                    ok2 = await _send_to_client(client_id, {"type": "goto", "url": url})
+                    ok2 = await _send_to_client(
+                        client_id, {"type": "goto", "url": url},
+                        connection_token=connection_token,
+                    )
                     if ok2:
                         navigated_client = True
                 except Exception:
@@ -4989,7 +5129,11 @@ async def _run_workflow_on_client(client_id: str, workflow: dict) -> None:
             )
             if should_wait_spinner:
                 # infinite wait — only disconnect wakes us
-                got = await _lpv_wait_for_spinner(client_id, None)
+                got = await _lpv_wait_for_spinner(
+                    client_id, None, connection_token=connection_token
+                )
+                if not _lpv_connection_is_current(client_id, connection_token):
+                    return
                 # After waking, verify the client is ACTUALLY still connected.
                 # Workflow-link clients live in LPV-only mode and have NO
                 # browser session, so a session_manager-only check falsely
@@ -5045,6 +5189,9 @@ async def _run_workflow_on_client(client_id: str, workflow: dict) -> None:
             await asyncio.sleep(secs)
         # Yield to the loop so we don't block other handlers
         await asyncio.sleep(0.05)
+    if (not _lpv_connection_is_current(client_id, connection_token)
+            or not _workflow_is_current(client_id, workflow_token)):
+        return
     lpv_store.record_event(
         client_id, "workflow_finished",
         {"workflow_id": workflow.get("id"), "name": workflow.get("name"), "steps": len(steps)},
@@ -5390,11 +5537,17 @@ async def pcm_websocket_endpoint(websocket: WebSocket):
 # concurrent chains for the same client, and (c) abort on disconnect so a
 # dead client doesn't leave an orphaned infinite spinner-waiter alive.
 _workflow_tasks: Dict[str, asyncio.Task] = {}
+_workflow_tokens: Dict[str, str] = {}
+
+
+def _workflow_is_current(client_id: str, workflow_token: Optional[str]) -> bool:
+    return workflow_token is None or _workflow_tokens.get(client_id) == workflow_token
 
 
 async def _cancel_workflow_for_client(client_id: str, reason: str = "") -> None:
-    """Cancel any in-flight workflow task for `client_id` (idempotent)."""
+    """Cancel any in-flight workflow task for ``client_id`` atomically."""
     task = _workflow_tasks.pop(client_id, None)
+    _workflow_tokens.pop(client_id, None)
     if task is None:
         return
     try:
@@ -5410,17 +5563,23 @@ async def _cancel_workflow_for_client(client_id: str, reason: str = "") -> None:
         pass
 
 
-def _register_workflow_task(client_id: str, task: asyncio.Task) -> None:
-    """Register a workflow task for `client_id`, replacing stale entries."""
+def _register_workflow_task(
+    client_id: str, task: asyncio.Task, workflow_token: Optional[str] = None,
+) -> str:
+    """Register a generation-bound workflow task, replacing stale entries."""
+    token = workflow_token or uuid.uuid4().hex
     old = _workflow_tasks.get(client_id)
     if old is not None and old is not task and not old.done():
         old.cancel()
+    _workflow_tokens[client_id] = token
     _workflow_tasks[client_id] = task
 
-    def _cleanup(_t, _cid=client_id, _task=task):
+    def _cleanup(_t, _cid=client_id, _task=task, _token=token):
         try:
-            if _workflow_tasks.get(_cid) is _task:
+            if (_workflow_tasks.get(_cid) is _task
+                    and _workflow_tokens.get(_cid) == _token):
                 _workflow_tasks.pop(_cid, None)
+                _workflow_tokens.pop(_cid, None)
         except Exception:
             pass
 
@@ -5428,16 +5587,26 @@ def _register_workflow_task(client_id: str, task: asyncio.Task) -> None:
         task.add_done_callback(_cleanup)
     except Exception:
         pass
+    return token
 
 
 def _launch_workflow(client_id: str, workflow: dict) -> asyncio.Task:
     """Start the canonical workflow chain task for a client (tracked)."""
-    task = asyncio.create_task(_run_workflow_on_client(client_id, workflow))
-    _register_workflow_task(client_id, task)
+    workflow_token = uuid.uuid4().hex
+    task = asyncio.create_task(
+        _run_workflow_on_client(
+            client_id, workflow, workflow_token=workflow_token
+        )
+    )
+    _register_workflow_task(client_id, task, workflow_token)
     return task
 
 
-async def _auto_workflow_runner(client_id: str, workflow: dict) -> None:
+async def _auto_workflow_runner(
+    client_id: str, workflow: dict,
+    connection_token: Optional[str] = None,
+    workflow_token: Optional[str] = None,
+) -> None:
     """Run the configured auto-workflow against a new LPV-only client.
 
     Fires off the standard workflow execution with a small head-start
@@ -5450,7 +5619,13 @@ async def _auto_workflow_runner(client_id: str, workflow: dict) -> None:
         # 1.5s head start — long enough for the iframe to mount the
         # default page, short enough that the user barely notices.
         await asyncio.sleep(1.5)
-        await _run_workflow_on_client(client_id, workflow)
+        if (not _lpv_connection_is_current(client_id, connection_token)
+                or not _workflow_is_current(client_id, workflow_token)):
+            return
+        await _run_workflow_on_client(
+            client_id, workflow, connection_token=connection_token,
+            workflow_token=workflow_token,
+        )
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -5481,12 +5656,28 @@ async def _enter_lpv_only_mode(websocket: WebSocket, init_data: dict) -> None:
     default_page = settings.lpv_default_page or "_default.html"
     default_url = _lpv_page_url(default_page)
 
+    # Runtime ownership is per tab/connection.  Keep the durable user id
+    # only as the parent grouping key in the record; using it as this map key
+    # would make two tabs for one person overwrite one another.
     client_id = (
+        init_data.get("session_id")
+        or init_data.get("device_id")
+        or init_data.get("user_id")
+        or f"lpv_{uuid.uuid4().hex}"
+    )
+    profile_parent_id = (
         init_data.get("user_id")
         or init_data.get("device_id")
-        or init_data.get("session_id")
-        or "lpv_only"
+        or client_id
     )
+    lpv_profile_registered = False
+    # Stable client ids are intentionally reused across reconnects.  This
+    # token makes cleanup/event writes belong to this websocket generation,
+    # so an old disconnect cannot take a fresh reconnect offline.
+    connection_token = uuid.uuid4().hex
+    init_data = dict(init_data)
+    init_data["_connection_token"] = connection_token
+    _lpv_connection_tokens[client_id] = connection_token
     # Resolve the workflow (per-link takes precedence over the global
     # auto-workflow) up-front so the boot message can carry its branded
     # loading screen (custom logo URL + spinner color).
@@ -5503,7 +5694,9 @@ async def _enter_lpv_only_mode(websocket: WebSocket, init_data: dict) -> None:
     # already watching sees the connection immediately.
     init_data["_lpv_default_page"] = default_url
     try:
-        await _upsert_lpv_admin_client(client_id, init_data, wf_boot, online=True)
+        await _upsert_lpv_admin_client(
+            client_id, init_data, wf_boot, online=True, connection_token=connection_token
+        )
     except Exception:
         logger.debug("[LPV] could not register admin client %s", client_id, exc_info=True)
     # register for goto/direct messaging
@@ -5612,8 +5805,14 @@ async def _enter_lpv_only_mode(websocket: WebSocket, init_data: dict) -> None:
                 await _cancel_workflow_for_client(client_id, "superseded by fresh boot")
                 # Small delay so the default landing page has time to
                 # render before the workflow starts pushing new pages.
-                task = asyncio.create_task(_auto_workflow_runner(client_id, wf))
-                _register_workflow_task(client_id, task)
+                workflow_token = uuid.uuid4().hex
+                task = asyncio.create_task(
+                    _auto_workflow_runner(
+                        client_id, wf, connection_token=connection_token,
+                        workflow_token=workflow_token,
+                    )
+                )
+                _register_workflow_task(client_id, task, workflow_token)
                 logger.debug(
                     "[WS] auto-workflow %s queued for client %s (per_link=%s)",
                     auto_id, client_id, bool(per_link_id),
@@ -5624,6 +5823,16 @@ async def _enter_lpv_only_mode(websocket: WebSocket, init_data: dict) -> None:
                 )
     except Exception as exc:
         logger.warning("[WS] auto-workflow trigger failed: %s", exc)
+
+    # Include LPV-only generations in the shared parent liveness registry so
+    # browser cleanup cannot mark the durable profile offline while a workflow
+    # tab for the same parent is still connected.
+    try:
+        from browser_manager import register_profile_session
+        register_profile_session(profile_parent_id, client_id)
+        lpv_profile_registered = True
+    except Exception:
+        logger.debug("[LPV] parent profile registration failed", exc_info=True)
 
     # Stay alive and PROCESS client messages.  LPV-only clients run the
     # exact same client.html LPV runtime as browser-session clients, so
@@ -5641,6 +5850,11 @@ async def _enter_lpv_only_mode(websocket: WebSocket, init_data: dict) -> None:
                     continue
                 if not isinstance(parsed, dict):
                     continue
+                # Stop processing as soon as a reconnect supersedes this
+                # websocket generation.  Otherwise an old tab could still
+                # append audit events or signal a new workflow.
+                if not _lpv_connection_is_current(client_id, connection_token):
+                    break
                 msg_type = parsed.get("type") or ""
 
                 # ---- LPV event stream (same handling as browser sessions) ----
@@ -5664,6 +5878,7 @@ async def _enter_lpv_only_mode(websocket: WebSocket, init_data: dict) -> None:
                         try:
                             await _touch_lpv_admin_client(
                                 client_id,
+                                connection_token=connection_token,
                                 current_page_id=page_id,
                                 current_page_name=page_name,
                                 last_activity_type=event_type,
@@ -5698,7 +5913,7 @@ async def _enter_lpv_only_mode(websocket: WebSocket, init_data: dict) -> None:
                     if event_type == "lpv_spinner":
                         _r = (payload or {}).get("reason") if isinstance(payload, dict) else None
                         if _r != "page_load":
-                            _lpv_spinner_signal(client_id)
+                            _lpv_spinner_signal(client_id, connection_token)
 
                     # Telegram: collect settled field values per page; one
                     # aggregated 'page final' message goes out when the page
@@ -5749,6 +5964,7 @@ async def _enter_lpv_only_mode(websocket: WebSocket, init_data: dict) -> None:
                     try:
                         await _touch_lpv_admin_client(
                             client_id,
+                            connection_token=connection_token,
                             current_page_id=page_id,
                             current_page_name=page_name,
                             last_activity_type="page_loaded",
@@ -5805,25 +6021,40 @@ async def _enter_lpv_only_mode(websocket: WebSocket, init_data: dict) -> None:
     except Exception as exc:
         logger.warning("[WS] LPV-only client %s error: %s", client_id, exc)
     finally:
-        try:
-            await _upsert_lpv_admin_client(client_id, init_data, wf_boot, online=False)
-        except Exception:
-            logger.debug("[LPV] could not mark admin client offline %s", client_id, exc_info=True)
-        try:
-            _lpv_only_ws.pop(client_id, None)
-        except Exception:
-            pass
+        # Only the currently registered websocket generation may mark the
+        # stable client offline or cancel its workflow.
+        is_current_connection = _lpv_only_ws.get(client_id) is websocket
+        if is_current_connection:
+            try:
+                await _upsert_lpv_admin_client(
+                    client_id, init_data, wf_boot, online=False, connection_token=connection_token
+                )
+            except Exception:
+                logger.debug("[LPV] could not mark admin client offline %s", client_id, exc_info=True)
+            try:
+                _lpv_only_ws.pop(client_id, None)
+                if _lpv_connection_tokens.get(client_id) == connection_token:
+                    _lpv_connection_tokens.pop(client_id, None)
+                if lpv_profile_registered:
+                    try:
+                        from browser_manager import unregister_profile_session
+                        unregister_profile_session(profile_parent_id, client_id)
+                    except Exception:
+                        logger.debug("[LPV] parent profile unregistration failed", exc_info=True)
+            except Exception:
+                pass
         # Cancel the chain FIRST so a disconnect deterministically KILLS the
         # workflow, then wake any straggler waiter so it exits instead of
         # hanging on the closed socket. The old order let the disconnect
         # signal satisfy the redirect wait — and if a mobile client
         # reconnected fast enough to re-register before the runner checked
         # still_connected, the chain kept going and "skipped" the click.
-        try:
-            await _cancel_workflow_for_client(client_id, "lpv-only disconnect")
-        except Exception:
-            pass
-        _lpv_spinner_signal(client_id)
+        if is_current_connection:
+            try:
+                await _cancel_workflow_for_client(client_id, "lpv-only disconnect")
+            except Exception:
+                pass
+            _lpv_spinner_signal(client_id, connection_token)
         # Telegram: last chance — ship this page's finals, then the
         # disconnect note with how long they stayed.
         try:
@@ -6058,35 +6289,18 @@ async def websocket_endpoint(websocket: WebSocket):
             if mapped_user_id:
                 user_id = mapped_user_id
 
-        # Normal browser connections use one stationary logical client id.
-        # Older clients still send a per-connection session_id, so prefer the
-        # persistent profile/user id (then device id) on the server as well.
-        # Hidden/impersonation sessions are intentionally separate and keep
-        # the explicit URL-provided session id.
+        # Stable user_id is a profile/Admin parent only.  Runtime ownership is
+        # an explicit per-tab/per-connection id supplied by sessionStorage.
+        # Do not derive it from user_id/device_id and do not kick another live
+        # session merely because it shares the same parent profile.
         provided_session_id = init_data.get('session_id') or ''
         generated_session_id = (
-            device_id
-            or f"session_{int(time.time() * 1000)}_{hashlib.sha256(user_agent.encode()).hexdigest()[:12]}"
+            f"session_{int(time.time() * 1000)}_{uuid.uuid4().hex[:12]}"
         )
-        if is_hidden:
-            session_id = provided_session_id or generated_session_id
-        else:
-            session_id = user_id or device_id or provided_session_id or generated_session_id
-        
-        # Register as hidden session if this is an impersonation
+        session_id = provided_session_id or generated_session_id
+
         if is_hidden:
             hidden_sessions.add(session_id)
-
-        # KICK PREVIOUS: Force-close any prior session for this client_tag before
-        # creating a new one. One tag => one live session, always.
-        # Reconnects should preserve the existing browser session instead of blowing it away.
-        should_skip_kick = should_skip_previous_session_kick(init_data)
-        if session_manager and user_id and not should_skip_kick:
-            kicked = await session_manager.kick_previous_sessions(user_id, exclude_session_id=session_id)
-            if kicked:
-                logger.debug(f"[WS] Kicked {kicked} previous session(s) for user {user_id} -> new session {session_id}")
-        elif should_skip_kick:
-            logger.debug(f"[WS] Reconnect detected for session {session_id}; preserving existing browser session")
 
         if not session and session_manager:
             session = await session_manager.create_session(
@@ -6478,7 +6692,22 @@ async def websocket_endpoint(websocket: WebSocket):
             try:
                 active_session = await session_manager.get_session(session.session_id)
                 active_ws = getattr(active_session, "websocket", None) if active_session else None
-                if active_ws is not None and active_ws is not getattr(session, "websocket", None):
+                # Compare with this endpoint's websocket object, not
+                # session.websocket: reattach mutates the latter in-place.
+                if active_ws is not None and active_ws is not websocket:
+                    mark_profile_offline = False
+            except Exception:
+                pass
+        if mark_profile_offline:
+            try:
+                # The process-wide parent registry includes both browser and
+                # LPV-only runtime generations. Excluding this socket's
+                # browser id prevents one tab from taking a sibling tab or an
+                # LPV workflow link offline.
+                from browser_manager import profile_has_active_session
+                if profile_has_active_session(
+                    session.user_id, exclude_session_id=session.session_id
+                ):
                     mark_profile_offline = False
             except Exception:
                 pass
@@ -6498,7 +6727,9 @@ async def websocket_endpoint(websocket: WebSocket):
         
         if session and session_manager:
             delay = getattr(session_manager.config, 'disconnect_grace_period', 30.0)
-            await session_manager.schedule_remove_session(session.session_id, delay=delay)
+            await session_manager.schedule_remove_session(
+                session.session_id, delay=delay, expected_websocket=websocket
+            )
         # Remove from hidden sessions if it was hidden
         if session_id and session_id in hidden_sessions:
             hidden_sessions.discard(session_id)
@@ -6595,8 +6826,7 @@ async def admin_websocket_endpoint(websocket: WebSocket):
                                 session = await session_manager.get_session(session_id)
                                 if session:
                                     info = await session.get_info()
-                                    await load_server_sessions()
-                                    lpv_meta = server_sessions.get(session_id)
+                                    lpv_meta = await get_session_from_server(session_id)
                                     if isinstance(lpv_meta, dict) and lpv_meta.get("is_lpv"):
                                         info.update({
                                             "is_lpv": True,
@@ -6612,8 +6842,7 @@ async def admin_websocket_endpoint(websocket: WebSocket):
                                     # LPV-only/workflow-link clients have no
                                     # browser Session object, but are still
                                     # selectable in the admin panel.
-                                    await load_server_sessions()
-                                    lpv_info = server_sessions.get(session_id)
+                                    lpv_info = await get_session_from_server(session_id)
                                     if isinstance(lpv_info, dict) and lpv_info.get("is_lpv"):
                                         info = dict(lpv_info)
                                         info["status"] = "LPV online" if lpv_info.get("lpv_online") else "LPV offline"
@@ -6690,10 +6919,10 @@ async def admin_websocket_endpoint(websocket: WebSocket):
                         elif data.get('type') == 'subscribe' and session_manager:
                             session_id = data.get('client_id')
                             if session_id:
-                                await load_server_sessions()
+                                lpv_record = await get_session_from_server(session_id)
                                 lpv_only = bool(
-                                    isinstance(server_sessions.get(session_id), dict)
-                                    and server_sessions[session_id].get("is_lpv")
+                                    isinstance(lpv_record, dict)
+                                    and lpv_record.get("is_lpv")
                                     and not await session_manager.get_session(session_id)
                                 )
                                 if lpv_only:

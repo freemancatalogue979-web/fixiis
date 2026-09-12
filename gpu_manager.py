@@ -9,6 +9,7 @@ import psutil
 import subprocess
 import time
 import logging
+import threading
 import platform
 from typing import Tuple, Dict, Optional
 
@@ -30,6 +31,11 @@ class GPUManager:
     def __init__(self, config):
         self.config = config
         self.sessions: Dict[str, int] = {}  # session_id -> start_time
+        self._reserved_sessions: Dict[str, float] = {}
+        # Runtime profile ownership lets orphan cleanup distinguish this
+        # process's browser trees from unrelated Chrome installations.
+        self._runtime_profiles: Dict[str, str] = {}
+        self._sessions_lock = threading.RLock()
         self.max_sessions = getattr(config, 'max_sessions', 20)
         self.min_free_memory_mb = int(os.environ.get('MIN_FREE_MEMORY_MB', 56 if is_windows() else 512))
         self.min_free_disk_gb = 2  # Minimum free disk space required
@@ -38,20 +44,67 @@ class GPUManager:
         """Return dummy GPU ID (no GPU needed)"""
         return 0
 
-    def register_session(self, session_id: str, gpu_id: int):
-        """Register a new session"""
-        self.sessions[session_id] = time.time()
-        logger.debug(f"Registered session {session_id}, total: {len(self.sessions)}")
+    def reserve_session(self, session_id: str, gpu_id: int = 0) -> Tuple[bool, str]:
+        """Atomically reserve capacity before slow browser startup."""
+        with self._sessions_lock:
+            if session_id in self.sessions:
+                return True, "already active"
+            if session_id in self._reserved_sessions:
+                return True, "already reserved"
+            if len(self.sessions) + len(self._reserved_sessions) >= self.max_sessions:
+                return False, f"Max sessions reached ({self.max_sessions})"
+            memory_info = self._get_memory_info()
+            if memory_info['available_mb'] < self.min_free_memory_mb:
+                return False, (
+                    f"Low memory ({memory_info['available_mb']:.0f}MB available, "
+                    f"need {self.min_free_memory_mb}MB)"
+                )
+            disk_info = self._get_disk_info()
+            if disk_info['free_gb'] < self.min_free_disk_gb:
+                return False, f"Low disk space ({disk_info['free_gb']:.1f}GB free)"
+            self._reserved_sessions[session_id] = time.time()
+            logger.debug("Reserved resources for session %s (active=%s reserved=%s)",
+                         session_id, len(self.sessions), len(self._reserved_sessions))
+            return True, "Resources reserved"
 
-    def unregister_session(self, session_id: str, gpu_id: int):
-        """Unregister a session"""
-        if session_id in self.sessions:
-            del self.sessions[session_id]
-            logger.debug(f"Unregistered session {session_id}, remaining: {len(self.sessions)}")
+    def release_session_reservation(self, session_id: str) -> bool:
+        with self._sessions_lock:
+            return self._reserved_sessions.pop(session_id, None) is not None
+
+    def register_session(self, session_id: str, gpu_id: int):
+        """Commit a reservation as an active session; idempotent."""
+        with self._sessions_lock:
+            self._reserved_sessions.pop(session_id, None)
+            self.sessions[session_id] = time.time()
+            logger.debug(f"Registered session {session_id}, total: {len(self.sessions)}")
+
+    def unregister_session(self, session_id: str, gpu_id: int = 0):
+        """Release active state and any outstanding reservation exactly once."""
+        with self._sessions_lock:
+            was_active = self.sessions.pop(session_id, None) is not None
+            was_reserved = self._reserved_sessions.pop(session_id, None) is not None
+            if was_active or was_reserved:
+                logger.debug(f"Unregistered session {session_id}, remaining: {len(self.sessions)}")
+            return was_active or was_reserved
+
+    def register_runtime_profile(self, session_id: str, profile_dir: str) -> None:
+        if not session_id or not profile_dir:
+            return
+        with self._sessions_lock:
+            self._runtime_profiles[str(session_id)] = os.path.realpath(str(profile_dir))
+
+    def unregister_runtime_profile(self, session_id: str) -> None:
+        with self._sessions_lock:
+            self._runtime_profiles.pop(str(session_id), None)
+
+    def get_active_runtime_profiles(self) -> set:
+        with self._sessions_lock:
+            return set(self._runtime_profiles.values())
 
     def get_active_session_count(self) -> int:
         """Get count of active sessions"""
-        return len(self.sessions)
+        with self._sessions_lock:
+            return len(self.sessions)
 
     def get_status(self) -> dict:
         """Get comprehensive system status"""
@@ -63,7 +116,7 @@ class GPUManager:
             'type': 'none',
             'count': 0,
             'encoder_type': 'png_screencast',
-            'active_sessions': len(self.sessions),
+            'active_sessions': self.get_active_session_count(),
             'max_sessions': self.max_sessions,
             'memory_available_mb': memory_info['available_mb'],
             'memory_used_percent': memory_info['used_percent'],
@@ -152,8 +205,10 @@ class GPUManager:
             return False
         
         # Check session count
-        if len(self.sessions) >= self.max_sessions:
-            logger.warning(f"Max sessions reached: {len(self.sessions)}/{self.max_sessions}")
+        with self._sessions_lock:
+            _session_total = len(self.sessions) + len(self._reserved_sessions)
+        if _session_total >= self.max_sessions:
+            logger.warning(f"Max sessions reached: {_session_total}/{self.max_sessions}")
             return False
         
         return True
@@ -167,8 +222,10 @@ class GPUManager:
         disk_info = self._get_disk_info()
         chrome_count = self._get_chrome_process_count()
         
-        # Check session limit
-        if len(self.sessions) >= self.max_sessions:
+        # Check session limit including startup reservations.
+        with self._sessions_lock:
+            _session_total = len(self.sessions) + len(self._reserved_sessions)
+        if _session_total >= self.max_sessions:
             return False, f"Max sessions reached ({self.max_sessions})"
         
         # Check memory using available memory instead of free memory for Windows compatibility
@@ -185,142 +242,74 @@ class GPUManager:
         return True, "Resources available"
 
     def cleanup_orphaned_chrome_processes(self) -> int:
+        """Kill only stale browsers in this app's private runtime tree.
+
+        A process named Chrome is not evidence that this service owns it.  The
+        old implementation scanned every Chrome process and killed anything
+        whose parent looked orphaned, which could terminate a user's personal
+        browser or another tenant's session.  Runtime browsers use
+        ``<profile_base_path>/.runtime_sessions/...``; exact profile matching
+        plus the in-process ownership registry keeps cleanup scoped.
         """
-        Cleanup orphaned Chrome processes that are not associated with active sessions.
-        Returns number of processes killed.
-        """
-        killed = 0
+        if not is_linux() and not is_windows():
+            return 0
         try:
-            if is_windows():
-                # Windows: Use tasklist to find chrome processes
-                result = subprocess.run(
-                    ['tasklist', '/FI', 'IMAGENAME eq chrome.exe', '/FO', 'CSV', '/NH'],
-                    capture_output=True,
-                    text=True
+            root = (
+                os.path.realpath(
+                    os.path.join(
+                        str(getattr(self.config, 'profile_base_path', '')),
+                        '.runtime_sessions',
+                    )
                 )
-                if result.returncode != 0:
-                    return 0
-                
-                for line in result.stdout.strip().split('\n'):
-                    if not line or 'chrome.exe' not in line.lower():
+                if getattr(self.config, 'profile_base_path', None)
+                else ''
+            )
+            if not root or not os.path.isdir(root):
+                return 0
+            active_profiles = self.get_active_runtime_profiles()
+            killed = 0
+
+            def profile_arg(args):
+                for index, arg in enumerate(args):
+                    if arg == '--user-data-dir' and index + 1 < len(args):
+                        return args[index + 1]
+                    if arg.startswith('--user-data-dir='):
+                        return arg.split('=', 1)[1]
+                return None
+
+            for proc in psutil.process_iter(['pid', 'cmdline']):
+                try:
+                    args = [str(part) for part in (proc.info.get('cmdline') or [])]
+                    profile = profile_arg(args)
+                    if not profile:
                         continue
-                    try:
-                        # Parse CSV format: "chrome.exe","1234","Console","1"...
-                        parts = line.split(',')
-                        if len(parts) >= 2:
-                            pid = int(parts[1].strip('"'))
-                            proc = psutil.Process(pid)
-                            
-                            # Skip if process is zombie
-                            if proc.status() == psutil.STATUS_ZOMBIE:
-                                logger.debug(f"Killing zombie Chrome process {pid}")
-                                proc.kill()
-                                killed += 1
-                                continue
-                            
-                            # Check parent process
-                            try:
-                                parent = proc.parent()
-                                if parent is None or parent.pid in [0, 1]:
-                                    logger.debug(f"Killing orphaned Chrome process {pid}")
-                                    proc.kill()
-                                    killed += 1
-                            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                                logger.debug(f"Killing unresponsive Chrome process {pid}")
-                                proc.kill()
-                                killed += 1
-                    except (ValueError, psutil.NoSuchProcess, psutil.AccessDenied):
+                    profile = os.path.realpath(profile)
+                    # Only descendants of our private runtime root are
+                    # eligible.  Stable user profiles and personal Chrome are
+                    # never touched.
+                    if not (profile == root or profile.startswith(root + os.sep)):
                         continue
-                    except Exception as e:
-                        logger.debug(f"Error checking process: {e}")
-            else:
-                # Linux: Use pgrep
-                result = subprocess.run(
-                    ['pgrep', '-f', 'chrome'],
-                    capture_output=True,
-                    text=True
-                )
-                if result.returncode != 0:
-                    return 0
-                
-                pids = result.stdout.strip().split('\n')
-                for pid in pids:
-                    if not pid:
+                    if profile in active_profiles:
                         continue
-                    try:
-                        # Check if process is a zombie or has no parent
-                        proc = psutil.Process(int(pid))
-                        
-                        # Skip if process is defunct/zombie
-                        if proc.status() == psutil.STATUS_ZOMBIE:
-                            logger.debug(f"Killing zombie Chrome process {pid}")
-                            proc.kill()
-                            killed += 1
-                            continue
-                        
-                        # Check parent process - if parent is gone or is init/system, kill it
-                        try:
-                            parent = proc.parent()
-                            if parent is None or parent.pid in [1, 0]:
-                                logger.debug(f"Killing orphaned Chrome process {pid}")
-                                proc.kill()
-                                killed += 1
-                        except (psutil.NoSuchProcess, psutil.AccessDenied):
-                            logger.debug(f"Killing unresponsive Chrome process {pid}")
-                            proc.kill()
-                            killed += 1
-                            
-                    except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
-                        # Process already gone
-                        continue
-                    except Exception as e:
-                        logger.debug(f"Error checking process {pid}: {e}")
-                    
+                    proc.kill()
+                    killed += 1
+                    logger.debug("Killed stale owned Chrome PID %s (profile=%s)", proc.pid, profile)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+                except Exception:
+                    logger.debug("Error checking runtime browser process", exc_info=True)
+            return killed
         except Exception as e:
-            logger.error(f"Error during Chrome cleanup: {e}")
-        
-        if killed > 0:
-            logger.debug(f"Cleaned up {killed} orphaned Chrome processes")
-        
-        return killed
+            logger.error("Error during scoped Chrome cleanup: %s", e)
+            return 0
 
     def force_cleanup_all_chrome(self) -> int:
-        """Force kill ALL Chrome processes. Returns count killed."""
-        killed = 0
-        try:
-            if is_windows():
-                # Windows: Use taskkill
-                for pattern in ['chrome.exe', 'chromium.exe']:
-                    result = subprocess.run(
-                        ['taskkill', '/F', '/IM', pattern],
-                        capture_output=True,
-                        text=True
-                    )
-                    # Count processes killed
-                    if result.returncode == 0:
-                        # taskkill reports "SUCCESS:" in output
-                        if 'SUCCESS' in result.stdout:
-                            killed += 1
-            else:
-                # Linux: Use pkill
-                for pattern in ['chrome', 'chromium', 'chrome-linux', 'headless_shell']:
-                    result = subprocess.run(
-                        ['pkill', '-9', '-f', pattern],
-                        capture_output=True,
-                        text=True
-                    )
-                    # pkill returns 1 if no processes found, which is fine
-                    if result.returncode in [0, 1]:
-                        # Count killed processes
-                        count_result = subprocess.run(
-                            ['pgrep', '-c', '-f', pattern],
-                            capture_output=True,
-                            text=True
-                        )
-                        if count_result.returncode == 0:
-                            killed += int(count_result.stdout.strip())
-                        
-        except Exception as e:
-            logger.error(f"Error during force cleanup: {e}")
-        
-        return killed
+        """Deprecated compatibility hook; never kill global Chrome processes.
+
+        Cleanup is intentionally restricted to exact private runtime profiles
+        owned by this service instance.
+        """
+        logger.warning(
+            "Ignoring global Chrome cleanup request; global process termination is disabled"
+        )
+        return 0

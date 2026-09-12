@@ -51,100 +51,77 @@ class SessionStats:
 
 
 class SessionRegistry:
-    """
-    V7 Session Registry - WITH SESSION LOCKING
-    Enforces that each user_id can only have ONE active session at a time.
-    Uses PER-USER locks to allow concurrent operations on different users.
+    """Race-safe registry for session metadata and explicit admin locks.
+
+    The registry is deliberately *not* a singleton enforcer. A stable
+    profile/user id is a parent identity used for Admin grouping; it is not a
+    browser resource key. Multiple runtime sessions may therefore belong to
+    the same profile. ``_session_locks`` is reserved for an explicit Admin
+    lock operation and is never populated as a side effect of normal session
+    creation.
     """
 
     def __init__(self):
-        self._sessions: Dict[str, Dict] = {}  # session_id -> session_data
-        self._profile_sessions: Dict[str, List[str]] = {}  # profile_id -> [session_ids]
-        self._websocket_sessions: Dict[str, str] = {}  # websocket_id -> session_id
-        self._session_locks: Dict[str, str] = {}  # user_id -> session_id (locked sessions)
-        # PER-USER LOCKS: Allows concurrent operations on different users
-        self._user_locks: Dict[str, asyncio.Lock] = {}  # Per-user locks
-        self._locks_lock = asyncio.Lock()  # Lock for managing the locks dictionary
+        self._sessions: Dict[str, Dict] = {}
+        self._profile_sessions: Dict[str, List[str]] = {}
+        self._websocket_sessions: Dict[str, str] = {}
+        self._session_locks: Dict[str, str] = {}
+        self._registry_lock = asyncio.Lock()
         self._cleanup_task = None
 
-    async def _get_user_lock(self, user_id: str) -> asyncio.Lock:
-        """Get or create a per-user lock"""
-        async with self._locks_lock:
-            if user_id not in self._user_locks:
-                self._user_locks[user_id] = asyncio.Lock()
-            return self._user_locks[user_id]
-
-    async def _release_user_lock(self, user_id: str):
-        """Remove a user lock when no longer needed"""
-        async with self._locks_lock:
-            if user_id in self._user_locks:
-                del self._user_locks[user_id]
-
     async def start(self):
-        """Start the cleanup task"""
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
 
     async def stop(self):
-        """Stop the cleanup task"""
-        if self._cleanup_task:
-            self._cleanup_task.cancel()
+        task = self._cleanup_task
+        self._cleanup_task = None
+        if task:
+            task.cancel()
             try:
-                await self._cleanup_task
+                await task
             except asyncio.CancelledError:
                 pass
 
     async def is_session_locked(self, user_id: str) -> bool:
-        """Check if a user_id has a locked session"""
-        return user_id in self._session_locks
+        async with self._registry_lock:
+            return user_id in self._session_locks
 
     async def get_locked_session_id(self, user_id: str) -> Optional[str]:
-        """Get the session_id that is locked for this user_id"""
-        return self._session_locks.get(user_id)
+        async with self._registry_lock:
+            return self._session_locks.get(user_id)
 
     async def lock_session(self, session_id: str, user_id: str) -> bool:
-        """
-        Lock a session for a user_id.
-        Returns True if successfully locked, False if already locked by another session.
-        Uses per-user lock to allow concurrent lock operations on different users.
-        """
-        user_lock = await self._get_user_lock(user_id)
-        async with user_lock:
-            # Check if user_id already has a locked session
-            if user_id in self._session_locks:
-                existing_session_id = self._session_locks[user_id]
-                if existing_session_id != session_id:
-                    # Already locked by another session
-                    return False
-
-            # Lock this session for the user_id
+        """Set an explicit Admin lock for ``user_id``."""
+        if not user_id:
+            return False
+        async with self._registry_lock:
+            existing = self._session_locks.get(user_id)
+            if existing and existing != session_id:
+                return False
             self._session_locks[user_id] = session_id
             return True
 
     async def unlock_session(self, user_id: str) -> bool:
-        """Unlock a session for a user_id (called when session closes)"""
-        user_lock = await self._get_user_lock(user_id)
-        async with user_lock:
-            if user_id in self._session_locks:
-                del self._session_locks[user_id]
-                return True
-            return False
+        async with self._registry_lock:
+            return self._session_locks.pop(user_id, None) is not None
+
+    async def get_locked_sessions(self) -> List[Dict]:
+        async with self._registry_lock:
+            return [
+                {'user_id': user_id, 'session_id': session_id}
+                for user_id, session_id in self._session_locks.items()
+            ]
 
     async def create_session(self, session_id: str, profile_id: str, websocket_id: str,
-                            metadata: Optional[Dict] = None) -> Optional[Dict]:
-        """
-        Create a new session WITH singleton enforcement (session locking).
-        Only ONE session can be active per user_id at a time.
-        Uses per-user lock for better concurrency.
-        """
-        user_lock = await self._get_user_lock(profile_id)
-        async with user_lock:
-            # Check if this user_id already has a locked session
-            if profile_id in self._session_locks:
-                existing_session_id = self._session_locks[profile_id]
-                if existing_session_id != session_id:
-                    # Session is already locked by another session_id - return None to prevent creation
-                    return None
-
+                             metadata: Optional[Dict] = None) -> Optional[Dict]:
+        """Register metadata without enforcing one session per profile."""
+        async with self._registry_lock:
+            locked_by = self._session_locks.get(profile_id)
+            if locked_by and locked_by != session_id:
+                return None
+            existing = self._sessions.get(session_id)
+            if existing is not None:
+                return dict(existing)
             session_data = {
                 'session_id': session_id,
                 'profile_id': profile_id,
@@ -152,166 +129,170 @@ class SessionRegistry:
                 'created_at': time.time(),
                 'last_active': time.time(),
                 'is_active': True,
-                'metadata': metadata or {}
+                'metadata': metadata or {},
             }
-
             self._sessions[session_id] = session_data
+            self._profile_sessions.setdefault(profile_id, []).append(session_id)
+            if websocket_id:
+                self._websocket_sessions[websocket_id] = session_id
+            return dict(session_data)
 
-            # Add to profile sessions list
-            if profile_id not in self._profile_sessions:
-                self._profile_sessions[profile_id] = []
-            self._profile_sessions[profile_id].append(session_id)
-
-            # Map websocket to session
-            self._websocket_sessions[websocket_id] = session_id
-
-            # Lock this session for the user_id
-            self._session_locks[profile_id] = session_id
-
-            return session_data
-    
-    async def get_session(self, session_id: str) -> Optional[Dict]:
-        """Get session by ID"""
-        return self._sessions.get(session_id)
-    
-    async def get_session_by_websocket(self, websocket_id: str) -> Optional[Dict]:
-        """Get session by websocket ID"""
-        session_id = self._websocket_sessions.get(websocket_id)
-        if session_id:
-            return await self.get_session(session_id)
-        return None
-    
-    async def get_profile_sessions(self, profile_id: str) -> List[Dict]:
-        """Get ALL sessions for a specific profile (no longer just the active one)"""
-        session_ids = self._profile_sessions.get(profile_id, [])
-        sessions = []
-        for session_id in session_ids:
-            session = self._sessions.get(session_id)
-            if session:
-                sessions.append(session)
-        return sessions
-    
-    async def update_activity(self, session_id: str):
-        """Update last active timestamp"""
-        session = self._sessions.get(session_id)
-        if session:
-            session['last_active'] = time.time()
-    
-    async def close_session(self, session_id: str) -> bool:
-        """Close and remove a session, and unlock the user_id"""
-        session = self._sessions.pop(session_id, None)
-        if session:
-            profile_id = session.get('profile_id')
-            
-            # Use per-user lock for cleanup
-            if profile_id:
-                user_lock = await self._get_user_lock(profile_id)
-                async with user_lock:
-                    # Remove from profile sessions list
-                    if profile_id in self._profile_sessions:
-                        try:
-                            self._profile_sessions[profile_id].remove(session_id)
-                            if not self._profile_sessions[profile_id]:
-                                del self._profile_sessions[profile_id]
-                        except ValueError:
-                            pass
-
-                    # Unlock the session for this user_id
-                    if profile_id in self._session_locks:
-                        if self._session_locks[profile_id] == session_id:
-                            del self._session_locks[profile_id]
-
-            # Remove websocket mapping (needs global lock as it affects _websocket_sessions)
-            self._websocket_sessions.pop(session.get('websocket_id'), None)
-
-            session['is_active'] = False
+    async def reattach_session(self, session_id: str, websocket_id: str) -> bool:
+        """Update the websocket generation for an existing runtime session."""
+        async with self._registry_lock:
+            value = self._sessions.get(session_id)
+            if not value:
+                return False
+            old_websocket_id = value.get('websocket_id')
+            if old_websocket_id:
+                self._websocket_sessions.pop(old_websocket_id, None)
+            value['websocket_id'] = websocket_id
+            value['last_active'] = time.time()
+            if websocket_id:
+                self._websocket_sessions[websocket_id] = session_id
             return True
-        return False
-    
+
+    async def get_session(self, session_id: str) -> Optional[Dict]:
+        async with self._registry_lock:
+            value = self._sessions.get(session_id)
+            return dict(value) if value else None
+
+    async def get_session_by_websocket(self, websocket_id: str) -> Optional[Dict]:
+        async with self._registry_lock:
+            session_id = self._websocket_sessions.get(websocket_id)
+            value = self._sessions.get(session_id) if session_id else None
+            return dict(value) if value else None
+
+    async def get_profile_sessions(self, profile_id: str) -> List[Dict]:
+        async with self._registry_lock:
+            return [
+                dict(self._sessions[sid])
+                for sid in tuple(self._profile_sessions.get(profile_id, ()))
+                if sid in self._sessions
+            ]
+
+    async def update_activity(self, session_id: str):
+        async with self._registry_lock:
+            value = self._sessions.get(session_id)
+            if value:
+                value['last_active'] = time.time()
+
+    async def close_session(self, session_id: str) -> bool:
+        """Remove a runtime session but preserve explicit Admin locks."""
+        async with self._registry_lock:
+            value = self._sessions.pop(session_id, None)
+            if not value:
+                return False
+            profile_id = value.get('profile_id')
+            if profile_id in self._profile_sessions:
+                ids = self._profile_sessions[profile_id]
+                try:
+                    ids.remove(session_id)
+                except ValueError:
+                    pass
+                if not ids:
+                    self._profile_sessions.pop(profile_id, None)
+            websocket_id = value.get('websocket_id')
+            if websocket_id:
+                self._websocket_sessions.pop(websocket_id, None)
+            value['is_active'] = False
+            return True
+
     async def close_websocket_session(self, websocket_id: str) -> bool:
-        """Close session by websocket ID"""
-        session_id = self._websocket_sessions.get(websocket_id)
-        if session_id:
-            return await self.close_session(session_id)
-        return False
-    
+        async with self._registry_lock:
+            session_id = self._websocket_sessions.get(websocket_id)
+        return await self.close_session(session_id) if session_id else False
+
     async def get_active_session_count(self, profile_id: Optional[str] = None) -> int:
-        """Get count of active sessions"""
-        if profile_id:
-            return len(self._profile_sessions.get(profile_id, []))
-        return len(self._sessions)
-    
+        async with self._registry_lock:
+            if profile_id:
+                return sum(1 for sid in self._profile_sessions.get(profile_id, ())
+                           if sid in self._sessions)
+            return len(self._sessions)
+
     async def get_all_sessions(self) -> List[Dict]:
-        """Get all active sessions"""
-        return list(self._sessions.values())
-    
+        async with self._registry_lock:
+            return [dict(value) for value in self._sessions.values()]
+
     async def _cleanup_loop(self):
-        """Periodically cleanup inactive sessions - OPTIMIZED for less overhead"""
         while True:
             try:
-                await asyncio.sleep(120)  # Increased from 60s to 120s - less CPU usage
+                await asyncio.sleep(120)
                 await self._cleanup_dead_sessions()
             except asyncio.CancelledError:
                 break
-            except Exception as e:
-                logger.error(f"[Cleanup Error] {e}")
-    
+            except Exception as exc:
+                logger.error("[Registry cleanup error] %s", exc)
+
     async def _cleanup_dead_sessions(self):
-        """Remove sessions that haven't been active for too long"""
-        threshold = time.time() - 300  # 5 minutes (cleanup happens after session expires)
-        sessions_to_close = []
-        
-        for session_id, session in self._sessions.items():
-            if not session.get('is_active', True) or session.get('last_active', 0) < threshold:
-                sessions_to_close.append(session_id)
-        
-        for session_id in sessions_to_close:
-            await self.close_session(session_id)
-        
-        if sessions_to_close:
-            pass  # Silent cleanup
+        threshold = time.time() - 300
+        async with self._registry_lock:
+            session_ids = [
+                sid for sid, value in self._sessions.items()
+                if not value.get('is_active', True)
+                or value.get('last_active', 0) < threshold
+            ]
+        if session_ids:
+            await asyncio.gather(*(self.close_session(sid) for sid in session_ids),
+                                 return_exceptions=True)
+
+
+@dataclass
+class _StreamLockSlot:
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    references: int = 0
 
 
 class StreamManager:
-    """
-    V7 Stream Manager - PER-SESSION LOCKS
-    Allows multiple concurrent streams without blocking each other.
-    Uses per-session locks for better concurrency.
-    """
-    
+    """Per-session stream index with race-safe lock-slot lifetime."""
+
     def __init__(self):
-        self._active_streams: Dict[str, str] = {}  # session_id -> status
-        self._stream_locks: Dict[str, asyncio.Lock] = {}  # Per-session locks
-        self._locks_lock = asyncio.Lock()  # Lock for managing locks dictionary
-    
-    async def _get_stream_lock(self, session_id: str) -> asyncio.Lock:
-        """Get or create a per-session lock"""
+        self._active_streams: Dict[str, str] = {}
+        self._stream_locks: Dict[str, _StreamLockSlot] = {}
+        self._locks_lock = asyncio.Lock()
+
+    async def _acquire_stream_slot(self, session_id: str) -> _StreamLockSlot:
         async with self._locks_lock:
-            if session_id not in self._stream_locks:
-                self._stream_locks[session_id] = asyncio.Lock()
-            return self._stream_locks[session_id]
-    
+            slot = self._stream_locks.get(session_id)
+            if slot is None:
+                slot = _StreamLockSlot()
+                self._stream_locks[session_id] = slot
+            slot.references += 1
+        try:
+            await slot.lock.acquire()
+            return slot
+        except BaseException:
+            await self._release_stream_slot(session_id, slot)
+            raise
+
+    async def _release_stream_slot(self, session_id: str, slot: _StreamLockSlot) -> None:
+        async with self._locks_lock:
+            slot.references = max(0, slot.references - 1)
+            if (slot.references == 0
+                    and session_id not in self._active_streams
+                    and self._stream_locks.get(session_id) is slot):
+                self._stream_locks.pop(session_id, None)
+
     async def register_stream(self, session_id: str) -> None:
-        """Register a new stream (no blocking - multiple streams allowed)"""
-        stream_lock = await self._get_stream_lock(session_id)
-        async with stream_lock:
+        slot = await self._acquire_stream_slot(session_id)
+        try:
             self._active_streams[session_id] = 'active'
-    
+        finally:
+            slot.lock.release()
+            await self._release_stream_slot(session_id, slot)
+
     async def unregister_stream(self, session_id: str) -> None:
-        """Unregister a stream"""
-        stream_lock = await self._get_stream_lock(session_id)
-        async with stream_lock:
+        slot = await self._acquire_stream_slot(session_id)
+        try:
             self._active_streams.pop(session_id, None)
-        # Clean up the lock
-        async with self._locks_lock:
-            self._stream_locks.pop(session_id, None)
-    
+        finally:
+            slot.lock.release()
+            await self._release_stream_slot(session_id, slot)
+
     async def get_active_stream_count(self) -> int:
-        """Get number of active streams"""
         return len(self._active_streams)
-    
+
     async def get_all_active_streams(self) -> List[str]:
-        """Get all active stream session IDs"""
         return list(self._active_streams.keys())
 
 
@@ -335,8 +316,10 @@ class SessionManager:
         # CRITICAL FIX: Per-session locks instead of global lock
         # This allows sessions to operate in parallel without blocking each other
         self._session_locks: Dict[str, asyncio.Lock] = {}
+        self._session_lock_refs: Dict[str, int] = {}
         self._locks_lock = asyncio.Lock()  # Only for managing the locks dict
         self._sessions_lock = asyncio.Lock()  # Only for adding/removing sessions
+        self._pending_session_ids: Set[str] = set()
         self.stats = SessionStats()
         self.cleanup_task = None
         self._reconnect_tokens: Dict[str, Dict] = {}
@@ -349,23 +332,49 @@ class SessionManager:
         self._init_cgroup_manager()
     
     async def _get_session_lock(self, session_id: str) -> asyncio.Lock:
-        """Get or create a per-session lock for independent operations"""
+        """Get a per-session lock and hold one operation reference."""
         async with self._locks_lock:
-            if session_id not in self._session_locks:
-                self._session_locks[session_id] = asyncio.Lock()
-            return self._session_locks[session_id]
-    
-    async def _release_session_lock(self, session_id: str):
-        """Remove a session lock when session is removed"""
-        async with self._locks_lock:
-            self._session_locks.pop(session_id, None)
+            lock = self._session_locks.get(session_id)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._session_locks[session_id] = lock
+            self._session_lock_refs[session_id] = self._session_lock_refs.get(session_id, 0) + 1
+            return lock
 
-    async def schedule_remove_session(self, session_id: str, delay: float = 30.0, force: bool = False):
-        """Schedule delayed session removal to allow quick reconnects."""
+    async def _release_session_lock(self, session_id: str):
+        """Release one operation reference and reap an unused lock."""
+        async with self._locks_lock:
+            refs = max(0, self._session_lock_refs.get(session_id, 0) - 1)
+            if refs:
+                self._session_lock_refs[session_id] = refs
+                return
+            self._session_lock_refs.pop(session_id, None)
+            if session_id not in self.sessions and session_id not in self._pending_session_ids:
+                self._session_locks.pop(session_id, None)
+
+    def _session_operation(self, session_id: str):
+        from contextlib import asynccontextmanager
+
+        @asynccontextmanager
+        async def _operation():
+            lock = await self._get_session_lock(session_id)
+            try:
+                async with lock:
+                    yield
+            finally:
+                await self._release_session_lock(session_id)
+
+        return _operation()
+
+    async def schedule_remove_session(self, session_id: str, delay: float = 30.0,
+                                      force: bool = False, expected_websocket=None):
+        """Schedule removal owned by one websocket generation."""
         async with self._pending_remove_lock:
             if session_id in self._pending_remove_tasks:
                 return
-            task = asyncio.create_task(self._delayed_remove_session(session_id, delay, force))
+            task = asyncio.create_task(
+                self._delayed_remove_session(session_id, delay, force, expected_websocket)
+            )
             self._pending_remove_tasks[session_id] = task
 
     async def cancel_scheduled_removal(self, session_id: str):
@@ -379,12 +388,15 @@ class SessionManager:
             except asyncio.CancelledError:
                 pass
 
-    async def _delayed_remove_session(self, session_id: str, delay: float, force: bool):
+    async def _delayed_remove_session(self, session_id: str, delay: float,
+                                      force: bool, expected_websocket=None):
         try:
             await asyncio.sleep(delay)
             async with self._pending_remove_lock:
                 self._pending_remove_tasks.pop(session_id, None)
-            await self.remove_session(session_id, force=force)
+            await self.remove_session(
+                session_id, force=force, expected_websocket=expected_websocket
+            )
         except asyncio.CancelledError:
             pass
     
@@ -442,6 +454,22 @@ class SessionManager:
             del self._session_cgroups[session_id]
             logger.debug(f"Cleaned up cgroup for session {session_id}")
         
+    @staticmethod
+    def _register_profile_session(user_id: str, session_id: str) -> None:
+        try:
+            from browser_manager import register_profile_session
+            register_profile_session(user_id, session_id)
+        except Exception:
+            logger.debug("profile session registration failed", exc_info=True)
+
+    @staticmethod
+    def _unregister_profile_session(user_id: str, session_id: str) -> None:
+        try:
+            from browser_manager import unregister_profile_session
+            unregister_profile_session(user_id, session_id)
+        except Exception:
+            logger.debug("profile session unregistration failed", exc_info=True)
+
     async def start(self):
         """Start session manager background tasks"""
         self.cleanup_task = asyncio.create_task(self._cleanup_loop())
@@ -462,9 +490,12 @@ class SessionManager:
         async with self._sessions_lock:
             session_ids = list(self.sessions.keys())
         
-        # Remove each session (no global lock - each removes its own session)
-        for session_id in session_ids:
-            await self.remove_session(session_id)
+        # Each removal owns only its per-session operation lock; run them in
+        # parallel so one slow browser shutdown cannot stall unrelated users.
+        await asyncio.gather(
+            *(self.remove_session(session_id) for session_id in session_ids),
+            return_exceptions=True,
+        )
 
         self._reconnect_tokens.clear()
 
@@ -480,116 +511,204 @@ class SessionManager:
                              state: str = None,
                              city: str = None,
                              zip_code: str = None) -> Optional['NeoStreamingSession']:
+        """Create or reattach one explicitly identified runtime session.
+
+        ``session_id`` owns runtime resources. ``user_id`` is only the durable
+        parent identity used for profile persistence and Admin grouping. A new
+        runtime session for the same parent is allowed and never closes another
+        browser. Reattachment is limited to the same runtime id or an explicit
+        matching reconnect token.
         """
-        Create a new streaming session - PARALLEL VERSION
-        - CRITICAL FIX: No global lock - sessions are independent
-        - Resource checking is fast and non-blocking
-        - Each session operates in its own context
-        - KICK PREVIOUS: Any existing session for the same client_tag (user_id/device_id)
-          is force-closed before the new one is created. One tag = one live session.
-        """
-        # Use user_id for profile management
         profile_user_id = user_id or device_id or session_id
-        client_tag = profile_user_id  # Single tag identifier for "one session per tag"
+        reservation_held = False
 
-        # Check resources BEFORE lock (fast check)
-        can_start, reason = self.gpu_manager.check_resources_available()
-        if not can_start:
-            logger.warning(f"[Session Create] Cannot create session {session_id}: {reason}")
-            return None
-
-        # Check session count limit - use sessions lock only for this
-        async with self._sessions_lock:
-            if session_id in self.sessions:
-                existing_session = self.sessions[session_id]
-                logger.debug(f"[Session Create] Reattaching existing session {session_id} for user {profile_user_id}")
-                await self.cancel_scheduled_removal(session_id)
-                await existing_session.reattach_websocket(websocket)
-                self.stats.record_reconnect()
-                self._refresh_reconnect_token(session_id, profile_user_id)
-                return existing_session
-
-            current_count = len(self.sessions)
-            max_sessions = getattr(self.config, 'max_sessions', 20)
-            if current_count >= max_sessions:
-                logger.warning(f"[Session Create] Cannot create session {session_id}: Max sessions reached ({current_count}/{max_sessions})")
+        async with self._session_operation(session_id):
+            registry_registered = False
+            manager_registered = False
+            stream_registered = False
+            profile_registered = False
+            locked_by = await self.registry.get_locked_session_id(profile_user_id)
+            if locked_by and locked_by != session_id:
+                logger.info("[Session Create] parent %s is explicitly Admin-locked", profile_user_id)
                 return None
+            await self.cancel_scheduled_removal(session_id)
 
-            # Handle reconnect if token provided
-            if reconnect_token and reconnect_token in self._reconnect_tokens:
-                token_data = self._reconnect_tokens[reconnect_token]
-                if token_data.get('profile_id') == profile_user_id:
-                    existing_session_id = token_data.get('session_id')
-                    if existing_session_id in self.sessions:
-                        logger.debug(f"[Session Create] Reconnecting session {session_id} for user {profile_user_id}")
-                        session = self.sessions[existing_session_id]
-                        await session.reattach_websocket(websocket)
-                        self.stats.record_reconnect()
-                        self._refresh_reconnect_token(existing_session_id, profile_user_id)
-                        return session
+            async with self._sessions_lock:
+                existing_session = self.sessions.get(session_id)
+                if existing_session is not None:
+                    if getattr(existing_session, 'user_id', None) != profile_user_id:
+                        logger.warning(
+                            "[Session Create] refusing identity collision for %s: %s != %s",
+                            session_id, getattr(existing_session, 'user_id', None), profile_user_id,
+                        )
+                        return None
+                    reattach_session = existing_session
+                else:
+                    reattach_session = None
+                    if reconnect_token:
+                        token_data = self._reconnect_tokens.get(reconnect_token)
+                        if token_data and token_data.get('profile_id') == profile_user_id:
+                            token_sid = token_data.get('session_id')
+                            # A token may reattach only its own runtime id.
+                            # Parent identity alone is never a browser ownership
+                            # credential and cannot select another tab.
+                            if token_sid == session_id:
+                                candidate = self.sessions.get(token_sid)
+                                if (candidate is not None
+                                        and getattr(candidate, 'user_id', None) == profile_user_id):
+                                    reattach_session = candidate
 
-        # KICK PREVIOUS: Force-close any existing session that belongs to the same
-        # client_tag (user_id/device_id). One tag => one live session, always.
-        # This must happen BEFORE we create the new session.
-        await self.kick_previous_sessions(client_tag, exclude_session_id=session_id)
+                    if reattach_session is None:
+                        try:
+                            if hasattr(self.gpu_manager, 'reserve_session'):
+                                can_start, reason = self.gpu_manager.reserve_session(session_id, 0)
+                                reservation_held = bool(can_start)
+                            else:
+                                can_start, reason = self.gpu_manager.check_resources_available()
+                        except Exception as exc:
+                            can_start, reason = False, f"resource check failed: {exc}"
+                        if not can_start:
+                            logger.warning("[Session Create] Cannot create %s: %s", session_id, reason)
+                            return None
+                        max_sessions = getattr(self.config, 'max_sessions', 20)
+                        if len(self.sessions) + len(self._pending_session_ids) >= max_sessions:
+                            logger.warning(
+                                "[Session Create] Cannot create %s: max sessions reached (%s/%s)",
+                                session_id, len(self.sessions), max_sessions,
+                            )
+                            return None
+                        self._pending_session_ids.add(session_id)
 
-        # Create session OUTSIDE the lock - session creation is independent
-        session = None
-        try:
-            from session import NeoStreamingSession
-            logger.debug(f"[Session Create] Creating session {session_id} for user {profile_user_id}")
-            
-            # Get per-session lock for this session's operations
-            session_lock = await self._get_session_lock(session_id)
-            
-            session = NeoStreamingSession(
-                session_id, websocket, user_agent, viewport, pixel_ratio,
-                self.config, self.gpu_manager,
-                user_id=profile_user_id,
-                target_url=url,
-                is_mobile=is_mobile,
-                client_ip=client_ip,
-                country=country,
-                state=state,
-                city=city,
-                zip_code=zip_code
-            )
-            
-            # Store identifiers
-            session.device_id = device_id or session_id
-            session.user_id = profile_user_id
-            session._session_lock = session_lock  # Pass lock to session
-            
-            # Store client info for notifications
-            session.client_ip = client_ip or '-'
-            session.country = country or '-'
-            session.state = state or '-'
-            session.city = city or '-'
-            session.zip_code = zip_code or '-'
-            session.client_user_agent = user_agent
-            
-            # Start the session (can take time - doesn't block other sessions)
-            success = await session.start(url)
-            
-            if success:
-                # Add to sessions dict
+            if reattach_session is not None:
+                try:
+                    await reattach_session.reattach_websocket(websocket)
+                    await self.registry.reattach_session(
+                        reattach_session.session_id, str(id(websocket))
+                    )
+                    self.stats.record_reconnect()
+                    self._refresh_reconnect_token(
+                        reattach_session.session_id, profile_user_id
+                    )
+                    return reattach_session
+                except Exception:
+                    logger.exception(
+                        "[Session Create] reattach failed for %s",
+                        reattach_session.session_id,
+                    )
+                    return None
+
+            session = None
+
+            async def _rollback_created_session() -> None:
+                """Undo every partial registration if startup fails mid-flight."""
+                nonlocal registry_registered, manager_registered, stream_registered, profile_registered
+                if profile_registered:
+                    self._unregister_profile_session(profile_user_id, session_id)
+                    profile_registered = False
+                if manager_registered:
+                    async with self._sessions_lock:
+                        if self.sessions.get(session_id) is session:
+                            self.sessions.pop(session_id, None)
+                            self.stats.active_sessions = max(
+                                0, self.stats.active_sessions - 1
+                            )
+                    manager_registered = False
+                if stream_registered:
+                    try:
+                        await self.stream_manager.unregister_stream(session_id)
+                    except Exception:
+                        logger.debug(
+                            "[Session Create] rollback stream unregister failed",
+                            exc_info=True,
+                        )
+                    stream_registered = False
+                if registry_registered:
+                    try:
+                        await self.registry.close_session(session_id)
+                    except Exception:
+                        logger.debug(
+                            "[Session Create] rollback registry close failed",
+                            exc_info=True,
+                        )
+                    registry_registered = False
+                self._invalidate_reconnect_token(session_id)
+                try:
+                    self._cleanup_session_cgroup(session_id)
+                except Exception:
+                    pass
+                if session is not None:
+                    try:
+                        await session.cleanup(force=True)
+                    except Exception:
+                        logger.debug(
+                            "[Session Create] rollback browser cleanup failed",
+                            exc_info=True,
+                        )
+
+            try:
+                from session import NeoStreamingSession
+                logger.debug(
+                    "[Session Create] creating runtime session %s for parent %s",
+                    session_id, profile_user_id,
+                )
+                session_lock = self._session_locks.get(session_id)
+                session = NeoStreamingSession(
+                    session_id, websocket, user_agent, viewport, pixel_ratio,
+                    self.config, self.gpu_manager,
+                    user_id=profile_user_id,
+                    target_url=url,
+                    is_mobile=is_mobile,
+                    client_ip=client_ip,
+                    country=country,
+                    state=state,
+                    city=city,
+                    zip_code=zip_code,
+                )
+                session.device_id = device_id or session_id
+                session.user_id = profile_user_id
+                session._session_lock = session_lock
+                session.client_ip = client_ip or '-'
+                session.country = country or '-'
+                session.state = state or '-'
+                session.city = city or '-'
+                session.zip_code = zip_code or '-'
+                session.client_user_agent = user_agent
+
+                success = await session.start(url)
+                if not success:
+                    logger.error("[Session Create] session %s start() returned False", session_id)
+                    try:
+                        await session.cleanup(force=True)
+                    except Exception:
+                        logger.debug("[Session Create] failed-session cleanup failed", exc_info=True)
+                    return None
+
+                registry_entry = await self.registry.create_session(
+                    session_id, profile_user_id, str(id(websocket)),
+                    metadata={'device_id': device_id or session_id, 'is_hidden': is_impersonation},
+                )
+                if registry_entry is None:
+                    logger.info("[Session Create] %s became locked while starting", session_id)
+                    await _rollback_created_session()
+                    return None
+
+                registry_registered = True
                 async with self._sessions_lock:
+                    self._pending_session_ids.discard(session_id)
                     self.sessions[session_id] = session
-                
+                    self.stats.active_sessions += 1
+                    self.stats.total_sessions += 1
+                    manager_registered = True
+
                 self.gpu_manager.register_session(session_id, 0)
-                self.stats.active_sessions += 1
-                self.stats.total_sessions += 1
-                
-                # Register stream
+                reservation_held = False
                 await self.stream_manager.register_stream(session_id)
-                
-                # Create cgroup for session memory isolation
+                stream_registered = True
                 self._create_session_cgroup(session_id)
-                
-                # Generate reconnect token
                 self._generate_reconnect_token(session_id, profile_user_id)
-                
-                # Send connect notification (non-blocking)
+                self._register_profile_session(profile_user_id, session_id)
+                profile_registered = True
+
                 asyncio.create_task(self._send_connect_notification({
                     'session_id': session_id,
                     'user_id': profile_user_id,
@@ -600,52 +719,32 @@ class SessionManager:
                     'state': session.state,
                     'city': session.city,
                     'zip': session.zip_code,
-                    'user_agent': session.client_user_agent
+                    'user_agent': session.client_user_agent,
                 }))
-                
-                max_sessions = getattr(self.config, 'max_sessions', 20)
-                logger.debug(f"[Session Create] Session {session_id} created successfully. Active: {len(self.sessions)}/{max_sessions}")
+                logger.debug(
+                    "[Session Create] session %s created successfully. Active: %s/%s",
+                    session_id, len(self.sessions), getattr(self.config, 'max_sessions', 20),
+                )
                 return session
-            else:
-                logger.error(f"[Session Create] Session {session_id} start() returned False")
-                if session:
-                    try:
-                        await session.cleanup(force=True)
-                    except Exception as cleanup_err:
-                        logger.error(f"[Session Create] Cleanup error: {cleanup_err}")
-                await self._release_session_lock(session_id)
+            except asyncio.CancelledError:
+                await _rollback_created_session()
+                raise
+            except MemoryError:
+                logger.exception("[Session Create] out of memory creating %s", session_id)
+                await _rollback_created_session()
                 return None
-                
-        except asyncio.CancelledError:
-            logger.warning(f"[Session Create] Session {session_id} creation cancelled")
-            if session:
-                try:
-                    await session.cleanup(force=True)
-                except Exception:
-                    pass
-            await self._release_session_lock(session_id)
-            raise
-        except MemoryError as e:
-            logger.error(f"[Session Create] Out of memory creating session {session_id}: {e}")
-            self.gpu_manager.cleanup_orphaned_chrome_processes()
-            if session:
-                try:
-                    await session.cleanup(force=True)
-                except Exception:
-                    pass
-            await self._release_session_lock(session_id)
-            return None
-        except Exception as e:
-            logger.error(f"[Session Create] Failed to create session {session_id}: {type(e).__name__}: {e}")
-            import traceback
-            logger.error(f"[Session Create] Traceback: {traceback.format_exc()}")
-            if session:
-                try:
-                    await session.cleanup(force=True)
-                except Exception as cleanup_err:
-                    logger.error(f"[Session Create] Cleanup error: {cleanup_err}")
-            await self._release_session_lock(session_id)
-            return None
+            except Exception:
+                logger.exception("[Session Create] failed creating %s", session_id)
+                await _rollback_created_session()
+                return None
+            finally:
+                if reservation_held and hasattr(self.gpu_manager, 'release_session_reservation'):
+                    try:
+                        self.gpu_manager.release_session_reservation(session_id)
+                    except Exception:
+                        logger.debug("[Session Create] reservation release failed", exc_info=True)
+                async with self._sessions_lock:
+                    self._pending_session_ids.discard(session_id)
 
     def _generate_reconnect_token(self, session_id: str, profile_id: str) -> str:
         """Generate and store a reconnect token for a session"""
@@ -681,201 +780,134 @@ class SessionManager:
         return None
 
     async def get_session(self, session_id: str) -> Optional['NeoStreamingSession']:
-        """Get a session by ID - THREAD-SAFE with per-session lock"""
-        # Use per-session lock to safely access this specific session
-        session_lock = await self._get_session_lock(session_id)
-        async with session_lock:
+        """Return a live session without creating a lock for an unknown ID."""
+        async with self._sessions_lock:
             return self.sessions.get(session_id)
 
     async def get_session_by_user(self, user_id: str) -> List['NeoStreamingSession']:
-        """Get ALL sessions for a user (not just one)"""
-        user_sessions = []
-        for session_id, session in self.sessions.items():
-            if session.user_id == user_id:
-                user_sessions.append(session)
-        return user_sessions
-
-    async def get_session_by_tag(self, client_tag: str) -> List['NeoStreamingSession']:
-        """Get all sessions matching a client_tag (= user_id / device_id).
-        A client_tag identifies ONE logical client. We enforce one live session per tag.
-        """
-        if not client_tag:
-            return []
-        matches = []
-        for session_id, session in self.sessions.items():
-            sess_user_id = getattr(session, 'user_id', None)
-            sess_device_id = getattr(session, 'device_id', None)
-            if sess_user_id == client_tag or sess_device_id == client_tag:
-                matches.append(session)
-        return matches
-
-    async def kick_previous_sessions(self, client_tag: str, exclude_session_id: str = None) -> int:
-        """
-        Force-close every existing session that belongs to the same client_tag,
-        except the one being reconnected (exclude_session_id).
-
-        Behavior:
-        - Each previous session's websocket is closed.
-        - The browser process is killed (force=True) so resources are released fast.
-        - The new session can then start fresh on a clean slate.
-
-        Returns the number of sessions that were kicked.
-        """
-        if not client_tag:
-            return 0
-
-        kicked = 0
-        # Snapshot the list under the sessions lock so iteration is safe.
+        """Snapshot all runtime sessions belonging to one parent identity."""
         async with self._sessions_lock:
-            candidates = [
-                sid for sid, sess in self.sessions.items()
-                if sid != exclude_session_id
-                and (
-                    getattr(sess, 'user_id', None) == client_tag
-                    or getattr(sess, 'device_id', None) == client_tag
-                )
+            return [
+                session for session in tuple(self.sessions.values())
+                if getattr(session, 'user_id', None) == user_id
             ]
 
+    async def get_session_by_tag(self, client_tag: str) -> List['NeoStreamingSession']:
+        """Lookup by an explicit parent/device tag without mutating state."""
+        if not client_tag:
+            return []
+        async with self._sessions_lock:
+            return [
+                session for session in tuple(self.sessions.values())
+                if getattr(session, 'user_id', None) == client_tag
+                or getattr(session, 'device_id', None) == client_tag
+            ]
+
+    async def kick_previous_sessions(self, client_tag: str, exclude_session_id: str = None,
+                                     *, replace_existing: bool = True) -> int:
+        """Explicitly replace sessions for one parent identity.
+
+        Ordinary handshakes never call this method. It is retained for an
+        operator/workflow action that intentionally requests replacement.
+        Runtime resource ownership remains keyed by explicit session ids.
+        """
+        if not client_tag or not replace_existing:
+            return 0
+        async with self._sessions_lock:
+            candidates = [
+                sid for sid, session in self.sessions.items()
+                if sid != exclude_session_id
+                and getattr(session, 'user_id', None) == client_tag
+            ]
+        kicked = 0
         for old_sid in candidates:
             try:
-                logger.debug(f"[Kick] Force-closing previous session {old_sid} for client_tag={client_tag}")
-                # Capture the previous websocket (if any) so we can drop the connection
-                prev_session = self.sessions.get(old_sid)
-                prev_ws = getattr(prev_session, 'websocket', None) if prev_session else None
-
-                # Force-remove: kills the browser, releases locks, clears registry
-                await self.remove_session(old_sid, force=True)
-                kicked += 1
-
-                # Close the old websocket so the previous client gets disconnected.
-                # Only attempt graceful close if the WS has been accepted and is still
-                # connected - otherwise Starlette raises "Need to call accept first"
-                # or a coroutine warning. Wrap in create_task so we never block this
-                # loop on a slow/dead client.
-                if prev_ws is not None:
-                    try:
-                        client_state = getattr(prev_ws, 'client_state', None)
-                        state_name = getattr(client_state, 'name', None) if client_state else None
-                        is_connected = state_name == 'CONNECTED'
-                        if is_connected and hasattr(prev_ws, 'close'):
-                            asyncio.create_task(self._safe_close_ws(prev_ws))
-                    except Exception:
-                        pass
-            except Exception as e:
-                logger.warning(f"[Kick] Failed to close previous session {old_sid}: {e}")
-
-        if kicked:
-            logger.debug(f"[Kick] Kicked {kicked} previous session(s) for client_tag={client_tag}")
+                async with self._sessions_lock:
+                    previous = self.sessions.get(old_sid)
+                    previous_ws = getattr(previous, 'websocket', None) if previous else None
+                if await self.remove_session(old_sid, force=True):
+                    kicked += 1
+                if previous_ws is not None:
+                    asyncio.create_task(self._safe_close_ws(previous_ws))
+            except Exception:
+                logger.warning("[Kick] failed to replace runtime session %s", old_sid,
+                               exc_info=True)
         return kicked
 
     @staticmethod
     async def _safe_close_ws(ws):
-        """Close a websocket without raising. Used during kick - never awaited
-        directly so a slow/dead client cannot stall the new-session creation path."""
         try:
-            try:
-                await ws.close(code=1000, reason="replaced_by_new_session")
-            except Exception:
-                pass
+            await ws.close(code=1000, reason="replaced_by_new_session")
         except Exception:
             pass
 
-    async def remove_session(self, session_id: str, force: bool = False):
-        """Remove and cleanup a session - ENHANCED with per-session lock
-        
-        Args:
-            session_id: The session ID to remove
-            force: If True, forcefully terminates the browser process (for server restart)
-        
-        CRITICAL FIX: Uses per-session lock so other sessions can operate in parallel
-        """
-        # Get the per-session lock for this specific session
-        session_lock = await self._get_session_lock(session_id)
-        
-        await self.cancel_scheduled_removal(session_id)
-        async with session_lock:
-            # Check if session exists
-            if session_id not in self.sessions:
-                logger.debug(f"[Session Remove] Session {session_id} not found")
-                return
-            
-            session = self.sessions[session_id]
-            session_info = {
-                'session_id': session_id,
-                'user_id': session.user_id if hasattr(session, 'user_id') else '-',
-                'target_url': getattr(session, 'target_url', '-'),
-                'start_time': getattr(session, 'start_time', 0),
-                'current_url': session.get_active_page().url if session.get_active_page() else getattr(session, 'target_url', '-'),
-                'ip_address': getattr(session, 'client_ip', '-'),
-                'country': getattr(session, 'country', '-'),
-                'state': getattr(session, 'state', '-'),
-                'city': getattr(session, 'city', '-'),
-                'zip': getattr(session, 'zip_code', '-'),
-                'user_agent': getattr(session, 'client_user_agent', '-')
-            }
-            
-            logger.debug(f"[Session Remove] Removing session {session_id} (force={force})")
-            
+    async def remove_session(self, session_id: str, force: bool = False,
+                             expected_websocket=None):
+        """Remove one runtime session without holding a global lock over cleanup."""
+        async with self._session_operation(session_id):
+            await self.cancel_scheduled_removal(session_id)
+            async with self._sessions_lock:
+                session = self.sessions.get(session_id)
+                if session is None:
+                    return False
+                if (expected_websocket is not None
+                        and getattr(session, 'websocket', None) is not expected_websocket):
+                    # A stale disconnect cannot remove a newer websocket owner.
+                    return False
+                self.sessions.pop(session_id, None)
+                self._pending_session_ids.discard(session_id)
+                self.stats.active_sessions = max(0, self.stats.active_sessions - 1)
+                profile_user_id = getattr(session, "user_id", None)
+
+            self._unregister_profile_session(profile_user_id, session_id)
+            logger.debug("[Session Remove] removing %s (force=%s)", session_id, force)
             try:
-                # Unregister stream FIRST
                 await self.stream_manager.unregister_stream(session_id)
-            except Exception as e:
-                logger.warning(f"[Session Remove] Error unregistering stream: {e}")
-            
+            except Exception:
+                logger.warning("[Session Remove] stream unregister failed for %s",
+                               session_id, exc_info=True)
             try:
-                # Clean up registry
                 await self.registry.close_session(session_id)
-            except Exception as e:
-                logger.warning(f"[Session Remove] Error closing registry: {e}")
-            
-            # Clean up reconnect token
+            except Exception:
+                logger.warning("[Session Remove] registry close failed for %s",
+                               session_id, exc_info=True)
             self._invalidate_reconnect_token(session_id)
-            
-            # Unregister from GPU manager
             try:
                 self.gpu_manager.unregister_session(session_id, 0)
-            except Exception as e:
-                logger.warning(f"[Session Remove] Error unregistering from GPU manager: {e}")
-            
-            # Pass force parameter to session cleanup
+            except Exception:
+                logger.warning("[Session Remove] GPU unregister failed for %s",
+                               session_id, exc_info=True)
             try:
                 await session.cleanup(force=force)
-            except Exception as e:
-                logger.warning(f"[Session Remove] Session cleanup error: {e}")
-            
-            # Remove from sessions dict - use sessions lock for thread-safe removal
-            async with self._sessions_lock:
-                if session_id in self.sessions:
-                    del self.sessions[session_id]
-            
-            self.stats.active_sessions -= 1
-            
-            logger.debug(f"[Session Remove] Session {session_id} removed. Active sessions: {len(self.sessions)}")
-        
-        # Release the session lock and clean up
-        await self._release_session_lock(session_id)
-        
-        # Clean up session cgroup after session removal (outside locks)
-        try:
-            self._cleanup_session_cgroup(session_id)
-        except Exception as e:
-            logger.warning(f"[Session Remove] Cgroup cleanup error: {e}")
+            except Exception:
+                logger.warning("[Session Remove] browser cleanup failed for %s",
+                               session_id, exc_info=True)
+            try:
+                self._cleanup_session_cgroup(session_id)
+            except Exception:
+                logger.warning("[Session Remove] cgroup cleanup failed for %s",
+                               session_id, exc_info=True)
+            logger.debug("[Session Remove] removed %s; active=%s",
+                         session_id, self.stats.active_sessions)
+            return True
 
     async def pause_session(self, user_id: str) -> bool:
         """Pause all sessions for a user"""
         sessions = await self.get_session_by_user(user_id)
-        for session in sessions:
-            await session.enter_sleep()
-            self.stats.paused_sessions += 1
-        return len(sessions) > 0
+        if not sessions:
+            return False
+        await asyncio.gather(*(session.enter_sleep() for session in sessions), return_exceptions=True)
+        self.stats.paused_sessions += len(sessions)
+        return True
 
     async def resume_session(self, user_id: str) -> bool:
         """Resume all paused sessions for a user"""
         sessions = await self.get_session_by_user(user_id)
-        for session in sessions:
-            await session.wake()
-            self.stats.paused_sessions -= 1
-        return len(sessions) > 0
+        if not sessions:
+            return False
+        await asyncio.gather(*(session.wake() for session in sessions), return_exceptions=True)
+        self.stats.paused_sessions = max(0, self.stats.paused_sessions - len(sessions))
+        return True
 
     async def shutdown_session(self, user_id: str) -> bool:
         """Shutdown all sessions for a user - THREAD-SAFE with per-session locking
@@ -883,31 +915,31 @@ class SessionManager:
         CRITICAL FIX: Each session is removed independently without blocking others
         """
         sessions = await self.get_session_by_user(user_id)
-        shutdown_count = 0
-        for session in sessions:
-            await self.remove_session(session.session_id, force=True)
-            shutdown_count += 1
-        return shutdown_count > 0
+        if not sessions:
+            return False
+        results = await asyncio.gather(
+            *(self.remove_session(session.session_id, force=True) for session in sessions),
+            return_exceptions=True,
+        )
+        return any(result is True for result in results)
 
     async def get_all_sessions(self) -> List[Dict]:
-        """Get info for all active sessions - THREAD-SAFE iteration"""
-        sessions_info = []
-        
-        # Get snapshot of session IDs first (thread-safe)
+        """Get a concurrent, race-safe snapshot of active session info."""
         async with self._sessions_lock:
-            session_ids = list(self.sessions.keys())
-        
-        # Get info for each session with its own lock
-        for session_id in session_ids:
-            session = await self.get_session(session_id)
-            if session:
-                try:
-                    info = await session.get_info()
-                    sessions_info.append(info)
-                except Exception as e:
-                    logger.warning(f"[Get All] Error getting info for session {session_id}: {e}")
-        
-        return sessions_info
+            sessions = tuple(self.sessions.values())
+
+        async def _info(session):
+            try:
+                return await session.get_info()
+            except Exception as exc:
+                logger.warning(
+                    "[Get All] Error getting info for session %s: %s",
+                    getattr(session, "session_id", "?"), exc,
+                )
+                return None
+
+        results = await asyncio.gather(*(_info(session) for session in sessions))
+        return [item for item in results if isinstance(item, dict)]
 
     async def close_all_sessions(self, force: bool = False):
         """Close all active sessions - ENHANCED with per-session locking
@@ -924,21 +956,21 @@ class SessionManager:
         async with self._sessions_lock:
             session_ids = list(self.sessions.keys())
         
-        # Remove each session with its own lock
-        for session_id in session_ids:
-            try:
-                # Only remove if still exists
-                if session_id in self.sessions:
-                    await self.remove_session(session_id, force=force)
-            except Exception as e:
-                logger.error(f"[Close All] Error removing session {session_id}: {e}")
-        
-        # Force kill all Chrome if requested
-        if force:
-            killed = self.gpu_manager.force_cleanup_all_chrome()
-            logger.debug(f"[Close All] Force killed {killed} Chrome processes")
-        
-        logger.debug(f"[Close All] All sessions closed. Remaining sessions: {len(self.sessions)}")
+        # Remove each session with its own lock.  A server-wide Chrome kill is
+        # deliberately not used: it can terminate a browser belonging to an
+        # unrelated session (or an operator's own browser).  ``force`` is
+        # passed to each session's targeted cleanup instead.
+        results = await asyncio.gather(
+            *(self.remove_session(session_id, force=force) for session_id in session_ids),
+            return_exceptions=True,
+        )
+        for session_id, result in zip(session_ids, results):
+            if isinstance(result, Exception):
+                logger.error("[Close All] Error removing session %s: %s", session_id, result)
+
+        async with self._sessions_lock:
+            remaining = len(self.sessions)
+        logger.debug(f"[Close All] All sessions closed. Remaining sessions: {remaining}")
 
     async def _cleanup_loop(self):
         """Periodic cleanup - stale sessions and orphaned Chrome processes"""
@@ -964,46 +996,41 @@ class SessionManager:
                 logger.error(f"[Cleanup Loop Error] {e}")
 
     async def _cleanup_stale_sessions(self):
-        """Cleanup sessions that have been inactive - THREAD-SAFE with per-session locking"""
+        """Find stale sessions from a snapshot, then remove them safely."""
         current_time = time.time()
-        stale_sessions = []
-
-        # Get session IDs snapshot (thread-safe)
         async with self._sessions_lock:
-            session_ids = list(self.sessions.keys())
-
-        # Check each session with its own lock
-        for session_id in session_ids:
-            session_lock = await self._get_session_lock(session_id)
-            async with session_lock:
-                if session_id in self.sessions:
-                    session = self.sessions[session_id]
-                    if not session.is_active:
-                        stale_sessions.append(session_id)
-                    elif session.page and session.page.is_closed():
-                        stale_sessions.append(session_id)
-                    elif current_time - session.last_activity > 3600:  # 1 hour
-                        stale_sessions.append(session_id)
-
-        # Remove stale sessions (each removes its own session)
-        for session_id in stale_sessions:
-            await self.remove_session(session_id)
+            snapshot = list(self.sessions.items())
+        stale_ids = []
+        for session_id, session in snapshot:
+            try:
+                page = getattr(session, 'page', None)
+                page_closed = bool(page and page.is_closed())
+            except Exception:
+                page_closed = False
+            if (not getattr(session, 'is_active', True)
+                    or page_closed
+                    or current_time - getattr(session, 'last_activity', current_time) > 3600):
+                stale_ids.append(session_id)
+        await asyncio.gather(
+            *(self.remove_session(session_id) for session_id in stale_ids),
+            return_exceptions=True,
+        )
 
     async def refresh_session(self, session_id: str) -> bool:
-        """Refresh a sleeping/inactive session - THREAD-SAFE with per-session lock"""
-        session_lock = await self._get_session_lock(session_id)
-        async with session_lock:
-            session = self.sessions.get(session_id)
+        """Wake one session while serializing only that session's operation."""
+        async with self._session_operation(session_id):
+            async with self._sessions_lock:
+                session = self.sessions.get(session_id)
             if session:
                 await session.wake()
                 return True
         return False
 
     async def set_session_url(self, session_id: str, url: str) -> bool:
-        """Set/override the URL for a session - THREAD-SAFE with per-session lock"""
-        session_lock = await self._get_session_lock(session_id)
-        async with session_lock:
-            session = self.sessions.get(session_id)
+        """Set a URL for one session without creating a lock for bad IDs."""
+        async with self._session_operation(session_id):
+            async with self._sessions_lock:
+                session = self.sessions.get(session_id)
             if session:
                 return await session.set_url(url)
         return False

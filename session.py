@@ -58,221 +58,232 @@ logger = logging.getLogger(__name__)
 
 # ==============================
 # Key Logger (KLG) System
-# Logs all keyboard inputs organized by user and URL
 # ==============================
 
 KEYLOG_FILE = Path(__file__).parent / "data" / "key.json"
 _keylog_lock = asyncio.Lock()
+_keylog_write_lock = asyncio.Lock()
+_keylog_state_lock = __import__('threading').RLock()
+_keylog_cache: Optional[Dict] = None
+_keylog_dirty = False
+_keylog_writer_task: Optional[asyncio.Task] = None
 
 
 def _ensure_keylog_dir():
-    """Ensure the data directory exists for key logs"""
     KEYLOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 
-def _load_keylog() -> Dict:
-    """Load keylog data from disk"""
+def _read_keylog_file() -> Dict:
     try:
         if KEYLOG_FILE.exists():
             with open(KEYLOG_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        else:
-            logger.debug("[KLG] Keylog file does not exist yet, creating new")
-    except json.JSONDecodeError as e:
-        logger.warning(f"[KLG] Corrupted keylog file, resetting: {e}")
-    except Exception as e:
-        logger.warning(f"[KLG] Failed to load keylog: {e}")
+                data = json.load(f)
+            if isinstance(data, dict) and isinstance(data.get('users'), dict):
+                return data
+    except json.JSONDecodeError as exc:
+        logger.warning("[KLG] corrupted keylog file, resetting: %s", exc)
+    except Exception as exc:
+        logger.warning("[KLG] failed to load keylog: %s", exc)
     return {"users": {}}
 
 
+def _load_keylog() -> Dict:
+    """Return the process cache; disk is read only on first access."""
+    global _keylog_cache
+    with _keylog_state_lock:
+        if _keylog_cache is None:
+            _keylog_cache = _read_keylog_file()
+        return _keylog_cache
+
+
+def _snapshot_keylog() -> Dict:
+    import copy
+    with _keylog_state_lock:
+        return copy.deepcopy(_load_keylog())
+
+
 def _save_keylog(data: Dict):
-    """Save keylog data to disk"""
+    """Write one complete snapshot atomically; called off the event loop."""
     try:
         _ensure_keylog_dir()
-        with open(KEYLOG_FILE, 'w', encoding='utf-8') as f:
+        temp_file = KEYLOG_FILE.with_suffix('.json.tmp')
+        with open(temp_file, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
-        logger.debug(f"[KLG] Saved keylog with {len(data.get('users', {}))} users")
-    except Exception as e:
-        logger.error(f"[KLG] Failed to save keylog: {e}")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_file, KEYLOG_FILE)
+        logger.debug("[KLG] saved keylog with %s users", len(data.get('users', {})))
+    except Exception as exc:
+        logger.error("[KLG] failed to save keylog: %s", exc)
+        try:
+            temp_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+async def _flush_keylog_now():
+    """Persist the latest snapshot without blocking browser input callbacks."""
+    global _keylog_dirty
+    async with _keylog_write_lock:
+        with _keylog_state_lock:
+            snapshot = _snapshot_keylog()
+            _keylog_dirty = False
+        await asyncio.to_thread(_save_keylog, snapshot)
+        with _keylog_state_lock:
+            # A callback may have appended while the write was in flight.
+            # Leave dirty set so the next scheduled flush includes it.
+            return _keylog_dirty
+
+
+async def _debounced_keylog_flush():
+    global _keylog_writer_task
+    try:
+        await asyncio.sleep(0.25)
+        await _flush_keylog_now()
+    except asyncio.CancelledError:
+        raise
+    finally:
+        _keylog_writer_task = None
+
+
+def _schedule_keylog_flush():
+    global _keylog_writer_task
+    if _keylog_writer_task is None or _keylog_writer_task.done():
+        _keylog_writer_task = asyncio.create_task(_debounced_keylog_flush())
 
 
 async def log_keystroke(user_id: str, session_id: str, url: str, log_type: str, data: str):
-    """
-    Log a keystroke event for a user.
-    
-    Args:
-        user_id: User identifier (falls back to session_id if empty)
-        session_id: Session identifier
-        url: Current URL where the input occurred (falls back to 'unknown' if empty)
-        log_type: Type of input ('keydown', 'text', 'form_submit', 'form_input')
-        data: The keystroke data (key name or text)
-    """
-    # Check if keylogging is enabled
+    """Queue a session-partitioned keylog event without synchronous disk I/O."""
     try:
         from config import CONFIG
         if not getattr(CONFIG, 'keylog_enabled', True):
             return
     except Exception:
-        pass  # If config import fails, proceed with logging
-    
-    # Fallback to session_id if user_id is empty
-    if not user_id:
-        user_id = session_id or "unknown_user"
-    
-    # Fallback to 'unknown' if url is empty
-    if not url:
-        url = "unknown_url"
-    
-    # Extract domain from URL for organization
+        pass
+    user_id = user_id or session_id or "unknown_user"
+    url = url or "unknown_url"
     try:
         from urllib.parse import urlparse
         domain = urlparse(url).netloc or "unknown"
     except Exception:
         domain = "unknown"
-    
     timestamp = time.time()
-    
     log_entry = {
         "timestamp": timestamp,
         "session_id": session_id,
         "type": log_type,
         "data": data,
         "url": url,
-        "domain": domain
+        "domain": domain,
     }
-    
     async with _keylog_lock:
-        keylog = _load_keylog()
-        
-        # Ensure user exists
-        if user_id not in keylog["users"]:
-            keylog["users"][user_id] = {
-                "sessions": [],
-                "domains": {}
-            }
-        
-        # Add session if not already tracked
-        if session_id and session_id not in keylog["users"][user_id]["sessions"]:
-            keylog["users"][user_id]["sessions"].append(session_id)
-        
-        # Ensure domain exists
-        if domain not in keylog["users"][user_id]["domains"]:
-            keylog["users"][user_id]["domains"][domain] = {
-                "urls": {},
-                "logs": []
-            }
-        
-        # Add URL tracking if not exists
-        if url not in keylog["users"][user_id]["domains"][domain]["urls"]:
-            keylog["users"][user_id]["domains"][domain]["urls"][url] = {
-                "first_seen": timestamp,
-                "log_count": 0
-            }
-        
-        # Add the log entry
-        keylog["users"][user_id]["domains"][domain]["logs"].append(log_entry)
-        
-        # Update URL stats
-        keylog["users"][user_id]["domains"][domain]["urls"][url]["log_count"] += 1
-        
-        # Limit logs per domain to prevent file bloat (keep last 5000)
-        if len(keylog["users"][user_id]["domains"][domain]["logs"]) > 5000:
-            keylog["users"][user_id]["domains"][domain]["logs"] = \
-                keylog["users"][user_id]["domains"][domain]["logs"][-5000:]
-        
-        _save_keylog(keylog)
-        
-        # Debug: log successful save
-        logger.debug(f"[KLG] Logged {log_type} for user {user_id}: {data[:50] if len(data) > 50 else data}")
+        global _keylog_dirty
+        with _keylog_state_lock:
+            keylog = _load_keylog()
+            user_data = keylog["users"].setdefault(user_id, {"sessions": [], "domains": {}})
+            if session_id and session_id not in user_data["sessions"]:
+                user_data["sessions"].append(session_id)
+            domain_data = user_data["domains"].setdefault(domain, {"urls": {}, "logs": []})
+            url_data = domain_data["urls"].setdefault(
+                url, {"first_seen": timestamp, "log_count": 0}
+            )
+            domain_data["logs"].append(log_entry)
+            url_data["log_count"] += 1
+            if len(domain_data["logs"]) > 5000:
+                domain_data["logs"] = domain_data["logs"][-5000:]
+            _keylog_dirty = True
+        _schedule_keylog_flush()
+    logger.debug("[KLG] queued %s for user %s/session %s", log_type, user_id, session_id)
 
 
 def get_keylog_users() -> List[Dict]:
-    """Get list of all users with their keylog summary and domains data"""
-    keylog = _load_keylog()
+    keylog = _snapshot_keylog()
     users = []
     for user_id, user_data in keylog["users"].items():
-        total_logs = sum(len(d.get("logs", [])) for d in user_data["domains"].values())
+        total_logs = sum(len(d.get("logs", [])) for d in user_data.get("domains", {}).values())
         users.append({
             "user_id": user_id,
             "session_count": len(user_data.get("sessions", [])),
             "domain_count": len(user_data.get("domains", {})),
             "total_logs": total_logs,
-            "domains": user_data.get("domains", {})  # Include full domains data for frontend
+            "domains": user_data.get("domains", {}),
         })
     return users
 
 
 def get_keylog_domains(user_id: str) -> List[Dict]:
-    """Get list of domains for a specific user"""
-    keylog = _load_keylog()
-    if user_id not in keylog["users"]:
+    keylog = _snapshot_keylog()
+    user_data = keylog["users"].get(user_id)
+    if not user_data:
         return []
-    
-    domains = []
-    for domain, domain_data in keylog["users"][user_id]["domains"].items():
-        domains.append({
-            "domain": domain,
-            "url_count": len(domain_data.get("urls", {})),
-            "log_count": len(domain_data.get("logs", []))
-        })
-    return domains
+    return [
+        {"domain": domain, "url_count": len(data.get("urls", {})),
+         "log_count": len(data.get("logs", []))}
+        for domain, data in user_data.get("domains", {}).items()
+    ]
 
 
 def get_keylog_urls(user_id: str, domain: str) -> List[Dict]:
-    """Get list of URLs for a specific user and domain"""
-    keylog = _load_keylog()
-    if user_id not in keylog["users"]:
+    keylog = _snapshot_keylog()
+    data = keylog["users"].get(user_id, {}).get("domains", {}).get(domain)
+    if not data:
         return []
-    if domain not in keylog["users"][user_id]["domains"]:
-        return []
-    
-    urls = []
-    for url, url_data in keylog["users"][user_id]["domains"][domain].get("urls", {}).items():
-        urls.append({
-            "url": url,
-            "first_seen": url_data.get("first_seen", 0),
-            "log_count": url_data.get("log_count", 0)
-        })
-    return urls
+    return [
+        {"url": url, "first_seen": value.get("first_seen", 0),
+         "log_count": value.get("log_count", 0)}
+        for url, value in data.get("urls", {}).items()
+    ]
 
 
 def get_keylog_for_url(user_id: str, url: str) -> List[Dict]:
-    """Get all keylogs for a specific URL"""
-    keylog = _load_keylog()
-    if user_id not in keylog["users"]:
-        return []
-    
-    # Extract domain from URL
+    keylog = _snapshot_keylog()
     try:
         from urllib.parse import urlparse
         domain = urlparse(url).netloc or "unknown"
     except Exception:
         domain = "unknown"
-    
-    if domain not in keylog["users"][user_id]["domains"]:
-        return []
-    
-    # Filter logs for this specific URL
-    logs = keylog["users"][user_id]["domains"][domain].get("logs", [])
+    logs = keylog["users"].get(user_id, {}).get("domains", {}).get(domain, {}).get("logs", [])
     return [log for log in logs if log.get("url") == url]
 
 
 async def clear_keylog_for_user(user_id: str) -> bool:
-    """Clear all keylogs for a specific user"""
+    global _keylog_dirty
     async with _keylog_lock:
-        keylog = _load_keylog()
-        if user_id in keylog["users"]:
-            del keylog["users"][user_id]
-            _save_keylog(keylog)
-            return True
-        return False
+        with _keylog_state_lock:
+            keylog = _load_keylog()
+            existed = user_id in keylog["users"]
+            if existed:
+                del keylog["users"][user_id]
+                _keylog_dirty = True
+        writer = _keylog_writer_task
+        if writer and writer is not asyncio.current_task():
+            writer.cancel()
+    if writer and writer is not asyncio.current_task():
+        try:
+            await writer
+        except asyncio.CancelledError:
+            pass
+    if existed:
+        await _flush_keylog_now()
+    return existed
 
 
 async def clear_all_keylogs() -> bool:
-    """Clear all keylogs"""
+    global _keylog_cache, _keylog_dirty
     async with _keylog_lock:
-        _save_keylog({"users": {}})
-        return True
+        with _keylog_state_lock:
+            _keylog_cache = {"users": {}}
+            _keylog_dirty = True
+        writer = _keylog_writer_task
+        if writer and writer is not asyncio.current_task():
+            writer.cancel()
+    if writer and writer is not asyncio.current_task():
+        try:
+            await writer
+        except asyncio.CancelledError:
+            pass
+    await _flush_keylog_now()
+    return True
 
 
 def log(msg):
@@ -624,7 +635,13 @@ class NeoStreamingSession:
                     from sb_backend import launch_for_session
                     _profile_dir = None
                     try:
-                        if self.browser_manager and getattr(self.browser_manager, 'profile_manager', None):
+                        if self.browser_manager and hasattr(self.browser_manager, 'get_session_profile_path'):
+                            _profile_dir = str(
+                                self.browser_manager.get_session_profile_path(
+                                    self.user_id, self.session_id
+                                )
+                            )
+                        elif self.browser_manager and getattr(self.browser_manager, 'profile_manager', None):
                             _profile_dir = str(self.browser_manager.profile_manager.get_user_profile_path(self.user_id))
                     except Exception:
                         _profile_dir = None
@@ -640,6 +657,11 @@ class NeoStreamingSession:
                         proxy_url=_sb_proxy,
                     )
                     self.browser, self.context = _sb_browser, _sb_browser.contexts[0]
+                    if hasattr(self.browser_manager, 'register_active_browser'):
+                        self.browser_manager.register_active_browser(
+                            self.session_id, self.browser, self.context, self.user_id,
+                            _profile_dir, self.gpu_id
+                        )
                     logger.info(
                         "[SB] session=%s backend=seleniumbase-cdp active profile=%s",
                         self.session_id, _profile_dir,
@@ -2912,8 +2934,14 @@ class NeoStreamingSession:
         log(f"Shutting down session {self.session_id} (force={force})")
         self.is_active = False
         
-        # Update profile status
-        if self.browser_manager:
+        # Only the last runtime session for a stable parent may mark the
+        # shared Admin/profile record offline.
+        try:
+            from browser_manager import profile_has_active_session
+            has_sibling = profile_has_active_session(self.user_id, exclude_session_id=self.session_id)
+        except Exception:
+            has_sibling = False
+        if self.browser_manager and not has_sibling:
             await self.browser_manager.profile_manager.update_status(self.user_id, 'offline')
         
         await self.cleanup()
@@ -3017,6 +3045,14 @@ class NeoStreamingSession:
                 # Set to None regardless
                 setattr(self, task_name, None)
         
+        # Stop URL/delta capture tasks and release this runtime session's
+        # asset leases before the live page is closed.
+        try:
+            if self.dom_capture:
+                await self.dom_capture.shutdown()
+        except Exception:
+            logger.debug("[Cleanup] DOM capture shutdown failed", exc_info=True)
+
         # Clear proxy info if one was allocated
         if self.proxy_url:
             logger.debug(f"[PROXY] Session {self.session_id}: Proxy released (host: {self.proxy_host}:{self.proxy_port})")
@@ -3026,9 +3062,13 @@ class NeoStreamingSession:
             self.proxy_username = None
             self.proxy_password = None
         
-        # Update profile status to offline
+        # Do not let one tab's cleanup mark a shared stable parent offline
+        # while another independent runtime session is still active.
         try:
-            if self.browser_manager and hasattr(self.browser_manager, 'profile_manager'):
+            from browser_manager import profile_has_active_session
+            has_sibling = profile_has_active_session(self.user_id, exclude_session_id=self.session_id)
+            if (self.browser_manager and hasattr(self.browser_manager, 'profile_manager')
+                    and not has_sibling):
                 await self.browser_manager.profile_manager.update_status(self.user_id, 'offline')
         except Exception as e:
             logger.debug(f"[Cleanup] Profile status update error: {e}")
@@ -3111,75 +3151,130 @@ class NeoStreamingSession:
         except Exception as e:
             logger.debug(f"[Cleanup] GPU manager unregister: {e}")
         
-        # Force kill browser process if force=True
-        # FIX: Only kill the specific browser process created by this tool, not all Chrome processes
+        # Force kill only a process proven to belong to this runtime profile.
+        # Never use a broad ``pkill -f`` pattern: two tabs for one stable
+        # parent deliberately have different user-data-dirs, and a regex or
+        # profile basename match can otherwise kill the sibling tab.
         if force:
             try:
                 import platform as platform_module
+                import signal
                 is_windows = platform_module.system() == 'Windows'
-                
-                # Try to get the specific browser process from browser_manager
+                browser_info = None
+                profile_path = None
                 browser_process = None
                 try:
-                    if self.browser_manager and self.session_id in self.browser_manager.active_browsers:
-                        browser_info = self.browser_manager.active_browsers[self.session_id]
-                        context = browser_info.get('context')
-                        if context and hasattr(context, 'browser') and context.browser:
-                            # For persistent context: access underlying process
-                            if hasattr(context.browser, 'process'):
-                                browser_process = context.browser.process
-                            elif hasattr(context.browser, '_connection') and hasattr(context.browser._connection, 'impl'):
-                                # Alternative way to access process for some Playwright versions
-                                try:
-                                    browser_process = context.browser._connection.impl._transport._proc
-                                except Exception:
-                                    pass
-                except Exception as e:
-                    logger.debug(f"[Cleanup] Could not get browser process: {e}")
-                
-                if browser_process:
-                    # Kill only the specific browser process
-                    if is_windows:
-                        subprocess.run(['taskkill', '/F', '/PID', str(browser_process.pid)], capture_output=True)
-                    else:
-                        subprocess.run(['kill', '-9', str(browser_process.pid)], capture_output=True)
-                    logger.debug(f"[Cleanup] Force killed specific browser process {browser_process.pid} for session: {self.session_id}")
-                else:
-                    # Fallback: kill by user_data_dir pattern (safer than killing all Chrome)
-                    profile_path = None
-                    try:
-                        if self.browser_manager and self.session_id in self.browser_manager.active_browsers:
-                            browser_info = self.browser_manager.active_browsers[self.session_id]
+                    if self.browser_manager and hasattr(self.browser_manager, 'get_active_browser'):
+                        browser_info = self.browser_manager.get_active_browser(self.session_id)
+                        if browser_info:
                             profile_path = browser_info.get('profile_dir')
+                            context = browser_info.get('context')
+                            browser_obj = getattr(context, 'browser', None) if context else None
+                            if browser_obj:
+                                if hasattr(browser_obj, 'process'):
+                                    browser_process = browser_obj.process
+                                elif (hasattr(browser_obj, '_connection')
+                                      and hasattr(browser_obj._connection, 'impl')):
+                                    try:
+                                        browser_process = (
+                                            browser_obj._connection.impl
+                                            ._transport._proc
+                                        )
+                                    except Exception:
+                                        pass
+                except Exception as exc:
+                    logger.debug("[Cleanup] Could not get owned browser process: %s", exc)
+
+                def _cmdline(pid: int) -> list:
+                    if is_windows:
+                        return []
+                    try:
+                        raw = Path(f"/proc/{int(pid)}/cmdline").read_bytes()
+                        return [part.decode(errors='replace') for part in raw.split(b'\0') if part]
+                    except Exception:
+                        return []
+
+                def _profile_from_cmdline(args: list) -> Optional[str]:
+                    for index, arg in enumerate(args):
+                        if arg == '--user-data-dir' and index + 1 < len(args):
+                            return args[index + 1]
+                        if arg.startswith('--user-data-dir='):
+                            return arg.split('=', 1)[1]
+                    return None
+
+                def _owns_profile(pid: int, target: Optional[str]) -> bool:
+                    if not target or not pid or pid <= 0:
+                        return False
+                    try:
+                        target_path = Path(target).resolve()
+                        # Runtime profiles are the only paths eligible for a
+                        # force fallback. Stable parent profiles are never
+                        # process-kill targets.
+                        root = Path(
+                            self.browser_manager.config.profile_base_path
+                        ).resolve() / '.runtime_sessions'
+                        if root not in target_path.parents:
+                            return False
+                        actual = _profile_from_cmdline(_cmdline(pid))
+                        return bool(actual) and Path(actual).resolve() == target_path
+                    except Exception:
+                        return False
+
+                target = str(profile_path) if profile_path else None
+                owned_pids = []
+                if browser_process is not None:
+                    try:
+                        pid = int(browser_process.pid)
+                        if _owns_profile(pid, target):
+                            owned_pids.append(pid)
+                        else:
+                            logger.warning(
+                                "[Cleanup] refusing force kill for %s: PID %s did not prove ownership",
+                                self.session_id, pid,
+                            )
                     except Exception:
                         pass
-                    
-                    if profile_path:
-                        # Kill Chrome processes that use this specific profile directory
-                        if is_windows:
-                            # Windows: Use tasklist to find matching processes
-                            result = subprocess.run(
-                                ['tasklist', '/FI', 'IMAGENAME eq chrome.exe', '/FO', 'CSV', '/NH'],
-                                capture_output=True
-                            )
-                            for line in result.stdout.decode().strip().split('\n'):
-                                if profile_path.split('/')[-1].split('\\')[-1] in line:  # Match profile dir name
-                                    parts = line.split(',')
-                                    if len(parts) > 0:
-                                        pid = parts[0].strip('"')
-                                        subprocess.run(['taskkill', '/F', '/PID', pid], capture_output=True)
-                                        logger.debug(f"[Cleanup] Killed Chrome process {pid} using profile: {self.session_id}")
-                        else:
-                            # Linux/Mac: Use pgrep with profile dir pattern
-                            subprocess.run(
-                                ['pkill', '-9', '-f', f'--user-data-dir.*{profile_path}'],
-                                capture_output=True
-                            )
-                            logger.debug(f"[Cleanup] Killed Chrome processes using profile: {self.session_id}")
-                    else:
-                        logger.warning(f"[Cleanup] Could not determine profile path - skipping force kill")
+
+                # If the handle is gone, enumerate only processes whose full
+                # command line contains this exact runtime profile path.
+                if not owned_pids and target and not is_windows:
+                    try:
+                        for entry in os.listdir('/proc'):
+                            if not entry.isdigit():
+                                continue
+                            pid = int(entry)
+                            if _owns_profile(pid, target):
+                                owned_pids.append(pid)
+                    except Exception:
+                        pass
+
+                for pid in sorted(set(owned_pids)):
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                        logger.debug(
+                            "[Cleanup] force killed owned browser PID %s for session %s",
+                            pid, self.session_id,
+                        )
+                    except ProcessLookupError:
+                        pass
+                    except Exception as exc:
+                        logger.debug("[Cleanup] force kill PID %s failed: %s", pid, exc)
+                if not owned_pids:
+                    logger.warning(
+                        "[Cleanup] no process with an exact runtime profile match; skipping force kill for %s",
+                        self.session_id,
+                    )
             except Exception as e:
                 logger.debug(f"[Cleanup] Force kill error: {e}")
+
+        # Remove the runtime ownership record exactly once.  The durable
+        # parent profile remains; only the private live user-data directory is
+        # eligible for cleanup.
+        try:
+            if self.browser_manager and hasattr(self.browser_manager, 'remove_active_browser'):
+                await self.browser_manager.remove_active_browser(self.session_id)
+        except Exception as e:
+            logger.debug(f"[Cleanup] Runtime browser record cleanup error: {e}")
 
         logger.debug(f"[Cleanup] Session cleaned up: {self.session_id}")
     async def _send_navigation_notification(self, new_url: str):

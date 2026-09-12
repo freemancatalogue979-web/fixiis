@@ -51,6 +51,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -192,6 +193,7 @@ CSS_EMBED_MAX_BYTES: int = int(os.environ.get("DOM_CAPTURE_CSS_EMBED_MAX_BYTES",
 
 
 _CSS_STYLE_CLOSE_RE = re.compile(r"</style", re.IGNORECASE)
+_ASSET_PATH_RE = re.compile(r"/assets/([0-9a-f]{64})(?:\.[a-z0-9]+)?", re.IGNORECASE)
 
 
 def _inline_css_safe(css_text: str) -> str:
@@ -205,6 +207,7 @@ def _inline_css_safe(css_text: str) -> str:
 # ---------------------------------------------------------------------------
 
 _SINGLEFILE_SOURCES: Optional[Dict[str, str]] = None
+_SINGLEFILE_SOURCES_LOCK = asyncio.Lock()
 
 
 def _find_singlefile_lib_dir() -> Optional[Path]:
@@ -263,7 +266,7 @@ def _find_singlefile_lib_dir() -> Optional[Path]:
     return None
 
 
-async def _load_singlefile_sources() -> Optional[Dict[str, str]]:
+async def _load_singlefile_sources_uncached() -> Optional[Dict[str, str]]:
     global _SINGLEFILE_SOURCES
     if _SINGLEFILE_SOURCES is not None:
         return _SINGLEFILE_SOURCES
@@ -350,6 +353,14 @@ async def _load_singlefile_sources() -> Optional[Dict[str, str]]:
 
     _SINGLEFILE_SOURCES = parsed
     return _SINGLEFILE_SOURCES
+
+
+async def _load_singlefile_sources() -> Optional[Dict[str, str]]:
+    """Initialize the process-wide SingleFile sources exactly once."""
+    async with _SINGLEFILE_SOURCES_LOCK:
+        if _SINGLEFILE_SOURCES is not None:
+            return _SINGLEFILE_SOURCES
+        return await _load_singlefile_sources_uncached()
 
 
 # ---------------------------------------------------------------------------
@@ -631,21 +642,20 @@ class AssetEntry:
 
 
 class AssetManager:
-    """In-memory content-addressed LRU cache for captured-page assets.
+    """Content-addressed cache with session leases.
 
-    The capture pipeline rewrites external URLs in captured HTML to
-    ``/assets/<sha256>[.<ext>]``; api.py serves the bytes from here with
-    ``Cache-Control: immutable`` so the browser only ever fetches each
-    asset once.  Process-local; a restart simply refetches on demand.
-
-    Also keeps a URL→digest memo so that repeat captures (and assets that
-    get data-URI embedded instead of cached) reuse already-fetched bytes
-    without hitting the network again — the "fetch-once per URL" promise.
+    A shared digest may be reused by many sessions, but eviction and explicit
+    clears never remove an asset while a live session still references it.
     """
 
     def __init__(self, max_items: int = CACHE_MAX_ITEMS, max_bytes: int = CACHE_MAX_BYTES) -> None:
         self._items: "OrderedDict[str, AssetEntry]" = OrderedDict()
-        self._by_url: "OrderedDict[str, str]" = OrderedDict()   # abs_url -> digest
+        self._by_url: "OrderedDict[str, str]" = OrderedDict()
+        self._refs: Dict[str, set] = {}
+        # CSS can point at other cached assets.  Keep those dependency leases
+        # alive whenever the stylesheet itself is leased by a live session.
+        self._deps: Dict[str, set] = {}
+        self._lock = threading.RLock()
         self._max_items = max_items
         self._max_bytes = max_bytes
         self._bytes = 0
@@ -654,78 +664,135 @@ class AssetManager:
         self._evictions = 0
         self._registered = 0
 
-    def register(self, data: bytes, content_type: str, url: Optional[str] = None) -> str:
-        """Store bytes under their sha256; returns the hex digest."""
+    def register(self, data: bytes, content_type: str, url: Optional[str] = None,
+                 owner_id: Optional[str] = None) -> str:
         digest = hashlib.sha256(data).hexdigest()
-        existing = self._items.get(digest)
-        if existing is not None:
-            # Refresh LRU position; first content_type wins.
-            self._items.move_to_end(digest)
-        else:
-            entry = AssetEntry(data, content_type)
-            self._items[digest] = entry
-            self._bytes += entry.size
-            self._registered += 1
-        if url:
-            self._by_url[url] = digest
-            self._by_url.move_to_end(url)
-        # Evict LRU until within both bounds.
+        with self._lock:
+            existing = self._items.get(digest)
+            if existing is not None:
+                self._items.move_to_end(digest)
+            else:
+                entry = AssetEntry(data, content_type)
+                self._items[digest] = entry
+                self._bytes += entry.size
+                self._registered += 1
+            if (content_type or "").split(";", 1)[0].strip().lower() == "text/css":
+                deps = {m.group(1).lower() for m in _ASSET_PATH_RE.finditer(data.decode("utf-8", errors="ignore"))}
+                self._deps[digest] = deps
+            if owner_id:
+                self._retain_locked(digest, str(owner_id))
+            if url:
+                self._by_url[url] = digest
+                self._by_url.move_to_end(url)
+            self._evict_unreferenced_locked()
+            return digest
+
+    def _retain_locked(self, digest: str, owner: str, seen: Optional[set] = None) -> None:
+        if digest not in self._items:
+            return
+        seen = seen or set()
+        if digest in seen:
+            return
+        seen.add(digest)
+        self._refs.setdefault(digest, set()).add(owner)
+        for dependency in self._deps.get(digest, set()):
+            self._retain_locked(dependency, owner, seen)
+
+    def retain(self, digest: str, owner_id: Optional[str]) -> bool:
+        if not digest or not owner_id:
+            return False
+        with self._lock:
+            if digest not in self._items:
+                return False
+            self._retain_locked(digest, str(owner_id))
+            return True
+
+    def _evict_unreferenced_locked(self) -> None:
         while self._items and (len(self._items) > self._max_items or self._bytes > self._max_bytes):
-            evict_digest, ev = self._items.popitem(last=False)
+            candidate = next(
+                ((digest, entry) for digest, entry in self._items.items()
+                 if not self._refs.get(digest)),
+                None,
+            )
+            if candidate is None:
+                # Every excess entry is still visible to a live session. Keep
+                # it rather than invalidating another session's mirror.
+                break
+            evict_digest, ev = candidate
+            self._items.pop(evict_digest, None)
             self._bytes -= ev.size
+            self._refs.pop(evict_digest, None)
+            self._deps.pop(evict_digest, None)
             self._evictions += 1
-            for u, d in list(self._by_url.items()):
-                if d == evict_digest:
-                    del self._by_url[u]
+            for url, digest in list(self._by_url.items()):
+                if digest == evict_digest:
+                    self._by_url.pop(url, None)
         while len(self._by_url) > self._max_items:
             self._by_url.popitem(last=False)
-        return digest
 
     def get(self, digest: str) -> Optional[AssetEntry]:
-        entry = self._items.get(digest)
-        if entry is None:
-            self._misses += 1
-            return None
-        self._hits += 1
-        self._items.move_to_end(digest)
-        return entry
+        with self._lock:
+            entry = self._items.get(digest)
+            if entry is None:
+                self._misses += 1
+                return None
+            self._hits += 1
+            self._items.move_to_end(digest)
+            return entry
 
-    def get_by_url(self, url: str) -> Optional[AssetEntry]:
-        digest = self._by_url.get(url)
-        if not digest:
-            return None
-        return self.get(digest)
+    def get_by_url(self, url: str, owner_id: Optional[str] = None) -> Optional[AssetEntry]:
+        with self._lock:
+            digest = self._by_url.get(url)
+            if digest and owner_id:
+                self._retain_locked(digest, str(owner_id))
+        return self.get(digest) if digest else None
 
     def digest_for(self, data: bytes) -> str:
         return hashlib.sha256(data).hexdigest()
 
-    async def clear(self) -> None:
-        self._items.clear()
-        self._by_url.clear()
-        self._bytes = 0
+    async def clear(self, owner_id: Optional[str] = None) -> None:
+        """Release one session, or prune only unreferenced global entries."""
+        with self._lock:
+            if owner_id is not None:
+                owner = str(owner_id)
+                for refs in self._refs.values():
+                    refs.discard(owner)
+            else:
+                # A global admin clear must not invalidate live sessions.
+                pass
+            self._evict_unreferenced_locked()
+
+    async def release_session(self, owner_id: str) -> None:
+        await self.clear(owner_id=owner_id)
 
     def stats(self) -> Dict[str, Any]:
-        return {
-            "items": len(self._items),
-            "url_entries": len(self._by_url),
-            "bytes": self._bytes,
-            "max_items": self._max_items,
-            "max_bytes": self._max_bytes,
-            "hits": self._hits,
-            "misses": self._misses,
-            "evictions": self._evictions,
-            "registered": self._registered,
-        }
+        with self._lock:
+            referenced = sum(1 for refs in self._refs.values() if refs)
+            return {
+                "items": len(self._items),
+                "url_entries": len(self._by_url),
+                "bytes": self._bytes,
+                "max_items": self._max_items,
+                "max_bytes": self._max_bytes,
+                "hits": self._hits,
+                "misses": self._misses,
+                "evictions": self._evictions,
+                "registered": self._registered,
+                "referenced_items": referenced,
+            }
 
 
 _GLOBAL_ASSET_MANAGER: Optional[AssetManager] = None
+_GLOBAL_ASSET_MANAGER_LOCK = threading.Lock()
 
 
 def get_global_asset_manager() -> AssetManager:
     """Process-wide singleton used by the capture pipeline and /assets."""
     global _GLOBAL_ASSET_MANAGER
     if _GLOBAL_ASSET_MANAGER is None:
-        _GLOBAL_ASSET_MANAGER = AssetManager()
+        with _GLOBAL_ASSET_MANAGER_LOCK:
+            if _GLOBAL_ASSET_MANAGER is None:
+                _GLOBAL_ASSET_MANAGER = AssetManager()
     return _GLOBAL_ASSET_MANAGER
 
 
@@ -1151,7 +1218,7 @@ async def _fetch_one_asset(client: Any, sem: asyncio.Semaphore, abs_url: str) ->
 
 
 async def _cache_css_text(css_text: str, css_abs_url: str, client: Any, sem: asyncio.Semaphore,
-                          manager: AssetManager, depth: int) -> bytes:
+                          manager: AssetManager, depth: int, owner_id: Optional[str] = None) -> bytes:
     """Fetch+rewrite the resources referenced by a CSS body, recursively
     (bounded depth), then return the rewritten CSS bytes.  Small image/font
     refs are data-URI embedded (logo-in-CSS case); larger refs and nested
@@ -1184,27 +1251,29 @@ async def _cache_css_text(css_text: str, css_abs_url: str, client: Any, sem: asy
         if is_css_ref and depth < 2:
             try:
                 sub_text = data.decode("utf-8", errors="ignore")
-                data = await _cache_css_text(sub_text, abs_u, client, sem, manager, depth + 1)
+                data = await _cache_css_text(
+                    sub_text, abs_u, client, sem, manager, depth + 1, owner_id=owner_id
+                )
                 ctype = "text/css"
             except Exception:
                 pass
             # Small nested css embeds as a data: URI (works in @import and
             # url()) so an inlined parent <style> stays fully self-contained.
             if CSS_EMBED_MAX_BYTES > 0 and len(data) <= CSS_EMBED_MAX_BYTES:
-                manager.register(data, ctype, url=abs_u)
+                manager.register(data, ctype, url=abs_u, owner_id=owner_id)
                 repl[abs_u] = _data_uri(data, ctype)
                 continue
-            digest = manager.register(data, ctype, url=abs_u)
+            digest = manager.register(data, ctype, url=abs_u, owner_id=owner_id)
             ext = _guess_ext_from_content_type(ctype)
             repl[abs_u] = f"/assets/{digest}{'.' + ext if ext else ''}"
             continue
         # Small image/font refs: embed as data URI.
         if (EMBED_MAX_BYTES > 0 and len(data) <= EMBED_MAX_BYTES
                 and (ctype.startswith(("image/", "font/", "application/font")) or not ctype)):
-            manager.register(data, ctype, url=abs_u)
+            manager.register(data, ctype, url=abs_u, owner_id=owner_id)
             repl[abs_u] = _data_uri(data, ctype)
             continue
-        digest = manager.register(data, ctype, url=abs_u)
+        digest = manager.register(data, ctype, url=abs_u, owner_id=owner_id)
         ext = _guess_ext_from_content_type(ctype)
         repl[abs_u] = f"/assets/{digest}{'.' + ext if ext else ''}"
 
@@ -1257,7 +1326,8 @@ def _strip_script_tags(html: str) -> str:
     return out
 
 
-async def _rewrite_assets_to_cache(html: str, base_url: str, page: Any = None) -> Tuple[str, List[Dict[str, Any]]]:
+async def _rewrite_assets_to_cache(html: str, base_url: str, page: Any = None,
+                                  owner_id: Optional[str] = None) -> Tuple[str, List[Dict[str, Any]]]:
     """Resolve external asset refs in captured HTML: small images/icons are
     data-URI EMBEDDED (see EMBED_MAX_BYTES), small stylesheets become inline
     <style> blocks with their inner refs rewritten (CSS_EMBED_MAX_BYTES),
@@ -1312,7 +1382,7 @@ async def _rewrite_assets_to_cache(html: str, base_url: str, page: Any = None) -
     hits: Dict[str, Tuple[bytes, str]] = {}
     fetch_list: List[str] = []
     for u in candidates:
-        ent = manager.get_by_url(u)
+        ent = manager.get_by_url(u, owner_id=owner_id)
         if ent is not None:
             hits[u] = (ent.data, ent.content_type)
         else:
@@ -1357,7 +1427,7 @@ async def _rewrite_assets_to_cache(html: str, base_url: str, page: Any = None) -
         # rewritten (step 4) — memoizing raw CSS would both skip the inner
         # rewrite forever and cache the wrong bytes.
         if kind_by_url.get(abs_u) != "css":
-            manager.register(data, ctype, url=abs_u)
+            manager.register(data, ctype, url=abs_u, owner_id=owner_id)
 
     # -- 4. Decision per ref: embed / cache / leave -------------------------
     repl: Dict[str, str] = {}
@@ -1373,7 +1443,7 @@ async def _rewrite_assets_to_cache(html: str, base_url: str, page: Any = None) -
         kind = kind_by_url.get(abs_u, "other")
         try:
             if kind == "css":
-                if abs_u not in manager._by_url:
+                if manager.get_by_url(abs_u, owner_id=owner_id) is None:
                     # Fresh CSS: rewrite its inner url()/@import refs (small
                     # images embed below threshold, fonts/nested css via
                     # cache/data-uri), then memoize the rewritten bytes.
@@ -1384,9 +1454,11 @@ async def _rewrite_assets_to_cache(html: str, base_url: str, page: Any = None) -
                                                               "Accept-Language": "en-US,en;q=0.9"}) as client:
                             sem = asyncio.Semaphore(6)
                             sub_text = data.decode("utf-8", errors="ignore")
-                            data = await _cache_css_text(sub_text, abs_u, client, sem, manager, depth=0)
+                            data = await _cache_css_text(
+                                sub_text, abs_u, client, sem, manager, depth=0, owner_id=owner_id
+                            )
                         ctype = "text/css"
-                        manager.register(data, ctype, url=abs_u)
+                        manager.register(data, ctype, url=abs_u, owner_id=owner_id)
                     except Exception as exc:
                         logger.debug("css inner rewrite failed for %s: %s", abs_u[:120], exc)
                 # Small stylesheets INLINE as <style> (client needs no
@@ -1511,6 +1583,7 @@ async def _capture_with_single_file(
     *,
     timeout: int = SINGLEFILE_TIMEOUT_S,
     max_attempts: int = 3,
+    extension_only: bool = False,
 ) -> Optional[str]:
     """Capture the current page using SingleFile.
 
@@ -1521,8 +1594,9 @@ async def _capture_with_single_file(
     HTML.
 
     Set ``SINGLEFILE_CAPTURE_MODE=library`` to use the legacy JS-library
-    injection path instead. ``max_attempts`` lets archive callers bound the
-    retry budget; the live mirror keeps the historical retry default.
+    injection path instead, unless ``extension_only`` is true.
+    ``max_attempts`` lets callers bound one retry batch; callers that need to
+    wait for a browser extension may repeat batches while the page is alive.
     """
     if page is None:
         return None
@@ -1534,6 +1608,9 @@ async def _capture_with_single_file(
         return None
 
     # Fast path: if both capture backends are disabled, don't even try.
+    if extension_only and not _is_extension_capture_enabled():
+        logger.warning("SingleFile extension capture is unavailable; returning None")
+        return None
     if not _is_extension_capture_enabled() and not _is_live_library_enabled():
         logger.warning(
             "SingleFile capture is fully disabled "
@@ -1542,8 +1619,10 @@ async def _capture_with_single_file(
         )
         return None
 
-    mode = os.environ.get("SINGLEFILE_CAPTURE_MODE", "extension").strip().lower()
-    if mode == "library":
+    mode = "extension" if extension_only else os.environ.get(
+        "SINGLEFILE_CAPTURE_MODE", "extension"
+    ).strip().lower()
+    if mode == "library" and not extension_only:
         if not _is_live_library_enabled():
             logger.warning(
                 "SingleFile library capture requested but "
@@ -3264,6 +3343,10 @@ class DOMCaptureSession:
             except (asyncio.CancelledError, Exception):
                 pass
         self.url_watch_task = None
+        try:
+            await get_global_asset_manager().release_session(self.client_id)
+        except Exception:
+            logger.debug("asset lease release failed for %s", self.client_id, exc_info=True)
 
     async def _capture_navigation_once(self, reason: str) -> Optional[str]:
         """Serialize one navigation recovery send at a time.
@@ -3583,7 +3666,9 @@ class DOMCaptureSession:
                 try:
                     if DOM_CAPTURE_STRIP_SCRIPTS:
                         html_data = _strip_script_tags(html_data)
-                    html_data, assets_meta = await _rewrite_assets_to_cache(html_data, url, self.page)
+                    html_data, assets_meta = await _rewrite_assets_to_cache(
+                        html_data, url, self.page, owner_id=self.client_id
+                    )
                 except ImportError:
                     self._assets_ok = False
                 except Exception as exc:

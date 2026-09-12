@@ -31,15 +31,75 @@ import sys
 import time
 import shutil
 import json
+import hashlib
 import socket
 import subprocess
 import urllib.request
 import threading
+import tempfile
 from typing import Dict, Optional, Any, List
 from pathlib import Path
 import logging
 
 logger = logging.getLogger(__name__)
+
+# Profile metadata/cookie files are shared by BrowserManager instances even
+# though each runtime browser is isolated.  Key the short synchronous file
+# critical sections by canonical parent profile so concurrent sessions cannot
+# truncate or overwrite one another's durable state.
+_PROFILE_IO_LOCKS: Dict[str, threading.RLock] = {}
+_PROFILE_IO_LOCKS_GUARD = threading.RLock()
+_PROFILE_ACTIVE_SESSIONS: Dict[str, set] = {}
+_PROFILE_ACTIVE_GUARD = threading.RLock()
+
+def register_profile_session(user_id: str, session_id: str) -> None:
+    if not user_id or not session_id:
+        return
+    with _PROFILE_ACTIVE_GUARD:
+        _PROFILE_ACTIVE_SESSIONS.setdefault(str(user_id), set()).add(str(session_id))
+
+def unregister_profile_session(user_id: str, session_id: str) -> None:
+    if not user_id or not session_id:
+        return
+    with _PROFILE_ACTIVE_GUARD:
+        sessions = _PROFILE_ACTIVE_SESSIONS.get(str(user_id))
+        if not sessions:
+            return
+        sessions.discard(str(session_id))
+        if not sessions:
+            _PROFILE_ACTIVE_SESSIONS.pop(str(user_id), None)
+
+def profile_has_active_session(user_id: str, exclude_session_id: Optional[str] = None) -> bool:
+    with _PROFILE_ACTIVE_GUARD:
+        sessions = _PROFILE_ACTIVE_SESSIONS.get(str(user_id), set())
+        if exclude_session_id is None:
+            return bool(sessions)
+        return any(sid != str(exclude_session_id) for sid in sessions)
+
+def _profile_io_lock(profile_path: Path) -> threading.RLock:
+    key = str(profile_path.resolve())
+    with _PROFILE_IO_LOCKS_GUARD:
+        lock = _PROFILE_IO_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _PROFILE_IO_LOCKS[key] = lock
+        return lock
+
+def _atomic_json_write(path: Path, value: Any) -> None:
+    """Write one profile record without exposing a partially-written JSON file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with open(temp, "w", encoding="utf-8") as fh:
+            json.dump(value, fh, indent=2, ensure_ascii=False)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(temp, path)
+    finally:
+        try:
+            temp.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 # Mobile stealth toggle - set to False to disable all mobile stealth functionality
 ENABLE_MOBILE_STEALTH = True
@@ -964,21 +1024,22 @@ class UserProfileManager:
         self.config = config
         self.base_dir = Path(config.profile_base_path)
         self.base_dir.mkdir(parents=True, exist_ok=True)
-        self._lock = asyncio.Lock()
+        self._lock = threading.RLock()
         self._user_metadata: Dict[str, Dict] = {}
     
     def get_user_profile_path(self, user_id: str) -> Path:
-        """Get profile directory for user - creates full structure if not exists"""
+        """Get profile directory for user - creates full structure if not exists."""
         profile_path = self.base_dir / user_id
-        profile_path.mkdir(parents=True, exist_ok=True)
-        
-        # Create subdirectories for different data types
-        (profile_path / "Default").mkdir(parents=True, exist_ok=True)
-        (profile_path / "Local Storage").mkdir(parents=True, exist_ok=True)
-        (profile_path / "Session Storage").mkdir(parents=True, exist_ok=True)
-        (profile_path / "Extension State").mkdir(parents=True, exist_ok=True)
-        (profile_path / "Service Worker").mkdir(parents=True, exist_ok=True)
-        
+        # Directory creation participates in the same process-wide lock as
+        # metadata/cookie IO, so a cleanup cannot race a partially-created
+        # profile tree.
+        with _profile_io_lock(profile_path):
+            profile_path.mkdir(parents=True, exist_ok=True)
+            (profile_path / "Default").mkdir(parents=True, exist_ok=True)
+            (profile_path / "Local Storage").mkdir(parents=True, exist_ok=True)
+            (profile_path / "Session Storage").mkdir(parents=True, exist_ok=True)
+            (profile_path / "Extension State").mkdir(parents=True, exist_ok=True)
+            (profile_path / "Service Worker").mkdir(parents=True, exist_ok=True)
         return profile_path
     
     def get_or_create_profile(self, user_id: str) -> Path:
@@ -987,8 +1048,8 @@ class UserProfileManager:
     
     def cleanup_profile(self, user_id: str) -> None:
         """Remove profile directory for user"""
-        with self._lock:
-            profile_path = self.base_dir / user_id
+        profile_path = self.base_dir / user_id
+        with _profile_io_lock(profile_path):
             if profile_path.exists():
                 for attempt in range(3):
                     try:
@@ -996,13 +1057,13 @@ class UserProfileManager:
                         break
                     except PermissionError:
                         # Use non-blocking approach - just retry immediately
-                        import time
-                        time.sleep(0.1)  # Shorter sleep for retry
+                        time.sleep(0.1)
     
     def profile_exists(self, user_id: str) -> bool:
-        """Check if profile exists for user"""
+        """Check if profile exists for user under the profile lock."""
         profile_path = self.base_dir / user_id
-        return profile_path.exists()
+        with _profile_io_lock(profile_path):
+            return profile_path.exists()
     
     async def save_user_info(self, user_id: str, info: Dict) -> None:
         """Save user information to About.txt and meta.json"""
@@ -1014,55 +1075,56 @@ class UserProfileManager:
         
         try:
             # Save About.txt
-            with open(about_file, 'w', encoding='utf-8') as f:
-                f.write("=" * 60 + "\n")
-                f.write("USER PROFILE INFORMATION\n")
-                f.write("=" * 60 + "\n\n")
-                f.write(f"User ID: {user_id}\n")
-                f.write(f"Created: {info.get('created_at', current_time)}\n")
-                f.write(f"Last Updated: {current_time}\n\n")
+            with _profile_io_lock(profile_path):
+                with open(about_file, 'w', encoding='utf-8') as f:
+                    f.write("=" * 60 + "\n")
+                    f.write("USER PROFILE INFORMATION\n")
+                    f.write("=" * 60 + "\n\n")
+                    f.write(f"User ID: {user_id}\n")
+                    f.write(f"Created: {info.get('created_at', current_time)}\n")
+                    f.write(f"Last Updated: {current_time}\n\n")
                 
-                f.write("-" * 40 + "\n")
-                f.write("CONNECTION INFO\n")
-                f.write("-" * 40 + "\n")
-                f.write(f"IP Address: {info.get('ip', 'Unknown')}\n")
-                f.write(f"Port: {info.get('port', 'Unknown')}\n")
-                f.write(f"Protocol: {info.get('protocol', 'https')}\n\n")
+                    f.write("-" * 40 + "\n")
+                    f.write("CONNECTION INFO\n")
+                    f.write("-" * 40 + "\n")
+                    f.write(f"IP Address: {info.get('ip', 'Unknown')}\n")
+                    f.write(f"Port: {info.get('port', 'Unknown')}\n")
+                    f.write(f"Protocol: {info.get('protocol', 'https')}\n\n")
                 
-                f.write("-" * 40 + "\n")
-                f.write("LOCATION INFO\n")
-                f.write("-" * 40 + "\n")
-                f.write(f"Country: {info.get('country', 'Unknown')}\n")
-                f.write(f"State/Region: {info.get('state', 'Unknown')}\n\n")
+                    f.write("-" * 40 + "\n")
+                    f.write("LOCATION INFO\n")
+                    f.write("-" * 40 + "\n")
+                    f.write(f"Country: {info.get('country', 'Unknown')}\n")
+                    f.write(f"State/Region: {info.get('state', 'Unknown')}\n\n")
                 
-                f.write("-" * 40 + "\n")
-                f.write("BROWSER INFO\n")
-                f.write("-" * 40 + "\n")
-                f.write(f"User Agent: {info.get('user_agent', 'Unknown')}\n")
-                f.write(f"Browser: {info.get('browser', 'Chrome')}\n")
-                f.write(f"Browser Version: {info.get('browser_version', 'Unknown')}\n")
-                f.write(f"Platform: {info.get('platform', 'Windows')}\n")
-                f.write(f"Viewport: {info.get('viewport', 'Unknown')}\n")
-                f.write(f"Pixel Ratio: {info.get('pixel_ratio', '1.0')}\n\n")
+                    f.write("-" * 40 + "\n")
+                    f.write("BROWSER INFO\n")
+                    f.write("-" * 40 + "\n")
+                    f.write(f"User Agent: {info.get('user_agent', 'Unknown')}\n")
+                    f.write(f"Browser: {info.get('browser', 'Chrome')}\n")
+                    f.write(f"Browser Version: {info.get('browser_version', 'Unknown')}\n")
+                    f.write(f"Platform: {info.get('platform', 'Windows')}\n")
+                    f.write(f"Viewport: {info.get('viewport', 'Unknown')}\n")
+                    f.write(f"Pixel Ratio: {info.get('pixel_ratio', '1.0')}\n\n")
                 
-                f.write("-" * 40 + "\n")
-                f.write("SESSION INFO\n")
-                f.write("-" * 40 + "\n")
-                f.write(f"Session Started: {info.get('session_start', 'Unknown')}\n")
-                f.write(f"Total Sessions: {info.get('total_sessions', 1)}\n")
-                f.write(f"Current URL: {info.get('current_url', 'None')}\n\n")
+                    f.write("-" * 40 + "\n")
+                    f.write("SESSION INFO\n")
+                    f.write("-" * 40 + "\n")
+                    f.write(f"Session Started: {info.get('session_start', 'Unknown')}\n")
+                    f.write(f"Total Sessions: {info.get('total_sessions', 1)}\n")
+                    f.write(f"Current URL: {info.get('current_url', 'None')}\n\n")
                 
-                f.write("-" * 40 + "\n")
-                f.write("PROFILE SETTINGS\n")
-                f.write("-" * 40 + "\n")
-                f.write(f"Profile Enabled: {info.get('profile_enabled', True)}\n")
-                f.write(f"Stealth Mode: {info.get('stealth_mode', True)}\n")
-                f.write(f"Headless Mode: {info.get('headless', False)}\n")
-                f.write(f"GPU Mode: {info.get('gpu_mode', 'CPU')}\n\n")
+                    f.write("-" * 40 + "\n")
+                    f.write("PROFILE SETTINGS\n")
+                    f.write("-" * 40 + "\n")
+                    f.write(f"Profile Enabled: {info.get('profile_enabled', True)}\n")
+                    f.write(f"Stealth Mode: {info.get('stealth_mode', True)}\n")
+                    f.write(f"Headless Mode: {info.get('headless', False)}\n")
+                    f.write(f"GPU Mode: {info.get('gpu_mode', 'CPU')}\n\n")
                 
-                f.write("=" * 60 + "\n")
-                f.write("AUTO-GENERATED BY NEO BROWSER STREAM\n")
-                f.write("=" * 60 + "\n")
+                    f.write("=" * 60 + "\n")
+                    f.write("AUTO-GENERATED BY NEO BROWSER STREAM\n")
+                    f.write("=" * 60 + "\n")
             
             # Save meta.json (for Admin panel)
             meta_data = {
@@ -1074,83 +1136,118 @@ class UserProfileManager:
                 "total_sessions": info.get('total_sessions', 1),
                 "sites_count": 0
             }
-            with open(meta_file, 'w', encoding='utf-8') as f:
-                json.dump(meta_data, f, indent=2, ensure_ascii=False)
+            # Merge with the latest metadata under the shared parent lock; a
+            # reconnect from another runtime session must not erase status or
+            # URL fields written milliseconds earlier.
+            with _profile_io_lock(profile_path):
+                latest = {}
+                if meta_file.exists():
+                    try:
+                        with open(meta_file, 'r', encoding='utf-8') as f:
+                            loaded = json.load(f)
+                        if isinstance(loaded, dict):
+                            latest = loaded
+                    except Exception:
+                        pass
+                # ``save_user_info`` is connection metadata, not an
+                # authoritative liveness update. Preserve fields owned by
+                # heartbeat/status writers unless this call explicitly set
+                # them.
+                if "status" not in info:
+                    meta_data.pop("status", None)
+                if "current_url" not in info:
+                    meta_data.pop("current_url", None)
+                if "total_sessions" not in info:
+                    meta_data.pop("total_sessions", None)
+                if "sites_count" not in info:
+                    meta_data.pop("sites_count", None)
+                latest.update(meta_data)
+                _atomic_json_write(meta_file, latest)
                 
         except Exception as e:
                 logger.error(f"[Profile Error] {e}")
     
     async def update_status(self, user_id: str, status: str, current_url: str = '') -> None:
-        """Update profile status in meta.json"""
+        """Update profile status without losing a concurrent session's fields."""
         profile_path = self.get_user_profile_path(user_id)
         meta_file = profile_path / "meta.json"
-        
         try:
-            meta_data = {}
-            if meta_file.exists():
-                with open(meta_file, 'r', encoding='utf-8') as f:
-                    meta_data = json.load(f)
-            
-            meta_data['status'] = status
-            meta_data['last_active'] = time.strftime('%Y-%m-%d %H:%M:%S')
-            if current_url:
-                meta_data['current_url'] = current_url
-            
-            with open(meta_file, 'w', encoding='utf-8') as f:
-                json.dump(meta_data, f, indent=2, ensure_ascii=False)
-                
+            with _profile_io_lock(profile_path):
+                meta_data = {}
+                if meta_file.exists():
+                    try:
+                        with open(meta_file, 'r', encoding='utf-8') as f:
+                            loaded = json.load(f)
+                        if isinstance(loaded, dict):
+                            meta_data = loaded
+                    except Exception:
+                        pass
+                meta_data['status'] = status
+                meta_data['last_active'] = time.strftime('%Y-%m-%d %H:%M:%S')
+                if current_url:
+                    meta_data['current_url'] = current_url
+                _atomic_json_write(meta_file, meta_data)
         except Exception as e:
-                logger.error(f"[Profile Error] {e}")
-    
+            logger.error(f"[Profile Error] {e}")
+
     async def add_visited_site(self, user_id: str, domain: str, title: str = '', favicon_url: str = '') -> None:
-        """Add a visited site to visited_sites.json and save favicon"""
+        """Merge a visited site without losing another session's update."""
         profile_path = self.get_user_profile_path(user_id)
         sites_file = profile_path / "visited_sites.json"
         favicons_dir = profile_path / "favicons"
         favicons_dir.mkdir(exist_ok=True)
-        
+        favicon_path = favicons_dir / f"{domain.replace('.', '_')}.png"
+
         try:
-            sites = []
-            if sites_file.exists():
-                with open(sites_file, 'r', encoding='utf-8') as f:
-                    sites = json.load(f)
-            
-            # Check if site already exists
-            existing_idx = None
-            for i, site in enumerate(sites):
-                if site.get('domain') == domain:
-                    existing_idx = i
-                    break
-            
-            # Download and save favicon
-            favicon_path = favicons_dir / f"{domain.replace('.', '_')}.png"
+            # Network IO is deliberately outside the profile lock.  The final
+            # read-modify-write below is repeated after the download so two
+            # concurrent tabs merge against the newest list.
             saved_favicon_url = await self._download_favicon(domain, favicon_path)
-            
             site_entry = {
                 "domain": domain,
-                "favicon_url": saved_favicon_url,
-                "favicon_local": str(favicon_path.relative_to(profile_path)) if favicon_path.exists() else "",
+                "favicon_url": saved_favicon_url or favicon_url or f"https://{domain}/favicon.ico",
+                "favicon_local": (
+                    str(favicon_path.relative_to(profile_path))
+                    if favicon_path.exists() else ""
+                ),
                 "last_visited": time.strftime('%Y-%m-%d %H:%M:%S'),
-                "title": title
+                "title": title,
             }
-            
-            if existing_idx is not None:
-                sites[existing_idx] = site_entry
-            else:
-                sites.insert(0, site_entry)
-            
-            # Keep only last 100 sites
-            sites = sites[:100]
-            
-            with open(sites_file, 'w', encoding='utf-8') as f:
-                json.dump(sites, f, indent=2, ensure_ascii=False)
-            
-            # Update sites count in meta.json
-            await self._update_sites_count(user_id, len(sites))
-                
+            with _profile_io_lock(profile_path):
+                sites = []
+                if sites_file.exists():
+                    try:
+                        with open(sites_file, 'r', encoding='utf-8') as f:
+                            loaded = json.load(f)
+                        if isinstance(loaded, list):
+                            sites = [item for item in loaded if isinstance(item, dict)]
+                    except Exception:
+                        pass
+                existing_idx = next(
+                    (i for i, site in enumerate(sites)
+                     if site.get('domain') == domain),
+                    None,
+                )
+                if existing_idx is None:
+                    sites.insert(0, site_entry)
+                else:
+                    sites[existing_idx] = site_entry
+                sites = sites[:100]
+                _atomic_json_write(sites_file, sites)
+
+                meta_file = profile_path / "meta.json"
+                if meta_file.exists():
+                    try:
+                        with open(meta_file, 'r', encoding='utf-8') as f:
+                            meta_data = json.load(f)
+                        if isinstance(meta_data, dict):
+                            meta_data['sites_count'] = len(sites)
+                            _atomic_json_write(meta_file, meta_data)
+                    except Exception:
+                        pass
         except Exception as e:
-                logger.error(f"[Profile Error] {e}")
-    
+            logger.error(f"[Profile Error] {e}")
+
     async def _download_favicon(self, domain: str, favicon_path: Path) -> str:
         """Download favicon for a domain and save to profile folder"""
         try:
@@ -1161,8 +1258,23 @@ class UserProfileManager:
                 data = response.read()
                 # Save as PNG if valid image
                 if data and len(data) > 0:
-                    with open(favicon_path, 'wb') as f:
-                        f.write(data)
+                    # Avoid readers observing a partially-written favicon.
+                    fd, tmp_name = tempfile.mkstemp(
+                        prefix=f".{favicon_path.name}.",
+                        suffix=".tmp",
+                        dir=str(favicon_path.parent),
+                    )
+                    try:
+                        with os.fdopen(fd, 'wb') as f:
+                            f.write(data)
+                            f.flush()
+                            os.fsync(f.fileno())
+                        os.replace(tmp_name, favicon_path)
+                    finally:
+                        try:
+                            os.unlink(tmp_name)
+                        except FileNotFoundError:
+                            pass
                     return f"/api/profiles/favicons/{favicon_path.name}"
         except Exception as e:
                 logger.error(f"[Profile Error] {e}")
@@ -1173,8 +1285,9 @@ class UserProfileManager:
         """Get favicon path for a site"""
         profile_path = self.get_user_profile_path(user_id)
         favicon_path = profile_path / "favicons" / f"{domain.replace('.', '_')}.png"
-        if favicon_path.exists():
-            return f"/api/profiles/favicons/{favicon_path.name}"
+        with _profile_io_lock(profile_path):
+            if favicon_path.exists():
+                return f"/api/profiles/favicons/{favicon_path.name}"
         return f"https://{domain}/favicon.ico"
     
     async def _update_sites_count(self, user_id: str, count: int) -> None:
@@ -1183,12 +1296,13 @@ class UserProfileManager:
         meta_file = profile_path / "meta.json"
         
         try:
-            if meta_file.exists():
-                with open(meta_file, 'r', encoding='utf-8') as f:
-                    meta_data = json.load(f)
-                meta_data['sites_count'] = count
-                with open(meta_file, 'w', encoding='utf-8') as f:
-                    json.dump(meta_data, f, indent=2, ensure_ascii=False)
+            with _profile_io_lock(profile_path):
+                if meta_file.exists():
+                    with open(meta_file, 'r', encoding='utf-8') as f:
+                        meta_data = json.load(f)
+                    if isinstance(meta_data, dict):
+                        meta_data['sites_count'] = count
+                        _atomic_json_write(meta_file, meta_data)
         except Exception as e:
                 logger.error(f"[Profile Error] {e}")
     
@@ -1198,9 +1312,11 @@ class UserProfileManager:
         sites_file = profile_path / "visited_sites.json"
         
         try:
-            if sites_file.exists():
-                with open(sites_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
+            with _profile_io_lock(profile_path):
+                if sites_file.exists():
+                    with open(sites_file, 'r', encoding='utf-8') as f:
+                        loaded = json.load(f)
+                    return loaded if isinstance(loaded, list) else []
         except Exception as e:
                 logger.error(f"[Profile Error] {e}")
         
@@ -1212,9 +1328,11 @@ class UserProfileManager:
         meta_file = profile_path / "meta.json"
         
         try:
-            if meta_file.exists():
-                with open(meta_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
+            with _profile_io_lock(profile_path):
+                if meta_file.exists():
+                    with open(meta_file, 'r', encoding='utf-8') as f:
+                        loaded = json.load(f)
+                    return loaded if isinstance(loaded, dict) else {}
         except Exception as e:
                 logger.error(f"[Profile Error] {e}")
         
@@ -1247,162 +1365,195 @@ class UserProfileManager:
         return profiles
     
     async def update_cookies(self, user_id: str, domain: str, cookies: List[Dict]) -> None:
-        """Update cookies for a specific domain"""
+        """Merge one domain's cookies under the parent-profile file lock."""
         profile_path = self.get_user_profile_path(user_id)
         cookies_file = profile_path / "cookies.json"
-        
         try:
-            # Load existing cookies
-            all_cookies = {}
-            if cookies_file.exists():
-                try:
-                    with open(cookies_file, 'r', encoding='utf-8') as f:
-                        all_cookies = json.load(f)
-                except Exception:
-                    pass
-            
-            # Update cookies for this domain
-            all_cookies[domain] = {
-                "updated_at": time.strftime('%Y-%m-%d %H:%M:%S'),
-                "cookies": cookies
-            }
-            
-            # Save updated cookies
-            with open(cookies_file, 'w', encoding='utf-8') as f:
-                json.dump(all_cookies, f, indent=2, ensure_ascii=False)
-                
+            with _profile_io_lock(profile_path):
+                current: List[Dict] = []
+                if cookies_file.exists():
+                    try:
+                        with open(cookies_file, 'r', encoding='utf-8') as f:
+                            raw = json.load(f)
+                        if isinstance(raw, dict) and isinstance(raw.get("cookies"), list):
+                            current = [c for c in raw["cookies"] if isinstance(c, dict)]
+                        elif isinstance(raw, dict):
+                            for value in raw.values():
+                                if isinstance(value, dict) and isinstance(value.get("cookies"), list):
+                                    current.extend(c for c in value["cookies"] if isinstance(c, dict))
+                    except Exception:
+                        pass
+                incoming = [dict(c) for c in (cookies or []) if isinstance(c, dict)]
+                by_key = {
+                    (str(c.get("name", "")), str(c.get("domain", "")), str(c.get("path", "/"))): c
+                    for c in current
+                }
+                for cookie in incoming:
+                    cookie.setdefault("domain", domain)
+                    by_key[(str(cookie.get("name", "")), str(cookie.get("domain", domain)), str(cookie.get("path", "/")))] = cookie
+                merged = list(by_key.values())
+                _atomic_json_write(cookies_file, {
+                    "saved_at": time.strftime('%Y-%m-%d %H:%M:%S'),
+                    "cookie_count": len(merged),
+                    "cookies": merged,
+                })
         except Exception as e:
-                logger.error(f"[Profile Error] {e}")
-    
+            logger.error(f"[Profile Error] {e}")
+
     async def save_cookies(self, user_id: str, cookies: List[Dict]) -> None:
-        """Save all cookies to cookies.json"""
+        """Merge a session snapshot into the durable cookie set atomically."""
         profile_path = self.get_user_profile_path(user_id)
         cookies_file = profile_path / "cookies.json"
-        
         try:
-            cookie_data = {
-                "saved_at": time.strftime('%Y-%m-%d %H:%M:%S'),
-                "cookie_count": len(cookies),
-                "cookies": cookies
-            }
-            
-            with open(cookies_file, 'w', encoding='utf-8') as f:
-                json.dump(cookie_data, f, indent=2, ensure_ascii=False)
-                
+            with _profile_io_lock(profile_path):
+                existing: List[Dict] = []
+                if cookies_file.exists():
+                    try:
+                        with open(cookies_file, 'r', encoding='utf-8') as f:
+                            raw = json.load(f)
+                        if isinstance(raw, dict) and isinstance(raw.get("cookies"), list):
+                            existing = [c for c in raw["cookies"] if isinstance(c, dict)]
+                        elif isinstance(raw, dict):
+                            for value in raw.values():
+                                if isinstance(value, dict) and isinstance(value.get("cookies"), list):
+                                    existing.extend(c for c in value["cookies"] if isinstance(c, dict))
+                    except Exception:
+                        pass
+                by_key = {
+                    (str(c.get("name", "")), str(c.get("domain", "")), str(c.get("path", "/"))): c
+                    for c in existing
+                }
+                for cookie in (cookies or []):
+                    if not isinstance(cookie, dict):
+                        continue
+                    key = (str(cookie.get("name", "")), str(cookie.get("domain", "")), str(cookie.get("path", "/")))
+                    by_key[key] = dict(cookie)
+                merged = list(by_key.values())
+                _atomic_json_write(cookies_file, {
+                    "saved_at": time.strftime('%Y-%m-%d %H:%M:%S'),
+                    "cookie_count": len(merged),
+                    "cookies": merged,
+                })
         except Exception as e:
-                logger.error(f"[Profile Error] {e}")
-    
+            logger.error(f"[Profile Error] {e}")
+
     async def load_cookies(self, user_id: str) -> List[Dict]:
         """Load cookies from cookies.json"""
         profile_path = self.get_user_profile_path(user_id)
         cookies_file = profile_path / "cookies.json"
         
         try:
-            if cookies_file.exists():
-                with open(cookies_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    return data.get('cookies', [])
+            with _profile_io_lock(profile_path):
+                if cookies_file.exists():
+                    with open(cookies_file, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    if isinstance(data, dict) and isinstance(data.get('cookies'), list):
+                        return list(data['cookies'])
         except Exception as e:
                 logger.error(f"[Profile Error] {e}")
         
         return []
     
     def get_cookie_domains(self, user_id: str) -> List[Dict]:
-        """Get all domains from cookies.json with favicons for profile display"""
+        """Get cookie domains under the shared profile read lock."""
         profile_path = self.get_user_profile_path(user_id)
         cookies_file = profile_path / "cookies.json"
-        
         try:
-            if cookies_file.exists():
+            with _profile_io_lock(profile_path):
+                if not cookies_file.exists():
+                    return []
                 with open(cookies_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                    domains = []
-                    # cookies.json format: {"domain1": {...}, "domain2": {...}}
-                    if isinstance(data, dict):
-                        for domain, domain_data in data.items():
-                            if isinstance(domain_data, dict):
-                                domains.append({
-                                    "domain": domain,
-                                    "favicon_url": f"https://{domain}/favicon.ico",
-                                    "updated_at": domain_data.get("updated_at", "")
-                                })
-                    # Also check for old format with "saved_at" and "cookies" keys
-                    elif isinstance(data, dict) and "cookies" in data:
-                        return []  # Old format, skip
-                    return domains
+                domains = set()
+                if isinstance(data, dict) and isinstance(data.get("cookies"), list):
+                    for cookie in data["cookies"]:
+                        if isinstance(cookie, dict) and cookie.get("domain"):
+                            domains.add(str(cookie["domain"]))
+                elif isinstance(data, dict):
+                    # Legacy format: {domain: {cookies/data/...}}
+                    for domain, domain_data in data.items():
+                        if domain not in {"saved_at", "cookie_count"} and isinstance(domain_data, dict):
+                            domains.add(str(domain))
+                return [
+                    {
+                        "domain": domain,
+                        "favicon_url": f"https://{domain}/favicon.ico",
+                        "updated_at": "",
+                    }
+                    for domain in sorted(domains)
+                ]
         except Exception as e:
-                logger.error(f"[Profile Error] {e}")
-        
+            logger.error(f"[Profile Error] {e}")
         return []
-    
+
     async def save_local_storage(self, user_id: str, origin: str, data: Dict) -> None:
-        """Save local storage data for a specific origin"""
+        """Atomically save local storage for one origin."""
         profile_path = self.get_user_profile_path(user_id)
-        storage_file = profile_path / "Local Storage" / f"{origin.replace('https://', '').replace('http://', '').replace('.', '_')}.json"
-        
+        safe_origin = (origin.replace('https://', '').replace('http://', '')
+                       .replace('.', '_').replace('/', '_').replace('\\', '_'))
+        storage_file = profile_path / "Local Storage" / f"{safe_origin}.json"
         try:
-            storage_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(storage_file, 'w', encoding='utf-8') as f:
-                json.dump({
+            with _profile_io_lock(profile_path):
+                storage_file.parent.mkdir(parents=True, exist_ok=True)
+                _atomic_json_write(storage_file, {
                     "origin": origin,
                     "saved_at": time.strftime('%Y-%m-%d %H:%M:%S'),
-                    "data": data
-                }, f, indent=2, ensure_ascii=False)
+                    "data": data if isinstance(data, dict) else {},
+                })
         except Exception as e:
-                logger.error(f"[Profile Error] {e}")
-    
+            logger.error(f"[Profile Error] {e}")
+
     async def load_local_storage(self, user_id: str) -> Dict:
-        """Load all local storage data"""
+        """Load a consistent snapshot of all local storage data."""
         profile_path = self.get_user_profile_path(user_id)
         storage_dir = profile_path / "Local Storage"
         result = {}
-        
         try:
-            if storage_dir.exists():
-                for file in storage_dir.glob("*.json"):
-                    try:
-                        with open(file, 'r', encoding='utf-8') as f:
-                            data = json.load(f)
-                            result[data.get('origin', file.stem)] = data.get('data', {})
-                    except Exception:
-                        pass
+            with _profile_io_lock(profile_path):
+                if storage_dir.exists():
+                    for file in storage_dir.glob("*.json"):
+                        try:
+                            with open(file, 'r', encoding='utf-8') as f:
+                                data = json.load(f)
+                            if isinstance(data, dict):
+                                result[data.get('origin', file.stem)] = data.get('data', {})
+                        except Exception:
+                            pass
         except Exception as e:
-                logger.error(f"[Profile Error] {e}")
-        
+            logger.error(f"[Profile Error] {e}")
         return result
-    
+
     def get_all_profiles(self) -> List[Dict]:
-        """Get list of all user profiles with metadata"""
+        """Get a consistent list of user profiles with metadata."""
         profiles = []
-        
         try:
             for profile_dir in self.base_dir.iterdir():
-                if profile_dir.is_dir():
-                    about_file = profile_dir / "About.txt"
-                    cookies_file = profile_dir / "cookies.json"
-                    
-                    profile_info = {
-                        "user_id": profile_dir.name,
-                        "path": str(profile_dir),
-                        "exists": True
-                    }
-                    
-                    if about_file.exists():
-                        profile_info["about_exists"] = True
+                if not profile_dir.is_dir():
+                    continue
+                about_file = profile_dir / "About.txt"
+                cookies_file = profile_dir / "cookies.json"
+                profile_info = {
+                    "user_id": profile_dir.name,
+                    "path": str(profile_dir),
+                    "exists": True,
+                }
+                with _profile_io_lock(profile_dir):
+                    profile_info["about_exists"] = about_file.exists()
                     if cookies_file.exists():
                         try:
-                            with open(cookies_file, 'r') as f:
+                            with open(cookies_file, 'r', encoding='utf-8') as f:
                                 data = json.load(f)
-                                profile_info["cookie_count"] = data.get("cookie_count", 0)
+                            profile_info["cookie_count"] = (
+                                data.get("cookie_count", 0)
+                                if isinstance(data, dict) else 0
+                            )
                         except Exception:
                             profile_info["cookie_count"] = 0
-                    
-                    profiles.append(profile_info)
+                profiles.append(profile_info)
         except Exception as e:
-                logger.error(f"[Profile Error] {e}")
-        
+            logger.error(f"[Profile Error] {e}")
         return profiles
-    
+
     def get_client_ip(self) -> str:
         """Get the client IP address"""
         try:
@@ -2305,8 +2456,10 @@ class DirectChromeLauncher:
             logger.error("Chrome executable not found")
             return None
         
-        # Find available debug port
-        debug_port = DirectChromeLauncher._find_available_port(9200, 9300)
+        # Ask Chrome for an ephemeral debug port.  A bind-and-close probe is
+        # racy under concurrent launches; Chrome's DevToolsActivePort file is
+        # the authoritative collision-free allocation.
+        debug_port = 0
         
         # Launch mode: prefer real display / Xvfb virtual display; headless
         # is the last resort because it is the strongest bot signal.
@@ -2447,14 +2600,31 @@ class DirectChromeLauncher:
                     start_new_session=True
                 )
             
-            # Wait for Chrome to start and be ready
-            await asyncio.sleep(2)
-            
-            # Verify Chrome is running
-            if process.poll() is not None:
-                logger.error("Chrome process exited immediately")
+            # Wait for Chrome to publish the actual ephemeral debug port.
+            # This avoids collisions when several sessions launch together.
+            active_port_file = Path(profile_dir) / "DevToolsActivePort"
+            port_deadline = time.monotonic() + 10.0
+            while time.monotonic() < port_deadline:
+                if process.poll() is not None:
+                    logger.error("Chrome process exited before publishing DevToolsActivePort")
+                    return None
+                try:
+                    lines = active_port_file.read_text(encoding="utf-8").splitlines()
+                    if lines and lines[0].strip().isdigit():
+                        debug_port = int(lines[0].strip())
+                        if 1 <= debug_port <= 65535:
+                            break
+                except (FileNotFoundError, OSError, ValueError):
+                    pass
+                await asyncio.sleep(0.1)
+            if not debug_port:
+                logger.error("Chrome did not publish a valid DevToolsActivePort")
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
                 return None
-            
+
             logger.debug(f"Chrome launched successfully with debug port {debug_port}, mode: {launch_mode}, mobile: {is_mobile}")
             return process, debug_port, profile_dir
             
@@ -2489,6 +2659,11 @@ class BrowserManager:
         self.gpu_manager = gpu_manager
         # NOTE: BrowserPool removed - not used, browsers are managed per-session via active_browsers
         self.active_browsers: Dict[str, Dict] = {}
+        # Browser ownership is per runtime session.  The lock protects map
+        # snapshots/removals used by cleanup and admin paths, while each
+        # browser still launches independently.
+        self._active_browsers_lock = threading.RLock()
+        self._runtime_profile_paths: Dict[str, str] = {}
         self._playwright = None
         self._playwright_lock = asyncio.Lock()
         self.profile_manager = UserProfileManager(config)
@@ -2610,8 +2785,85 @@ class BrowserManager:
         return self._user_ip
     
     def profile_exists(self, user_id: str) -> bool:
-        """Check if user profile exists - delegates to profile_manager"""
+        """Check if the durable parent profile exists."""
         return self.profile_manager.profile_exists(user_id)
+
+    def get_session_profile_path(self, user_id: str, session_id: str) -> Path:
+        """Return an isolated live Chrome user-data directory.
+
+        The stable parent profile is used for metadata, fingerprints and the
+        serialized cookie store only.  Chrome never runs against that directory
+        directly: every runtime session gets a private user-data-dir derived
+        from both parent and runtime ids.
+        """
+        parent_id = str(user_id or 'anonymous')
+        runtime_id = str(session_id or 'runtime')
+        parent_key = hashlib.sha256(parent_id.encode('utf-8', 'replace')).hexdigest()[:24]
+        runtime_key = hashlib.sha256(runtime_id.encode('utf-8', 'replace')).hexdigest()[:32]
+        root = Path(self.config.profile_base_path) / '.runtime_sessions' / parent_key
+        path = root / runtime_key
+        path.mkdir(parents=True, exist_ok=True)
+        with self._active_browsers_lock:
+            self._runtime_profile_paths[runtime_id] = str(path)
+        try:
+            if hasattr(self.gpu_manager, 'register_runtime_profile'):
+                self.gpu_manager.register_runtime_profile(runtime_id, str(path))
+        except Exception:
+            logger.debug("[Profile] runtime ownership registration failed", exc_info=True)
+        return path
+
+    def register_active_browser(self, session_id: str, browser, context,
+                                user_id: str, profile_dir: str, gpu_id: int = None):
+        """Register any backend's live handle under its runtime session id."""
+        info = {
+            'browser': browser,
+            'context': context,
+            'user_id': user_id,
+            'session_id': session_id,
+            'profile_dir': profile_dir,
+            'gpu_id': gpu_id,
+            'device_scale_factor': 1.0,
+        }
+        with self._active_browsers_lock:
+            self.active_browsers[session_id] = info
+        try:
+            if hasattr(self.gpu_manager, 'register_runtime_profile'):
+                self.gpu_manager.register_runtime_profile(session_id, profile_dir)
+        except Exception:
+            logger.debug("[Profile] runtime ownership registration failed", exc_info=True)
+        return info
+
+    def get_active_browser(self, session_id: str) -> Optional[Dict]:
+        """Return a session browser record under the ownership lock."""
+        with self._active_browsers_lock:
+            return self.active_browsers.get(session_id)
+
+    def snapshot_active_browsers(self) -> Dict[str, Dict]:
+        """Return a shallow map snapshot for diagnostic/admin scans."""
+        with self._active_browsers_lock:
+            return dict(self.active_browsers)
+
+    async def remove_active_browser(self, session_id: str, *, remove_profile: bool = True):
+        """Forget one browser handle after its owner has closed it."""
+        with self._active_browsers_lock:
+            info = self.active_browsers.pop(session_id, None)
+            profile_dir = (info or {}).get('profile_dir') or self._runtime_profile_paths.pop(session_id, None)
+            if session_id in self._runtime_profile_paths:
+                profile_dir = self._runtime_profile_paths.pop(session_id)
+        try:
+            if hasattr(self.gpu_manager, 'unregister_runtime_profile'):
+                self.gpu_manager.unregister_runtime_profile(session_id)
+        except Exception:
+            logger.debug("[Profile] runtime ownership unregister failed", exc_info=True)
+        if remove_profile and profile_dir:
+            try:
+                runtime_root = Path(self.config.profile_base_path) / '.runtime_sessions'
+                path = Path(profile_dir).resolve()
+                if runtime_root.resolve() in path.parents and path != runtime_root.resolve():
+                    await asyncio.to_thread(shutil.rmtree, path, ignore_errors=True)
+            except Exception:
+                logger.debug("[Profile] runtime profile cleanup failed for %s", session_id, exc_info=True)
+        return info
     
     async def load_cookies(self, user_id: str) -> List[Dict]:
         """Load cookies for user - delegates to profile_manager"""
@@ -2826,7 +3078,8 @@ class BrowserManager:
                     (k for k, v in DirectChromeLauncher.MOBILE_DEVICES.items()
                      if v is device_preset), None)) or None,
             }
-            self.active_browsers[session_id] = browser_info
+            with self._active_browsers_lock:
+                self.active_browsers[session_id] = browser_info
             
             logger.debug(f"Direct Chrome browser created for session {session_id} with debug port {debug_port}")
             
@@ -2841,7 +3094,7 @@ class BrowserManager:
                 async def close(self):
                     if not self._closed:
                         try:
-                            self.cdp.close()
+                            await self.cdp.close()
                         except Exception:
                             pass
                         self._closed = True
@@ -2860,7 +3113,7 @@ class BrowserManager:
                 async def close(self):
                     if not self._closed:
                         try:
-                            await self.browser_info['chrome_process'].terminate()
+                            self.browser_info['chrome_process'].terminate()
                         except Exception:
                             pass
                         self._closed = True
@@ -3055,8 +3308,10 @@ class BrowserManager:
                 if not user_id:
                     user_id = session_id
                 
-                # Get or create persistent profile directory
-                profile_path = self.profile_manager.get_or_create_profile(user_id)
+                # Keep parent metadata/cookies in the stable profile, but
+                # never let a live Chrome process share that directory.
+                self.profile_manager.get_or_create_profile(user_id)
+                profile_path = self.get_session_profile_path(user_id, session_id)
                 profile_dir = str(profile_path)
                 
                 # Ensure profile directory exists and is writable
@@ -3075,50 +3330,12 @@ class BrowserManager:
                     profile_dir = os.path.normpath(profile_dir)
                     logger.debug(f"Profile path normalized (Windows): {profile_dir}")
                 
-                # FIX: Force cleanup of Singleton locks BEFORE checking if profile is locked
-                # This allows new connections to release stale locks from previous sessions
-                # that may have crashed or not cleaned up properly
-                for lock_file in ["SingletonLock", "SingletonSocket", "SingletonCookie"]:
-                    lock_path = Path(profile_dir) / lock_file
-                    if lock_path.exists():
-                        try:
-                            if lock_path.is_dir():
-                                shutil.rmtree(lock_path)
-                            else:
-                                lock_path.unlink()
-                            logger.debug(f"Cleaned up stale lock file: {lock_file} for profile {user_id}")
-                        except Exception as e:
-                            logger.warning(f"Could not clean up lock file {lock_file}: {e}")
+                # The runtime profile is private to this session.  Never
+                # remove another session's Chrome singleton files and never
+                # kick a sibling session that shares the durable parent id.
+                # A stale runtime directory is safe to reuse only because the
+                # SessionManager serializes the same runtime id.
 
-                # CHECK IF PROFILE IS LOCKED (in use by another session)
-                # Now this check runs AFTER cleanup, so stale locks won't block new connections
-                profile_locked = False
-                for lock_file in ["SingletonLock", "SingletonSocket", "SingletonCookie"]:
-                    lock_path = Path(profile_dir) / lock_file
-                    if lock_path.exists():
-                        profile_locked = True
-                        logger.warning(f"Profile {user_id} is locked (file: {lock_file}) - another session may be using it")
-                        break
-                
-                # If profile is STILL locked after cleanup, kick out the existing session
-                # This allows new connections to take over the profile
-                if profile_locked:
-                    logger.debug(f"Profile {user_id} is in use - kicking out existing session and taking over")
-                    await self._kick_out_session_by_user_id(user_id)
-                    
-                    # Clean up locks again after kicking out the session
-                    for lock_file in ["SingletonLock", "SingletonSocket", "SingletonCookie"]:
-                        lock_path = Path(profile_dir) / lock_file
-                        if lock_path.exists():
-                            try:
-                                if lock_path.is_dir():
-                                    shutil.rmtree(lock_path)
-                                else:
-                                    lock_path.unlink()
-                                logger.debug(f"Cleaned up lock file after kickout: {lock_file} for profile {user_id}")
-                            except Exception as e:
-                                logger.warning(f"Could not clean up lock file {lock_file}: {e}")
-                
                 # ============================================================
                 # NEW: Use Direct Chrome Launcher (No Playwright)
                 # ============================================================
@@ -3641,17 +3858,18 @@ class BrowserManager:
                 context.user_id = user_id
                 context.profile_path = profile_dir
                 
-                # Store in active_browsers for kickout functionality
-                self.active_browsers[session_id] = {
-                    'browser': browser,
-                    'context': context,
-                    'user_id': user_id,
-                    'session_id': session_id,
-                    'profile_dir': profile_dir,
-                    'gpu_id': target_gpu,
-                    # Logical-pixel policy: surface == CSS viewport (1x).
-                    'device_scale_factor': 1.0,
-                }
+                # Store in active_browsers for session-scoped cleanup.
+                with self._active_browsers_lock:
+                    self.active_browsers[session_id] = {
+                        'browser': browser,
+                        'context': context,
+                        'user_id': user_id,
+                        'session_id': session_id,
+                        'profile_dir': profile_dir,
+                        'gpu_id': target_gpu,
+                        # Logical-pixel policy: surface == CSS viewport (1x).
+                        'device_scale_factor': 1.0,
+                    }
                 
                 if attempt > 0:
                     logger.debug(f"Browser created successfully on retry attempt {attempt + 1} for session {session_id}")
@@ -3781,8 +3999,10 @@ class BrowserManager:
             if not user_id:
                 user_id = session_id
             
-            # Get or create profile directory
-            profile_path = self.profile_manager.get_or_create_profile(user_id)
+            # Parent profile is durable metadata/cookie storage only; the
+            # live browser gets its own runtime user-data-dir.
+            self.profile_manager.get_or_create_profile(user_id)
+            profile_path = self.get_session_profile_path(user_id, session_id)
             profile_dir = str(profile_path)
             
             # NEW: Get or create PERMANENT fingerprint for this user
@@ -4208,16 +4428,17 @@ class BrowserManager:
             context.profile_path = profile_dir
             
             # Store in active_browsers
-            self.active_browsers[session_id] = {
-                'browser': browser,
-                'context': context,
-                'user_id': user_id,
-                'session_id': session_id,
-                'profile_dir': profile_dir,
-                'gpu_id': target_gpu,
-                # Logical-pixel policy: surface == CSS viewport (1x).
-                'device_scale_factor': 1.0,
-            }
+            with self._active_browsers_lock:
+                self.active_browsers[session_id] = {
+                    'browser': browser,
+                    'context': context,
+                    'user_id': user_id,
+                    'session_id': session_id,
+                    'profile_dir': profile_dir,
+                    'gpu_id': target_gpu,
+                    # Logical-pixel policy: surface == CSS viewport (1x).
+                    'device_scale_factor': 1.0,
+                }
             
             logger.debug(f"Stealth CDP browser created successfully for session {session_id}")
             return browser, context
@@ -5652,36 +5873,23 @@ class BrowserManager:
             logger.error(f"Error adding dialog handler to page: {e}")
     
     async def _kick_out_session_by_user_id(self, user_id: str):
+        """Deprecated compatibility hook; parent identity never owns a browser.
+
+        Runtime sessions are keyed by their explicit session id.  Closing every
+        browser that happens to share a durable profile would violate session
+        isolation, so replacement must go through SessionManager with an
+        explicit runtime id/owner check.
         """
-        Kick out existing session that is using the same user_id/profile.
-        This allows new connections to take over the profile.
-        FIXED: Improved process cleanup with zombie detection and force termination.
-        """
-        try:
-            # Find all sessions using this user_id
-            sessions_to_close = []
-            for sess_id, browser_info in self.active_browsers.items():
-                if browser_info.get('user_id') == user_id:
-                    sessions_to_close.append(sess_id)
-            
-            if sessions_to_close:
-                logger.debug(f"Found {len(sessions_to_close)} session(s) using profile {user_id}, closing them")
-                
-                # Close each session
-                for sess_id in sessions_to_close:
-                    await self._force_close_session(sess_id)
-            else:
-                logger.debug(f"No active sessions found for profile {user_id} (lock may be stale)")
-        except Exception as e:
-            logger.error(f"Error in _kick_out_session_by_user_id: {e}")
-    
+        logger.debug("Ignoring profile-wide browser kick for parent %s", user_id)
+        return 0
+
     async def _force_close_session(self, sess_id: str):
         """
         Force close a session and all its associated processes.
         FIXED: Better process cleanup with multiple termination attempts.
         """
         try:
-            browser_info = self.active_browsers.get(sess_id)
+            browser_info = self.get_active_browser(sess_id)
             if not browser_info:
                 return
             
@@ -5731,8 +5939,8 @@ class BrowserManager:
                 self.gpu_manager.unregister_session(sess_id, gpu_id)
             
             # 5. Remove from active browsers
-            if sess_id in self.active_browsers:
-                del self.active_browsers[sess_id]
+            with self._active_browsers_lock:
+                self.active_browsers.pop(sess_id, None)
             
             # 6. FIX: Clean up any zombie processes for this session
             await self._cleanup_zombie_processes(sess_id)
@@ -5805,124 +6013,58 @@ class BrowserManager:
             logger.error(f"Process kill failed: {e}")
     
     async def _cleanup_zombie_processes(self, session_id: str):
-        """
-        Clean up any zombie Chrome processes that may have been left behind.
-        FIXED: Added zombie process detection and cleanup. Cross-platform compatible.
-        """
+        """Reap only Chrome processes with this session's exact runtime profile."""
         try:
-            import platform as platform_module
-            is_windows = platform_module.system() == 'Windows'
-            
-            if is_windows:
-                # Windows: Use tasklist to find processes
-                result = await asyncio.create_subprocess_exec(
-                    'tasklist', '/FI', 'IMAGENAME eq chrome.exe', '/FO', 'CSV', '/NH',
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL
-                )
-                stdout, _ = await result.communicate()
-                
-                if stdout:
-                    lines = stdout.decode().strip().split('\n')
-                    for line in lines:
-                        if 'chrome' in line.lower() and session_id in line:
-                            # Extract PID from CSV format: "pid,imagename,..."
-                            parts = line.split(',')
-                            if len(parts) > 0:
-                                pid = parts[0].strip('"')
-                                try:
-                                    await asyncio.create_subprocess_exec(
-                                        'taskkill', '/F', '/PID', pid,
-                                        stdout=asyncio.subprocess.DEVNULL,
-                                        stderr=asyncio.subprocess.DEVNULL
-                                    )
-                                    logger.warning(f"Killed zombie Chrome process {pid} for session {session_id}")
-                                except Exception as e:
-                                    logger.error(f"Failed to kill zombie process {pid}: {e}")
-            else:
-                # Linux: Use pgrep to find processes
-                result = await asyncio.create_subprocess_exec(
-                    'pgrep', '-f', f'chrome.*--user-data-dir.*{session_id}',
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL
-                )
-                stdout, _ = await result.communicate()
-                
-                if stdout:
-                    pids = stdout.decode().strip().split('\n')
-                    for pid in pids:
-                        if pid.strip():
-                            try:
-                                await asyncio.create_subprocess_shell(
-                                    f'kill -9 {pid.strip()}',
-                                    stdout=asyncio.subprocess.DEVNULL,
-                                    stderr=asyncio.subprocess.DEVNULL
-                                )
-                                logger.warning(f"Killed zombie Chrome process {pid} for session {session_id}")
-                            except Exception as e:
-                                logger.error(f"Failed to kill zombie process {pid}: {e}")
-        except Exception as e:
-            # Process check failed - this is fine
-            pass
-    
-    async def cleanup_all_zombies(self):
-        """
-        Clean up all zombie Chrome processes on the system.
-        FIXED: Added system-wide zombie cleanup. Cross-platform compatible.
-        """
-        try:
-            import platform as platform_module
-            is_windows = platform_module.system() == 'Windows'
-            
-            if is_windows:
-                # Windows: Just kill all Chrome processes directly
-                # Windows doesn't have the same zombie process concept as Linux
+            info = self.get_active_browser(session_id)
+            profile_dir = (info or {}).get('profile_dir')
+            if not profile_dir or not sys.platform.startswith('linux'):
+                return
+            target = Path(profile_dir).resolve()
+            root = (Path(self.config.profile_base_path) / '.runtime_sessions').resolve()
+            if root not in target.parents:
+                return
+            for entry in os.listdir('/proc'):
+                if not entry.isdigit():
+                    continue
+                pid = int(entry)
                 try:
-                    await asyncio.create_subprocess_exec(
-                        'taskkill', '/F', '/IM', 'chrome.exe', '/T',
-                        stdout=asyncio.subprocess.DEVNULL,
-                        stderr=asyncio.subprocess.DEVNULL
-                    )
-                    logger.debug("Cleaned up Chrome processes on Windows")
-                except Exception:
+                    raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+                    args = [part.decode(errors='replace') for part in raw.split(b'\0') if part]
+                    actual = None
+                    for index, arg in enumerate(args):
+                        if arg == '--user-data-dir' and index + 1 < len(args):
+                            actual = args[index + 1]
+                            break
+                        if arg.startswith('--user-data-dir='):
+                            actual = arg.split('=', 1)[1]
+                            break
+                    if actual and Path(actual).resolve() == target:
+                        os.kill(pid, 9)
+                        logger.warning(
+                            "Killed owned zombie Chrome process %s for session %s",
+                            pid, session_id,
+                        )
+                except (FileNotFoundError, ProcessLookupError, PermissionError):
                     pass
-            else:
-                # Linux: Use pgrep to find zombie processes
-                result = await asyncio.create_subprocess_exec(
-                    'pgrep', '-f', 'chrome.*--user-data-dir',
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL
-                )
-                stdout, _ = await result.communicate()
-                
-                if stdout:
-                    pids = stdout.decode().strip().split('\n')
-                    logger.debug(f"Found {len(pids)} Chrome processes to check for cleanup")
-                    
-                    for pid in pids:
-                        if pid.strip():
-                            try:
-                                # Check if process is actually a zombie
-                                check_result = await asyncio.create_subprocess_exec(
-                                    'ps', '-p', pid.strip(), '-o', 'state=',
-                                    stdout=asyncio.subprocess.PIPE,
-                                    stderr=asyncio.subprocess.DEVNULL
-                                )
-                                stdout, _ = await check_result.communicate()
-                                state = stdout.decode().strip()
-                                
-                                if state == 'Z':  # Zombie state
-                                    logger.warning(f"Found zombie Chrome process {pid}, killing")
-                                    await asyncio.create_subprocess_shell(
-                                        f'kill -9 {pid.strip()}',
-                                        stdout=asyncio.subprocess.DEVNULL,
-                                        stderr=asyncio.subprocess.DEVNULL
-                                    )
-                            except Exception:
-                                pass
-        except Exception as e:
-            logger.error(f"Zombie cleanup error: {e}")
-    
+                except Exception:
+                    logger.debug("[Zombie] exact profile check failed for %s", pid, exc_info=True)
+        except Exception:
+            logger.debug("[Zombie] scoped cleanup failed for %s", session_id, exc_info=True)
+
+    async def cleanup_all_zombies(self):
+        """Run the GPU manager's private-runtime-only cleanup.
+
+        This compatibility method intentionally does not scan or kill all
+        Chrome processes on the host.
+        """
+        try:
+            return await asyncio.to_thread(
+                self.gpu_manager.cleanup_orphaned_chrome_processes
+            )
+        except Exception:
+            logger.debug("[Zombie] scoped global cleanup failed", exc_info=True)
+            return 0
+
     async def close_browser(self, browser, context, session_id: str, gpu_id: int):
         """Close browser and cleanup"""
         try:
@@ -5963,7 +6105,7 @@ class BrowserManager:
             # the user via the client (dialog/WS channel) instead.
             try:
                 active_dir = os.path.abspath(profile_dir)
-                for info in self.active_browsers.values():
+                for info in self.snapshot_active_browsers().values():
                     active_profile = info.get('profile_dir')
                     if active_profile and os.path.abspath(active_profile) == active_dir:
                         logger.warning(

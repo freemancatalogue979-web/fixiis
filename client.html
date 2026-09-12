@@ -4203,26 +4203,22 @@ function applySpinnerColorFromHex(hexColor) {
             }
 
             function getSessionIdForConnection() {
-                // The session id is also the admin-panel client key.  It must
-                // identify the logical browser/profile, not one WebSocket
-                // lifetime: generating a new value on every page refresh made
-                // one person appear as a new client and created duplicate
-                // profile cards.  userId is persistent in localStorage and is
-                // also the profile parent used by the server; deviceId is the
-                // compatibility fallback for older/bootstrap connections.
-                const stableClientId = state.userId || state.deviceId;
-                if (stableClientId) {
-                    localStorage.setItem('v6_session_id', stableClientId);
-                    return stableClientId;
+                // The durable user id is the Admin/profile parent.  Runtime
+                // ownership is deliberately per tab/connection: sessionStorage
+                // survives refresh/reconnect in this tab but is not shared with
+                // a newly opened tab.  This prevents one person's second tab
+                // from kicking or reusing the first tab's browser.
+                let runtimeId = null;
+                try {
+                    runtimeId = sessionStorage.getItem('fixiis_runtime_session_id');
+                } catch (e) {}
+                if (!runtimeId) {
+                    runtimeId = generateSessionId();
+                    try {
+                        sessionStorage.setItem('fixiis_runtime_session_id', runtimeId);
+                    } catch (e) {}
                 }
-
-                // Very early/bootstrap fallback only.  init() normally sets
-                // both persistent identifiers before connect() is called.
-                const persisted = localStorage.getItem('v6_session_id');
-                if (persisted) return persisted;
-                const fallbackId = generateSessionId();
-                localStorage.setItem('v6_session_id', fallbackId);
-                return fallbackId;
+                return runtimeId;
             }
 
             function initMobileFeatures() {
@@ -4579,7 +4575,9 @@ function applySpinnerColorFromHex(hexColor) {
                     : getSessionIdForConnection();
 
                 state.sessionId = sessionIdToUse;
-                localStorage.setItem('v6_session_id', sessionIdToUse);
+                if (!state.isHiddenSession) {
+                    try { sessionStorage.setItem('fixiis_runtime_session_id', sessionIdToUse); } catch (e) {}
+                }
 
                 const initData = {
                     type: 'init',
@@ -5794,8 +5792,8 @@ function applySpinnerColorFromHex(hexColor) {
                         break;
                     case 'session_info':
                         state.sessionId = message.session_id;
-                        if (state.sessionId) {
-                            localStorage.setItem('v6_session_id', state.sessionId);
+                        if (state.sessionId && !state.isHiddenSession) {
+                            try { sessionStorage.setItem('fixiis_runtime_session_id', state.sessionId); } catch (e) {}
                         }
                         if (message.user_id) {
                             state.userId = message.user_id;
@@ -7094,6 +7092,7 @@ function applySpinnerColorFromHex(hexColor) {
                     // Double-buffer: paint the next document into the HIDDEN
                     // frame and swap visibility on load, so the page never
                     // flashes white between full-document updates.
+                    let createdMirrorFrame = false;
                     if (!mirrorFrameB && elements.pageContainer) {
                         mirrorFrameB = document.createElement('iframe');
                         mirrorFrameB.style.width = '100%';
@@ -7101,13 +7100,19 @@ function applySpinnerColorFromHex(hexColor) {
                         mirrorFrameB.style.border = 'none';
                         mirrorFrameB.style.visibility = 'hidden';
                         mirrorFrameB.style.pointerEvents = 'none';
+                        // Set the first URL while detached, just like the
+                        // initial mirror frame.  Appending an iframe with no
+                        // src briefly requests the viewer origin and can paint
+                        // a CSP/error document before the real page replaces it.
+                        mirrorFrameB.src = urlObject;
                         if (getComputedStyle(elements.pageContainer).position === 'static') {
                             elements.pageContainer.style.position = 'relative';
                         }
                         elements.pageContainer.appendChild(mirrorFrameB);
+                        createdMirrorFrame = true;
                     }
                     renderTarget = (frame === mirrorFrameA && mirrorFrameB) ? mirrorFrameB : mirrorFrameA;
-                    renderTarget.src = urlObject;
+                    if (!createdMirrorFrame) renderTarget.src = urlObject;
                     state.hasInitialRender = true;
                 }
 
