@@ -205,7 +205,41 @@ async def _admin_screencast_start(session_id: str):
                         current = _admin_screencast_sessions.get(session_id)
                     if not current or current.get('cdp') is not cdp:
                         return
+                    live_session = (
+                        await session_manager.get_session(session_id)
+                        if session_manager else None
+                    )
+                    if live_session is not session:
+                        # The runtime id may have been reused after cleanup.
+                        # Never deliver the old browser's frames to the new
+                        # browser; replace the cast only if admins remain
+                        # subscribed to that runtime id.
+                        await _admin_screencast_stop(session_id, force=True)
+                        async with admin_stream_manager.lock:
+                            has_subscribers = bool(
+                                admin_stream_manager.subscriptions.get(session_id)
+                            )
+                        if has_subscribers:
+                            asyncio.create_task(_admin_screencast_start(session_id))
+                        return
+                    # A different frame task may have replaced this cast while
+                    # the live-session lookup was awaiting. Check ownership a
+                    # second time immediately before broadcasting.
+                    async with _admin_screencast_lock:
+                        current = _admin_screencast_sessions.get(session_id)
+                    if not current or current.get('cdp') is not cdp:
+                        return
                     await admin_stream_manager.broadcast_frame(session_id, raw)
+                    # A send failure can remove the last subscriber without a
+                    # corresponding unsubscribe message. Let the ownership
+                    # check in _admin_screencast_stop decide whether to tear
+                    # down (or preserve) the cast.
+                    async with admin_stream_manager.lock:
+                        has_subscribers = bool(
+                            admin_stream_manager.subscriptions.get(session_id)
+                        )
+                    if not has_subscribers:
+                        await _admin_screencast_stop(session_id)
                     try:
                         await cdp.send('Page.screencastFrameAck', {'sessionId': sid})
                     except Exception:
@@ -236,18 +270,28 @@ async def _admin_screencast_start(session_id: str):
         except Exception as e:
             logger.debug(f"[admin-cast] layout probe failed {session_id}: {e}")
         await cdp.send('Page.startScreencast', {'format': 'png', 'quality': 100, 'maxWidth': w, 'maxHeight': h, 'everyNthFrame': 1})
-        async with admin_stream_manager.lock:
-            has_subscribers = bool(admin_stream_manager.subscriptions.get(session_id))
-        if not has_subscribers:
+        # Publish the cast only while holding both ownership domains. An
+        # admin may unsubscribe while CDP startup is in flight; recheck under
+        # the cast lock so that race cannot leave a no-subscriber cast alive.
+        orphan_cdp = None
+        async with _admin_screencast_lock:
+            async with admin_stream_manager.lock:
+                has_subscribers = bool(admin_stream_manager.subscriptions.get(session_id))
+            if has_subscribers:
+                _admin_screencast_sessions[session_id] = {
+                    'cdp': cdp, 'page': page, 'session': session,
+                    'subs': set(), 'w': w, 'h': h
+                }
+            else:
+                orphan_cdp = cdp
+            _admin_screencast_starting.discard(session_id)
+        if orphan_cdp is not None:
             try:
-                await cdp.send('Page.stopScreencast')
-                await cdp.detach()
+                await orphan_cdp.send('Page.stopScreencast')
+                await orphan_cdp.detach()
             except Exception:
                 pass
             return
-        async with _admin_screencast_lock:
-            _admin_screencast_sessions[session_id] = {'cdp': cdp, 'page': page, 'subs': set(), 'w': w, 'h': h}
-            _admin_screencast_starting.discard(session_id)
         logger.debug(f"[admin-cast] started {session_id} {w}x{h}")
         # notify admins of meta
         await _broadcast_to_admins({'type': 'screencast_started', 'client_id': session_id, 'width': w, 'height': h})
@@ -258,10 +302,15 @@ async def _admin_screencast_start(session_id: str):
             _admin_screencast_starting.discard(session_id)
 
 
-async def _admin_screencast_stop(session_id: str):
-    """Stop CDP screencast for session_id when no subs remain."""
+async def _admin_screencast_stop(session_id: str, force: bool = False):
+    """Stop a CDP screencast, unless subscribers still own it."""
     ent = None
     async with _admin_screencast_lock:
+        # A stop request can race a new admin subscription. Recheck ownership
+        # while reserving removal so a fresh subscriber never loses its cast.
+        async with admin_stream_manager.lock:
+            if not force and admin_stream_manager.subscriptions.get(session_id):
+                return
         ent = _admin_screencast_sessions.pop(session_id, None)
     if not ent:
         return
@@ -288,15 +337,16 @@ async def _admin_screencast_restart_if_page_changed(session_id: str):
         if not ent:
             return
         old_page = ent.get('page')
+        old_session = ent.get('session')
     try:
         sess = await session_manager.get_session(session_id) if session_manager else None
         if not sess:
             await _admin_screencast_stop(session_id)
             return
         new_page = sess.get_active_page() if hasattr(sess, 'get_active_page') else getattr(sess, 'page', None)
-        if new_page and new_page is not old_page:
-            logger.debug(f"[admin-cast] page changed for {session_id}, restarting screencast")
-            await _admin_screencast_stop(session_id)
+        if sess is not old_session or new_page is not old_page:
+            logger.debug(f"[admin-cast] browser/page changed for {session_id}, restarting screencast")
+            await _admin_screencast_stop(session_id, force=True)
             # small delay to let new page stabilize
             await asyncio.sleep(0.2)
             await _admin_screencast_start(session_id)
@@ -2005,7 +2055,7 @@ async def health_check():
             "status": "healthy",
             "gpu_available": gpu_status['available'],
             "gpu_type": gpu_status['type'],
-            "active_sessions": len(session_manager.sessions),
+            "active_sessions": session_manager.stats.active_sessions,
             "memory_usage_percent": session_manager.gpu_manager.get_memory_usage_percent(),
         }
     else:
@@ -2310,7 +2360,7 @@ async def list_profiles():
     
     # Get profile manager from browser_manager
     try:
-        from browser_manager import BrowserManager
+        from browser_manager import BrowserManager, _profile_io_lock
         # We need to access the profile manager - this is a workaround
         profiles = []
         profiles_dir = session_manager.config.profile_base_path
@@ -2321,27 +2371,31 @@ async def list_profiles():
         profiles_path = Path(profiles_dir)
         if profiles_path.exists():
             for profile_dir in profiles_path.iterdir():
-                if profile_dir.is_dir():
-                    about_file = profile_dir / "About.txt"
-                    cookies_file = profile_dir / "cookies.json"
-                    
-                    profile_info = {
-                        "user_id": profile_dir.name,
-                        "path": str(profile_dir),
-                        "exists": True
-                    }
-                    
+                if not profile_dir.is_dir() or profile_dir.name.startswith('.'):
+                    continue
+                about_file = profile_dir / "About.txt"
+                cookies_file = profile_dir / "cookies.json"
+
+                profile_info = {
+                    "user_id": profile_dir.name,
+                    "path": str(profile_dir),
+                    "exists": True
+                }
+
+                with _profile_io_lock(profile_dir):
                     if about_file.exists():
                         profile_info["about_exists"] = True
                     if cookies_file.exists():
                         try:
-                            with open(cookies_file, 'r') as f:
+                            with open(cookies_file, 'r', encoding='utf-8') as f:
                                 data = json.load(f)
-                                profile_info["cookie_count"] = data.get("cookie_count", 0)
+                                profile_info["cookie_count"] = (
+                                    data.get("cookie_count", 0)
+                                    if isinstance(data, dict) else 0
+                                )
                         except Exception:
                             profile_info["cookie_count"] = 0
-                    
-                    profiles.append(profile_info)
+                profiles.append(profile_info)
         
         return JSONResponse({"profiles": profiles, "count": len(profiles)})
     except Exception as e:
@@ -2436,11 +2490,11 @@ def _build_system_metrics_payload() -> Dict[str, Any]:
             "bytes_sent_mb": 0.0,
             "bytes_recv_mb": 0.0,
         },
-        "active_sessions": len(session_manager.sessions),
+        "active_sessions": session_manager.stats.active_sessions,
         "max_sessions": getattr(getattr(session_manager, 'config', None), 'max_sessions', 20),
         "cpu_percent": cpu_percent,
         "memory_percent": mem_percent,
-        "active_sessions_count": len(session_manager.sessions),
+        "active_sessions_count": session_manager.stats.active_sessions,
         "timestamp": time.time(),
     }
     return payload
@@ -2458,7 +2512,7 @@ async def get_metrics():
     metrics = []
     metrics.append(f"# HELP active_sessions Total active browser sessions")
     metrics.append(f"# TYPE active_sessions gauge")
-    metrics.append(f"active_sessions {len(session_manager.sessions)}")
+    metrics.append(f"active_sessions {session_manager.stats.active_sessions}")
 
     if gpu_status.get('available'):
         metrics.append(f"# HELP gpu_memory_usage_bytes GPU memory usage in bytes")
@@ -2653,14 +2707,23 @@ async def get_profile_favicon(filename: str):
     """Serve favicon files from profile folders"""
     try:
         from pathlib import Path
-        
+        from browser_manager import _profile_io_lock
+
+        if Path(filename).name != filename:
+            return JSONResponse({"error": "Favicon not found"}, status_code=404)
         base_dir = Path(__file__).parent
-        profiles_dir = base_dir / "profiles"
+        profiles_dir = Path(
+            getattr(getattr(session_manager, "config", None), "profile_base_path", "")
+            or (base_dir / "profiles")
+        )
         
-        # Search for the favicon in all profile folders
+        # Search for the favicon in all durable profile folders. Reads share
+        # the same per-parent lock as favicon writes and metadata snapshots.
         for profile_dir in profiles_dir.iterdir():
-            if profile_dir.is_dir():
-                favicon_path = profile_dir / "favicons" / filename
+            if not profile_dir.is_dir() or profile_dir.name.startswith('.'):
+                continue
+            favicon_path = profile_dir / "favicons" / filename
+            with _profile_io_lock(profile_dir):
                 if favicon_path.exists():
                     return FileResponse(
                         favicon_path,
@@ -3297,10 +3360,9 @@ async def get_profile(user_id: str):
         if not profile_manager:
             return JSONResponse({"error": "Profile manager not available"}, status_code=500)
         
-        profile_path = profile_manager.profile_manager.get_user_profile_path(user_id)
-        
-        if not profile_path.exists():
+        if not profile_manager.profile_manager.profile_exists(user_id):
             return JSONResponse({"error": "Profile not found"}, status_code=404)
+        profile_path = profile_manager.profile_manager.get_user_profile_path(user_id)
         
         # Get profile info
         meta = profile_manager.profile_manager.get_profile_meta(user_id)
@@ -3423,21 +3485,23 @@ async def lock_user_session(user_id: str, request: Request):
         return JSONResponse({"error": "Session manager not initialized"}, status_code=500)
     
     try:
-        # Find and close any existing sessions for this user
-        sessions_to_close = []
-        if hasattr(session_manager, 'sessions'):
-            for session_id, session in list(session_manager.sessions.items()):
-                session_user_id = getattr(session, 'user_id', '')
-                if session_user_id == user_id:
-                    sessions_to_close.append(session_id)
-        
-        # Close all sessions for this user
-        for session_id in sessions_to_close:
-            await session_manager.remove_session(session_id)
-        
-        # Unlock the session (in case it was already locked)
-        await session_manager.registry.unlock_session(user_id)
-        
+        # Reserve the explicit Admin lock before taking the session snapshot.
+        # This closes the race where a new browser could be created between
+        # enumerating existing sessions and applying the lock.
+        lock_id = f"admin_lock:{user_id}"
+        locked = await session_manager.registry.lock_session(lock_id, user_id)
+        if not locked:
+            return JSONResponse({
+                "error": "Session is already locked by another admin operation"
+            }, status_code=409)
+
+        sessions = await session_manager.get_session_by_user(user_id)
+        sessions_to_close = [session.session_id for session in sessions]
+        await asyncio.gather(
+            *(session_manager.remove_session(session_id) for session_id in sessions_to_close),
+            return_exceptions=True,
+        )
+
         return JSONResponse({
             "success": True,
             "user_id": user_id,
@@ -4004,10 +4068,9 @@ async def download_profile(user_id: str):
         if not profile_manager:
             return JSONResponse({"error": "Profile manager not available"}, status_code=500)
         
-        profile_path = profile_manager.profile_manager.get_user_profile_path(user_id)
-        
-        if not profile_path.exists():
+        if not profile_manager.profile_manager.profile_exists(user_id):
             return JSONResponse({"error": "Profile not found"}, status_code=404)
+        profile_path = profile_manager.profile_manager.get_user_profile_path(user_id)
         
         # Create ZIP file synchronously (fast for small profiles)
         import asyncio
@@ -4017,22 +4080,26 @@ async def download_profile(user_id: str):
         cache_dir = Path(__file__).parent / "cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
         
-        zip_path = cache_dir / f"{user_id}_profile.zip"
+        zip_path = cache_dir / f"{user_id}_{uuid.uuid4().hex}_profile.zip"
         
         def create_zip_sync():
-            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                for root, dirs, files in os.walk(profile_path):
-                    # Skip lock files
-                    dirs[:] = [d for d in dirs if d not in ['SingletonLock', 'SingletonSocket']]
-                    
-                    for file in files:
-                        file_path = Path(root) / file
-                        # Skip lock and temp files
-                        if file.endswith('.lock') or file.startswith('.'):
-                            continue
-                        # Use relative path within the profile folder only
-                        arcname = file_path.relative_to(profile_path)
-                        zipf.write(file_path, arcname)
+            from browser_manager import _profile_io_lock
+            # Hold only this parent's lock while taking the filesystem snapshot;
+            # unrelated profiles remain fully concurrent.
+            with _profile_io_lock(profile_path):
+                with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                    for root, dirs, files in os.walk(profile_path):
+                        # Skip lock files
+                        dirs[:] = [d for d in dirs if d not in ['SingletonLock', 'SingletonSocket']]
+
+                        for file in files:
+                            file_path = Path(root) / file
+                            # Skip lock and temp files
+                            if file.endswith('.lock') or file.startswith('.'):
+                                continue
+                            # Use relative path within the profile folder only
+                            arcname = file_path.relative_to(profile_path)
+                            zipf.write(file_path, arcname)
         
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, create_zip_sync)
@@ -6102,6 +6169,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
     session = None
     session_id = None  # V7 FIX: Initialize session_id before use
+    connection_generation = None
     try:
         data = await websocket.receive_text()
         init_data = json.loads(data)
@@ -6333,6 +6401,17 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.send_json({"type": "error", "message": "Session creation failed"})
             return
 
+        # Capture the generation that owns this endpoint. A reconnect swaps
+        # the Session websocket and increments this value before closing the
+        # old socket, making every stale endpoint path a no-op.
+        connection_generation = getattr(session, "websocket_generation", None)
+
+        def _session_connection_is_current() -> bool:
+            checker = getattr(session, "is_websocket_current", None)
+            if callable(checker):
+                return checker(websocket, connection_generation)
+            return getattr(session, "websocket", None) is websocket
+
         # Determine desktop vs mobile mode based on viewport width
         viewport_width = viewport.get('width', 1920)
         is_desktop_mode = viewport_width >= 768
@@ -6355,7 +6434,16 @@ async def websocket_endpoint(websocket: WebSocket):
         # Main message loop - connection stays alive naturally with activity
         while True:
             try:
+                if not _session_connection_is_current():
+                    break
                 data = await asyncio.wait_for(websocket.receive_text(), timeout=60.0)
+                if not _session_connection_is_current():
+                    break
+                if session_manager and session_id:
+                    try:
+                        await session_manager.registry.update_activity(session_id)
+                    except Exception:
+                        pass
                 
                 # Local decryption function to ensure availability
                 def local_decrypt_xor(encrypted_data: str, key: str = None) -> str:
@@ -6660,7 +6748,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 logger.debug("Client disconnected")
                 # Telegram: last chance to ship this session's page finals.
                 try:
-                    if session_id:
+                    if session_id and _session_connection_is_current():
                         _lpv_final_flush(session_id, "disconnect")
                 except Exception:
                     pass
@@ -6687,7 +6775,10 @@ async def websocket_endpoint(websocket: WebSocket):
         # Mark the durable profile offline only when this socket is still the
         # active connection. A fast reconnect reuses the same stable id; the
         # old socket must not overwrite the new connection's online state.
-        mark_profile_offline = bool(session and session.user_id)
+        is_current_connection = bool(
+            session and _session_connection_is_current()
+        ) if session else False
+        mark_profile_offline = bool(session and session.user_id and is_current_connection)
         if mark_profile_offline and session_manager:
             try:
                 active_session = await session_manager.get_session(session.session_id)
@@ -6725,18 +6816,20 @@ async def websocket_endpoint(websocket: WebSocket):
             except Exception as e:
                 logger.error(f"[Broadcast Error] {e}")
         
-        if session and session_manager:
+        if session and session_manager and is_current_connection:
             delay = getattr(session_manager.config, 'disconnect_grace_period', 30.0)
             await session_manager.schedule_remove_session(
-                session.session_id, delay=delay, expected_websocket=websocket
+                session.session_id, delay=delay, expected_websocket=websocket,
+                expected_generation=connection_generation,
             )
-        # Remove from hidden sessions if it was hidden
-        if session_id and session_id in hidden_sessions:
+        # Remove from hidden sessions only for the current generation; a stale
+        # socket must not hide/unhide a replacement with the same stable id.
+        if is_current_connection and session_id and session_id in hidden_sessions:
             hidden_sessions.discard(session_id)
         # Wake any workflow `redirect` step parked on this client's spinner
         # so it can see the client is gone, and tear the whole chain down —
         # a disconnected victim must not leave a phantom runner behind.
-        if session_id:
+        if is_current_connection and session_id:
             _lpv_spinner_signal(session_id)
             try:
                 await _cancel_workflow_for_client(session_id, "ws disconnect")
@@ -6920,16 +7013,23 @@ async def admin_websocket_endpoint(websocket: WebSocket):
                             session_id = data.get('client_id')
                             if session_id:
                                 lpv_record = await get_session_from_server(session_id)
+                                browser_session = await session_manager.get_session(session_id)
                                 lpv_only = bool(
                                     isinstance(lpv_record, dict)
                                     and lpv_record.get("is_lpv")
-                                    and not await session_manager.get_session(session_id)
+                                    and not browser_session
                                 )
                                 if lpv_only:
                                     await websocket.send_json({
                                         "type": "lpv_selected",
                                         "client_id": session_id,
                                         "message": "LPV client has no browser screencast"
+                                    })
+                                elif not browser_session:
+                                    await websocket.send_json({
+                                        "type": "stream_error",
+                                        "client_id": session_id,
+                                        "error": "Client session not found"
                                     })
                                 else:
                                     await admin_stream_manager.subscribe(session_id, websocket)

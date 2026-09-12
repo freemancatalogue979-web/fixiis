@@ -35,7 +35,9 @@ def _sb_backend_enabled() -> bool:
 try:
     from webrtc_stream import WebRTCStreamer, WebRTCConfig, create_webrtc_streamer
     WEBRTC_AVAILABLE = True
-except ImportError as e:
+except Exception as e:
+    logger = logging.getLogger(__name__)
+    logger.debug("WebRTC optional dependencies unavailable: %s", e)
     WEBRTC_AVAILABLE = False
     # Fall back to a None placeholder so attribute checks don't blow up
     WebRTCStreamer = None
@@ -357,6 +359,15 @@ class NeoStreamingSession:
                  city: str = None, zip_code: str = None):
         self.session_id = session_id
         self.websocket = websocket
+        # A monotonically increasing connection generation prevents an old
+        # websocket's disconnect/finally path from acting on a reconnected
+        # generation that owns this runtime session now.  The lock only
+        # protects swapping the owner; message handlers still use the
+        # generation predicate before mutating browser state.
+        self._websocket_generation = 1
+        self._websocket_state_lock = asyncio.Lock()
+        self._cleanup_started = False
+        self._closing = False
         self._apple_mobile_client = False
         try:
             from browser_manager import (
@@ -456,6 +467,7 @@ class NeoStreamingSession:
         
         # Reconnect token for fast reconnect (Part 4)
         self.reconnect_token: Optional[str] = None
+        self._session_registry = None
         
         # Input state (Part 6)
         self.inputs_enabled = True
@@ -2010,6 +2022,11 @@ class NeoStreamingSession:
                         # A close can race this send. The websocket handler
                         # owns reconnect/cleanup, not the heartbeat task.
                         pass
+                try:
+                    if self._session_registry is not None:
+                        await self._session_registry.update_activity(self.session_id)
+                except Exception:
+                    pass
                 
                 current_time = time.time()
                 time_since_last_pong = current_time - self._last_client_pong_time
@@ -2875,63 +2892,99 @@ class NeoStreamingSession:
         # Send metadata to reconnected client
         await self._send_metadata()
 
-    async def reattach_websocket(self, new_websocket):
-        """Reattach websocket connection for fast reconnect - Part 4"""
-        log(f"Reattaching websocket for session {self.session_id}")
-        
-        # Close any existing websocket first to ensure old connections terminate
-        try:
-            old_ws = getattr(self, 'websocket', None)
-            if old_ws and old_ws is not new_websocket:
-                try:
-                    # Only attempt graceful close if the WS has actually been accepted.
-                    # FastAPI/Starlette raises "Need to call accept first" otherwise.
-                    client_state = getattr(old_ws, 'client_state', None)
-                    state_name = getattr(client_state, 'name', None) if client_state else None
-                    accepted = (
-                        state_name == 'CONNECTED'
-                        or (client_state is not None and not getattr(old_ws, 'closed', False)
-                            and not state_name in ('CONNECTING', 'CLOSED', 'DISCONNECTED'))
-                    )
-                    if hasattr(old_ws, 'close') and accepted:
-                        try:
-                            await old_ws.close(code=1000, reason="replaced_by_new_session")
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-        except Exception:
-            pass
+    @property
+    def websocket_generation(self) -> int:
+        """Current websocket generation for endpoint stale-work protection."""
+        return self._websocket_generation
 
-        # Update websocket reference
-        self.websocket = new_websocket
-        self._sync_dom_capture()
-        
+    def is_websocket_current(self, websocket, generation: int = None) -> bool:
+        """Return whether ``websocket`` still owns this runtime generation."""
+        if websocket is None or self.websocket is not websocket:
+            return False
+        if generation is not None and generation != self._websocket_generation:
+            return False
+        return not self._cleanup_started
+
+    async def reattach_websocket(self, new_websocket):
+        """Atomically replace the socket owner and return its generation.
+
+        The old socket is invalidated before its graceful close is awaited, so
+        a late disconnect cannot remove, mark offline, or cancel work for the
+        replacement generation.
+        """
+        if new_websocket is None:
+            raise ValueError("new_websocket is required")
+        log(f"Reattaching websocket for session {self.session_id}")
+
+        async with self._websocket_state_lock:
+            if self._cleanup_started or self._closing:
+                raise RuntimeError("session is already closing")
+            old_ws = self.websocket
+            self._websocket_generation += 1
+            generation = self._websocket_generation
+            # Publish the replacement before awaiting any old-socket close.
+            self.websocket = new_websocket
+
+        # Close any existing websocket after ownership has moved.
+        if old_ws and old_ws is not new_websocket:
+            try:
+                # Only attempt graceful close if the WS has actually been accepted.
+                # FastAPI/Starlette raises "Need to call accept first" otherwise.
+                client_state = getattr(old_ws, 'client_state', None)
+                state_name = getattr(client_state, 'name', None) if client_state else None
+                accepted = (
+                    state_name == 'CONNECTED'
+                    or (client_state is not None and not getattr(old_ws, 'closed', False)
+                        and state_name not in ('CONNECTING', 'CLOSED', 'DISCONNECTED'))
+                )
+                if hasattr(old_ws, 'close') and accepted:
+                    try:
+                        await old_ws.close(code=1000, reason="replaced_by_new_session")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        try:
+            self._sync_dom_capture()
+        except Exception:
+            logger.debug("[Reconnect] DOM capture rebind failed", exc_info=True)
+
         # Update state
         self.last_activity = time.time()
         self.inputs_enabled = True
-        
+
         # Wake from sleep mode if sleeping
         if self.is_sleeping:
             self.is_sleeping = False
             if self.browser_manager:
-                await self.browser_manager.profile_manager.update_status(
-                    self.user_id, 'online', self.page.url if self.page else ''
-                )
+                try:
+                    await self.browser_manager.profile_manager.update_status(
+                        self.user_id, 'online', self.page.url if self.page else ''
+                    )
+                except Exception:
+                    logger.debug("[Reconnect] profile wake update failed", exc_info=True)
             log(f"Woke session {self.session_id} from sleep")
-        
+
         # Send metadata to reconnected client
         await self._send_metadata()
-        
+
         # Resume streaming if applicable - fire-and-forget (no await needed)
         if self._streamer and not self._streamer.is_active:
             asyncio.create_task(self._streamer.start(self.page, self.websocket))
-        
-        log(f"Websocket reattached successfully for session {self.session_id}")
+
+        log(f"Websocket reattached successfully for session {self.session_id} (generation={generation})")
+        return generation
 
     async def shutdown(self, force: bool = False):
-        """Shutdown the session - Part 3: Force shutdown for singleton enforcement"""
+        """Shutdown the session and invalidate its current socket generation."""
         log(f"Shutting down session {self.session_id} (force={force})")
+        async with self._websocket_state_lock:
+            if self._cleanup_started or self._closing:
+                return
+            self._closing = True
+            self._websocket_generation += 1
+            self.websocket = None
         self.is_active = False
         
         # Only the last runtime session for a stable parent may mark the
@@ -3011,6 +3064,13 @@ class NeoStreamingSession:
         
         logger.debug(f"[Cleanup] Starting cleanup for session {self.session_id} (force={force})")
         
+        async with self._websocket_state_lock:
+            if self._cleanup_started:
+                return
+            self._cleanup_started = True
+            self._closing = True
+            self._websocket_generation += 1
+            self.websocket = None
         self.is_active = False
         self.is_sleeping = False
         self.inputs_enabled = False
@@ -3152,7 +3212,7 @@ class NeoStreamingSession:
             logger.debug(f"[Cleanup] GPU manager unregister: {e}")
         
         # Force kill only a process proven to belong to this runtime profile.
-        # Never use a broad ``pkill -f`` pattern: two tabs for one stable
+        # Never use a machine-wide process-name pattern: two tabs for one stable
         # parent deliberately have different user-data-dirs, and a regex or
         # profile basename match can otherwise kill the sibling tab.
         if force:

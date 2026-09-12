@@ -201,7 +201,9 @@ class Server:
         
         # Cleanup orphaned Chrome processes at startup
         logger.debug("[Startup] Cleaning up orphaned Chrome processes...")
-        killed = self.gpu_manager.cleanup_orphaned_chrome_processes()
+        killed = await asyncio.to_thread(
+            self.gpu_manager.cleanup_orphaned_chrome_processes
+        )
         if killed > 0:
             logger.debug(f"[Startup] Cleaned up {killed} orphaned Chrome processes")
 
@@ -284,7 +286,9 @@ class Server:
         # Step 2: Reap only stale private runtime profiles owned by this
         # service.  Never issue a machine-wide Chrome kill during restart.
         try:
-            killed = self.gpu_manager.cleanup_orphaned_chrome_processes()
+            killed = await asyncio.to_thread(
+                self.gpu_manager.cleanup_orphaned_chrome_processes
+            )
             if killed:
                 logger.debug("Restart reaped %s stale owned browser processes", killed)
         except Exception as e:

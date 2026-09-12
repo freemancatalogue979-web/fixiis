@@ -367,13 +367,16 @@ class SessionManager:
         return _operation()
 
     async def schedule_remove_session(self, session_id: str, delay: float = 30.0,
-                                      force: bool = False, expected_websocket=None):
+                                      force: bool = False, expected_websocket=None,
+                                      expected_generation: int = None):
         """Schedule removal owned by one websocket generation."""
         async with self._pending_remove_lock:
             if session_id in self._pending_remove_tasks:
                 return
             task = asyncio.create_task(
-                self._delayed_remove_session(session_id, delay, force, expected_websocket)
+                self._delayed_remove_session(
+                    session_id, delay, force, expected_websocket, expected_generation
+                )
             )
             self._pending_remove_tasks[session_id] = task
 
@@ -389,13 +392,15 @@ class SessionManager:
                 pass
 
     async def _delayed_remove_session(self, session_id: str, delay: float,
-                                      force: bool, expected_websocket=None):
+                                      force: bool, expected_websocket=None,
+                                      expected_generation: int = None):
         try:
             await asyncio.sleep(delay)
             async with self._pending_remove_lock:
                 self._pending_remove_tasks.pop(session_id, None)
             await self.remove_session(
-                session_id, force=force, expected_websocket=expected_websocket
+                session_id, force=force, expected_websocket=expected_websocket,
+                expected_generation=expected_generation,
             )
         except asyncio.CancelledError:
             pass
@@ -581,7 +586,9 @@ class SessionManager:
 
             if reattach_session is not None:
                 try:
-                    await reattach_session.reattach_websocket(websocket)
+                    generation = await reattach_session.reattach_websocket(websocket)
+                    if generation is None:
+                        raise RuntimeError("websocket reattachment was rejected")
                     await self.registry.reattach_session(
                         reattach_session.session_id, str(id(websocket))
                     )
@@ -667,6 +674,7 @@ class SessionManager:
                 session.device_id = device_id or session_id
                 session.user_id = profile_user_id
                 session._session_lock = session_lock
+                session._session_registry = self.registry
                 session.client_ip = client_ip or '-'
                 session.country = country or '-'
                 session.state = state or '-'
@@ -842,7 +850,7 @@ class SessionManager:
             pass
 
     async def remove_session(self, session_id: str, force: bool = False,
-                             expected_websocket=None):
+                             expected_websocket=None, expected_generation: int = None):
         """Remove one runtime session without holding a global lock over cleanup."""
         async with self._session_operation(session_id):
             await self.cancel_scheduled_removal(session_id)
@@ -850,10 +858,16 @@ class SessionManager:
                 session = self.sessions.get(session_id)
                 if session is None:
                     return False
-                if (expected_websocket is not None
-                        and getattr(session, 'websocket', None) is not expected_websocket):
-                    # A stale disconnect cannot remove a newer websocket owner.
-                    return False
+                if expected_websocket is not None:
+                    checker = getattr(session, "is_websocket_current", None)
+                    current = (
+                        checker(expected_websocket, expected_generation)
+                        if callable(checker)
+                        else getattr(session, 'websocket', None) is expected_websocket
+                    )
+                    if not current:
+                        # A stale disconnect cannot remove a newer websocket owner.
+                        return False
                 self.sessions.pop(session_id, None)
                 self._pending_session_ids.discard(session_id)
                 self.stats.active_sessions = max(0, self.stats.active_sessions - 1)
@@ -986,7 +1000,9 @@ class SessionManager:
                 # Every 5 minutes (300 seconds / 60 = 5 iterations), clean up orphaned Chrome
                 if cleanup_counter >= 5:
                     cleanup_counter = 0
-                    killed = self.gpu_manager.cleanup_orphaned_chrome_processes()
+                    killed = await asyncio.to_thread(
+                        self.gpu_manager.cleanup_orphaned_chrome_processes
+                    )
                     if killed > 0:
                         logger.debug(f"[Cleanup] Cleaned up {killed} orphaned Chrome processes")
                     
@@ -1000,7 +1016,7 @@ class SessionManager:
         current_time = time.time()
         async with self._sessions_lock:
             snapshot = list(self.sessions.items())
-        stale_ids = []
+        stale_sessions = []
         for session_id, session in snapshot:
             try:
                 page = getattr(session, 'page', None)
@@ -1010,9 +1026,16 @@ class SessionManager:
             if (not getattr(session, 'is_active', True)
                     or page_closed
                     or current_time - getattr(session, 'last_activity', current_time) > 3600):
-                stale_ids.append(session_id)
+                stale_sessions.append((
+                    session_id,
+                    getattr(session, "websocket", None),
+                    getattr(session, "websocket_generation", None),
+                ))
         await asyncio.gather(
-            *(self.remove_session(session_id) for session_id in stale_ids),
+            *(self.remove_session(
+                session_id, expected_websocket=expected_websocket,
+                expected_generation=expected_generation,
+            ) for session_id, expected_websocket, expected_generation in stale_sessions),
             return_exceptions=True,
         )
 
@@ -1038,7 +1061,7 @@ class SessionManager:
     def get_status(self) -> Dict:
         """Get manager status"""
         return {
-            'active_sessions': len(self.sessions),
+            'active_sessions': self.stats.active_sessions,
             'total_sessions': self.stats.total_sessions,
             'total_frames': self.stats.total_frames,
             'current_fps': self.stats.get_fps(),

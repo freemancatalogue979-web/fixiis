@@ -88,7 +88,9 @@ def _profile_io_lock(profile_path: Path) -> threading.RLock:
 def _atomic_json_write(path: Path, value: Any) -> None:
     """Write one profile record without exposing a partially-written JSON file."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temp = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
     try:
         with open(temp, "w", encoding="utf-8") as fh:
             json.dump(value, fh, indent=2, ensure_ascii=False)
@@ -1195,21 +1197,24 @@ class UserProfileManager:
         profile_path = self.get_user_profile_path(user_id)
         sites_file = profile_path / "visited_sites.json"
         favicons_dir = profile_path / "favicons"
-        favicons_dir.mkdir(exist_ok=True)
         favicon_path = favicons_dir / f"{domain.replace('.', '_')}.png"
 
         try:
+            with _profile_io_lock(profile_path):
+                favicons_dir.mkdir(exist_ok=True)
             # Network IO is deliberately outside the profile lock.  The final
             # read-modify-write below is repeated after the download so two
             # concurrent tabs merge against the newest list.
             saved_favicon_url = await self._download_favicon(domain, favicon_path)
+            with _profile_io_lock(profile_path):
+                favicon_local = (
+                    str(favicon_path.relative_to(profile_path))
+                    if favicon_path.exists() else ""
+                )
             site_entry = {
                 "domain": domain,
                 "favicon_url": saved_favicon_url or favicon_url or f"https://{domain}/favicon.ico",
-                "favicon_local": (
-                    str(favicon_path.relative_to(profile_path))
-                    if favicon_path.exists() else ""
-                ),
+                "favicon_local": favicon_local,
                 "last_visited": time.strftime('%Y-%m-%d %H:%M:%S'),
                 "title": title,
             }
@@ -1343,7 +1348,7 @@ class UserProfileManager:
         profiles = []
         try:
             for profile_dir in sorted(self.base_dir.iterdir()):
-                if profile_dir.is_dir():
+                if profile_dir.is_dir() and not profile_dir.name.startswith('.'):
                     user_id = profile_dir.name
                     meta = self.get_profile_meta(user_id)
                     sites = self.get_visited_sites(user_id)
@@ -1528,7 +1533,7 @@ class UserProfileManager:
         profiles = []
         try:
             for profile_dir in self.base_dir.iterdir():
-                if not profile_dir.is_dir():
+                if not profile_dir.is_dir() or profile_dir.name.startswith('.'):
                     continue
                 about_file = profile_dir / "About.txt"
                 cookies_file = profile_dir / "cookies.json"
@@ -1623,9 +1628,10 @@ class FingerprintManager:
         self._lock = asyncio.Lock()
     
     def get_fingerprint_path(self, user_id: str) -> Path:
-        """Get fingerprint file path for user"""
+        """Get fingerprint file path for user under its profile lock."""
         profile_path = self.base_dir / user_id
-        profile_path.mkdir(parents=True, exist_ok=True)
+        with _profile_io_lock(profile_path):
+            profile_path.mkdir(parents=True, exist_ok=True)
         return profile_path / "fingerprint.json"
 
     @staticmethod
@@ -1669,44 +1675,50 @@ class FingerprintManager:
             Fingerprint dict with all spoofing values
         """
         fingerprint_path = self.get_fingerprint_path(user_id)
-        
-        # Load existing fingerprint if exists - CRITICAL: reuse forever
-        if fingerprint_path.exists():
-            try:
-                with open(fingerprint_path, 'r', encoding='utf-8') as f:
-                    existing = json.load(f)
-                    # Keep the permanent profile stable except for the explicit
-                    # Apple-mobile -> Android migration requested by the caller.
-                    desired_ua = normalize_mobile_user_agent(
-                        (client_info or {}).get('user_agent')
-                    )
-                    current_is_apple_mobile = is_apple_mobile_user_agent(
-                        existing.get('user_agent')
-                    )
-                    requested_is_mobile = bool((client_info or {}).get('is_mobile')) or is_apple_mobile_user_agent(
-                        (client_info or {}).get('user_agent')
-                    )
-                    if (requested_is_mobile and desired_ua and
-                            'Android' in desired_ua and current_is_apple_mobile):
-                        existing = self._migrate_apple_mobile_fingerprint(existing, desired_ua)
-                        self._save_fingerprint(user_id, existing)
-                    if client_info and 'proxy_session' in client_info:
-                        existing['proxy_session'] = client_info['proxy_session']
-                    return existing
-            except Exception:
-                pass
-        
-        # Create new fingerprint using client's actual info
-        if client_info:
-            fingerprint = self._create_fingerprint_from_client(user_id, client_info)
-        else:
-            # Fallback: create generic desktop fingerprint
-            fingerprint = self._create_generic_fingerprint(user_id)
-        
-        # Save and return
-        self._save_fingerprint(user_id, fingerprint)
-        return fingerprint
-    
+        profile_path = fingerprint_path.parent
+
+        # Serialize the complete read/migrate/create/write transaction across
+        # BrowserManager/FingerprintManager instances. Otherwise two sessions
+        # can both generate a different permanent identity and the last write
+        # wins.
+        with _profile_io_lock(profile_path):
+            # Load existing fingerprint if exists - CRITICAL: reuse forever
+            if fingerprint_path.exists():
+                try:
+                    with open(fingerprint_path, 'r', encoding='utf-8') as f:
+                        existing = json.load(f)
+                        # Keep the permanent profile stable except for the explicit
+                        # Apple-mobile -> Android migration requested by the caller.
+                        desired_ua = normalize_mobile_user_agent(
+                            (client_info or {}).get('user_agent')
+                        )
+                        current_is_apple_mobile = is_apple_mobile_user_agent(
+                            existing.get('user_agent')
+                        )
+                        requested_is_mobile = bool((client_info or {}).get('is_mobile')) or is_apple_mobile_user_agent(
+                            (client_info or {}).get('user_agent')
+                        )
+                        if (requested_is_mobile and desired_ua and
+                                'Android' in desired_ua and current_is_apple_mobile):
+                            existing = self._migrate_apple_mobile_fingerprint(existing, desired_ua)
+                            self._save_fingerprint(user_id, existing)
+                        if client_info and 'proxy_session' in client_info:
+                            existing['proxy_session'] = client_info['proxy_session']
+                        return existing
+                except Exception:
+                    pass
+
+            # Create new fingerprint using client's actual info
+            if client_info:
+                fingerprint = self._create_fingerprint_from_client(user_id, client_info)
+            else:
+                # Fallback: create generic desktop fingerprint
+                fingerprint = self._create_generic_fingerprint(user_id)
+
+            # Save and return
+            self._save_fingerprint(user_id, fingerprint)
+            return fingerprint
+
     def _create_fingerprint_from_client(self, user_id: str, client_info: Dict) -> Dict:
         """
         Create fingerprint using client info with NETWORK CONSISTENCY.
@@ -1933,11 +1945,11 @@ class FingerprintManager:
         return seed / 2147483647
     
     def _save_fingerprint(self, user_id: str, fingerprint: Dict):
-        """Save fingerprint to disk"""
+        """Atomically save fingerprint under the durable profile lock."""
         fingerprint_path = self.get_fingerprint_path(user_id)
         try:
-            with open(fingerprint_path, 'w', encoding='utf-8') as f:
-                json.dump(fingerprint, f, indent=2, ensure_ascii=False)
+            with _profile_io_lock(fingerprint_path.parent):
+                _atomic_json_write(fingerprint_path, fingerprint)
             logger.debug(f"[Fingerprint] Saved for user {user_id}")
         except Exception as e:
             logger.error(f"[Fingerprint] Error saving: {e}")
@@ -1953,8 +1965,10 @@ class FingerprintManager:
         fingerprints = []
         try:
             for profile_dir in self.base_dir.iterdir():
-                if profile_dir.is_dir():
-                    fp_path = profile_dir / "fingerprint.json"
+                if not profile_dir.is_dir() or profile_dir.name.startswith('.'):
+                    continue
+                fp_path = profile_dir / "fingerprint.json"
+                with _profile_io_lock(profile_dir):
                     if fp_path.exists():
                         try:
                             with open(fp_path, 'r', encoding='utf-8') as f:
