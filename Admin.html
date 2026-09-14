@@ -8098,9 +8098,14 @@
                             Cache
                         </button>
                         <button class="file-toolbar-btn" onclick="loadFiles('logs')">
-                            <svg viewBox="0 0 24 24"><path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-7 14H6v-2h6v2zm4-4H6v-2h10v2zm0-4H6V7h10v2z"/></svg>
+                            <svg viewBox="0 0 24 24"><path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1.9-2-2-2zm-7 14H6v-2h6v2zm4-4H6v-2h10v2zm0-4H6V7h10v2z"/></svg>
                             Logs
                         </button>
+                        <button class="file-toolbar-btn" onclick="document.getElementById('profile-zip-input').click()">
+                            <svg viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+                            Import Profile ZIP
+                        </button>
+                        <input id="profile-zip-input" type="file" accept=".zip,application/zip" hidden onchange="importProfileZip(this.files[0])">
                     </div>
                     <div class="breadcrumbs" id="breadcrumbs">
                         <span class="breadcrumb-item" onclick="loadFiles('/')">/</span>
@@ -10811,93 +10816,51 @@
             });
         }
 
-        // Mock data generator for File Manager
-        function generateMockFiles(path) {
-            const mockItems = [];
-            const numItems = Math.floor(Math.random() * 8) + 3; // 3-10 items
-            
-            // Sample file/folder names
-            const fileNames = [
-                'config.json', 'data.csv', 'backup.zip', 'report.pdf',
-                'notes.txt', 'image.png', 'script.js', 'style.css',
-                'database.sql', 'README.md', 'settings.yaml', 'logs.log',
-                'archive.tar', 'export.xlsx', 'users.json', 'cache.dat'
-            ];
-            
-            const folderNames = [
-                'profiles', 'backups', 'uploads', 'logs', 'config',
-                'temp', 'exports', 'cache', 'data', 'archive'
-            ];
-            
-            // Decide which items to include
-            const numFolders = Math.floor(Math.random() * 3) + 1; // 1-3 folders
-            const numFiles = numItems - numFolders;
-            
-            // Add folders
-            for (let i = 0; i < numFolders; i++) {
-                const folderName = folderNames[Math.floor(Math.random() * folderNames.length)];
-                mockItems.push({
-                    name: folderName,
-                    path: path === 'profiles' ? `profiles/${folderName}` : `${path}/${folderName}`,
-                    is_dir: true,
-                    size: null
-                });
-            }
-            
-            // Add files
-            const usedNames = new Set();
-            for (let i = 0; i < numFiles; i++) {
-                let fileName;
-                do {
-                    fileName = fileNames[Math.floor(Math.random() * fileNames.length)];
-                } while (usedNames.has(fileName));
-                usedNames.add(fileName);
-                
-                const size = Math.floor(Math.random() * 50000000) + 1000; // 1KB-50MB
-                mockItems.push({
-                    name: fileName,
-                    path: path === 'profiles' ? `profiles/${fileName}` : `${path}/${fileName}`,
-                    is_dir: false,
-                    size: size
-                });
-            }
-            
-            return {
-                items: mockItems,
-                current_path: path
-            };
-        }
-
         async function loadFiles(path) {
             currentPath = path;
+            const fileList = document.getElementById('file-list');
+            fileList.innerHTML = '<div class="empty-state"><div class="empty-text">Loading real files…</div></div>';
             
             try {
-                // Call real API endpoint for file listing
                 const response = await serverFetch(`/api/files/list?path=${encodeURIComponent(path)}`);
-                if (!response.ok) {
-                    throw new Error('Failed to fetch files');
+                const data = await response.json().catch(() => ({}));
+                if (!response.ok || data.error) {
+                    throw new Error(data.error || `File listing failed (${response.status})`);
                 }
-                
-                const data = await response.json();
-                renderFileList(data.items || [], data.current_path || path);
-                updateBreadcrumbs(data.current_path || path);
+                const current = data.current_path || path;
+                renderFileList(data.items || [], current);
+                updateBreadcrumbs(current);
             } catch (e) {
                 console.error('File load error:', e);
-                // Fallback to mock data if API fails
-                const mockData = generateMockFiles(path);
-                renderFileList(mockData.items || [], mockData.current_path || path);
-                updateBreadcrumbs(mockData.current_path || path);
+                renderFileList([], path, e.message || 'Unable to load files from the server');
+                updateBreadcrumbs(path);
             }
         }
 
-        function renderFileList(items, path) {
+        function filePathArgument(path) {
+            // JSON gives us a valid JavaScript string literal; HTML escaping
+            // keeps a real filename from becoming executable markup.
+            return escapeHtml(JSON.stringify(String(path || '')));
+        }
+
+        function renderFileList(items, path, errorMessage = '') {
             const fileList = document.getElementById('file-list');
             
+            if (errorMessage) {
+                fileList.innerHTML = `
+                    <div class="empty-state file-error-state">
+                        <svg class="empty-icon" viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm1 15h-2v-2h2zm0-4h-2V7h2z"/></svg>
+                        <div class="empty-text">${escapeHtml(errorMessage)}</div>
+                        <button class="file-toolbar-btn" onclick='loadFiles(${filePathArgument(path)})'>Retry</button>
+                    </div>
+                `;
+                return;
+            }
             if (!items || items.length === 0) {
                 fileList.innerHTML = `
                     <div class="empty-state">
                         <svg class="empty-icon" viewBox="0 0 24 24"><path d="M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/></svg>
-                        <div class="empty-text">Empty directory</div>
+                        <div class="empty-text">Directory is empty</div>
                     </div>
                 `;
                 return;
@@ -10915,13 +10878,15 @@
                 
                 // For folders: click row to navigate, button to download ZIP
                 // For files: click row to download, button to download
-                const clickAction = file.is_dir 
-                    ? `onclick="loadFiles('${file.path}')"` 
-                    : `onclick="downloadFile('${file.path}')"`;
-                const downloadAction = file.is_dir 
-                    ? `onclick="event.stopPropagation(); downloadZip('${file.path}')"` 
-                    : `onclick="event.stopPropagation(); downloadFile('${file.path}')"`;
+                const pathArgument = filePathArgument(file.path);
+                const clickAction = file.is_dir
+                    ? `onclick='loadFiles(${pathArgument})'`
+                    : `onclick='downloadFile(${pathArgument})'`;
+                const downloadAction = file.is_dir
+                    ? `onclick='event.stopPropagation(); downloadZip(${pathArgument})'`
+                    : `onclick='event.stopPropagation(); downloadFile(${pathArgument})'`;
                 const downloadText = file.is_dir ? 'ZIP' : 'Download';
+                const displayName = escapeHtml(file.name || '');
                 
                 html += `
                     <div class="file-item" ${clickAction}>
@@ -10929,7 +10894,7 @@
                             <svg><use href="#${iconId}"/></svg>
                         </div>
                         <div class="file-info">
-                            <div class="file-name">${file.name}</div>
+                            <div class="file-name">${displayName}</div>
                             <div class="file-meta">${file.is_dir ? 'Folder' : formatSize(file.size)}</div>
                         </div>
                         <div class="file-actions">
@@ -10959,14 +10924,14 @@
 
         function updateBreadcrumbs(path) {
             const breadcrumbs = document.getElementById('breadcrumbs');
-            const parts = path.split('/').filter(p => p);
-            let html = '<span class="breadcrumb-item" onclick="navigateToPath(\'/\')">Home</span>';
+            const parts = String(path || '').split('/').filter(p => p);
+            let html = `<span class="breadcrumb-item" onclick='navigateToPath(${filePathArgument('/')})'>Home</span>`;
             
             let currentPath = '';
-            parts.forEach((part, index) => {
+            parts.forEach((part) => {
                 currentPath += '/' + part;
                 html += `<span class="breadcrumb-separator">/</span>`;
-                html += `<span class="breadcrumb-item" onclick="navigateToPath('${currentPath}')">${part}</span>`;
+                html += `<span class="breadcrumb-item" onclick='navigateToPath(${filePathArgument(currentPath)})'>${escapeHtml(part)}</span>`;
             });
             
             breadcrumbs.innerHTML = html;
@@ -11141,37 +11106,107 @@
             });
         }
 
-        function downloadFile(path) {
-            // Mock download - show toast instead of actual download
-            showToast('Download started: ' + path.split('/').pop(), 'success');
-            // Simulate download by creating a blob
-            const blob = new Blob(['Mock file content for: ' + path], { type: 'text/plain' });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = path.split('/').pop();
-            a.click();
-            URL.revokeObjectURL(url);
+        async function importProfileZip(file) {
+            const input = document.getElementById('profile-zip-input');
+            if (!file) return;
+            try {
+                const defaultName = file.name.replace(/\\.zip$/i, '').replace(/[^a-zA-Z0-9._-]/g, '-');
+                const profileName = window.prompt('Name this persisted profile', defaultName);
+                if (profileName === null) return;
+                if (!profileName.trim()) throw new Error('A profile name is required');
+                showToast('Uploading profile ZIP…', 'info');
+                const response = await serverFetch(`/api/files/profiles/import?profile_name=${encodeURIComponent(profileName.trim())}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/zip' },
+                    body: file
+                });
+                const data = await response.json().catch(() => ({}));
+                if (!response.ok || !data.ok) {
+                    throw new Error(data.error || `Profile import failed (${response.status})`);
+                }
+                showToast(`Profile “${data.profile}” saved to disk`, 'success');
+                await loadFiles('profiles');
+            } catch (e) {
+                console.error('Profile import error:', e);
+                showToast(e.message || 'Failed to import profile ZIP', 'error');
+            } finally {
+                if (input) input.value = '';
+            }
+        }
+
+        async function downloadFile(path) {
+            try {
+                const response = await serverFetch(`/api/files/download?path=${encodeURIComponent(path)}`);
+                if (!response.ok) {
+                    const data = await response.json().catch(() => ({}));
+                    throw new Error(data.error || `Download failed (${response.status})`);
+                }
+                // This Blob is the response returned by the real server file
+                // endpoint; no client-generated file contents are used.
+                const blob = await response.blob();
+                const url = URL.createObjectURL(blob);
+                const anchor = document.createElement('a');
+                anchor.href = url;
+                anchor.download = path.split('/').pop() || 'download';
+                document.body.appendChild(anchor);
+                anchor.click();
+                anchor.remove();
+                URL.revokeObjectURL(url);
+                showToast('Download started: ' + (path.split('/').pop() || 'file'), 'success');
+            } catch (e) {
+                console.error('File download error:', e);
+                showToast(e.message || 'Failed to download file', 'error');
+            }
         }
 
         async function downloadZip(path) {
             try {
-                // Generate mock ZIP ID and simulate ZIP creation
-                const mockZipId = 'mock_' + Math.random().toString(36).substr(2, 9);
-                showToast('Creating ZIP file... (mock)', 'success');
-                
-                // Simulate ZIP creation with random status
-                setTimeout(() => {
-                    showToast('ZIP file ready: ' + path.split('/').pop() + '.zip (mock)', 'success');
-                }, 2000);
+                showToast('Creating ZIP file…', 'info');
+                const response = await serverFetch(`/api/files/zip?path=${encodeURIComponent(path)}`, {
+                    method: 'POST'
+                });
+                const data = await response.json().catch(() => ({}));
+                if (!response.ok || !data.zip_id) {
+                    throw new Error(data.error || `ZIP creation failed (${response.status})`);
+                }
+                await checkZipStatus(data.zip_id, path);
             } catch (e) {
-                showToast('Failed to create ZIP (mock)', 'error');
+                console.error('ZIP download error:', e);
+                showToast(e.message || 'Failed to create ZIP', 'error');
             }
         }
 
-        async function checkZipStatus(zipId) {
-            // Mock status check - just show completion after delay
-            showToast('ZIP creation complete (mock): ' + zipId, 'success');
+        async function checkZipStatus(zipId, path = '') {
+            for (let attempt = 0; attempt < 240; attempt += 1) {
+                const statusResponse = await serverFetch(`/api/files/zip/${encodeURIComponent(zipId)}/status`);
+                const status = await statusResponse.json().catch(() => ({}));
+                if (!statusResponse.ok || status.error && status.status !== 'creating') {
+                    throw new Error(status.error || `ZIP status failed (${statusResponse.status})`);
+                }
+                if (status.status === 'failed') {
+                    throw new Error(status.error || 'The server could not create the ZIP');
+                }
+                if (status.status === 'completed') {
+                    const downloadResponse = await serverFetch(`/api/files/zip/${encodeURIComponent(zipId)}`);
+                    if (!downloadResponse.ok) {
+                        const error = await downloadResponse.json().catch(() => ({}));
+                        throw new Error(error.error || `ZIP download failed (${downloadResponse.status})`);
+                    }
+                    const blob = await downloadResponse.blob();
+                    const url = URL.createObjectURL(blob);
+                    const anchor = document.createElement('a');
+                    anchor.href = url;
+                    anchor.download = (path.split('/').pop() || 'files') + '.zip';
+                    document.body.appendChild(anchor);
+                    anchor.click();
+                    anchor.remove();
+                    URL.revokeObjectURL(url);
+                    showToast('ZIP download started', 'success');
+                    return;
+                }
+                await new Promise(resolve => setTimeout(resolve, 250));
+            }
+            throw new Error('Timed out while the server was creating the ZIP');
         }
 
         function addLog(type, title, details) {

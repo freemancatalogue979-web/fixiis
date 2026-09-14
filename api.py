@@ -13,6 +13,7 @@ import os
 import shutil
 import zipfile
 import uuid
+import stat
 from frame_crop import crop_frame_to_content
 import sys
 import base64
@@ -2703,142 +2704,321 @@ async def manager_websocket_endpoint(websocket: WebSocket):
 # File Manager Endpoints
 # ==============================
 
+def _normalise_file_manager_path(user_path: str) -> str:
+    """Return a root-relative POSIX path for the Admin file manager."""
+    value = str(user_path or "").replace("\\", "/").strip()
+    if value in {"", "/", "."}:
+        return ""
+    return value.lstrip("/")
+
+
 def safe_resolve_path(base_dir: Path, user_path: str) -> tuple[Path, bool]:
-    """
-    Safely resolve a user-provided path and check it's within base directory.
-    
-    Returns:
-        tuple: (resolved_path, is_valid)
-        - resolved_path: The resolved Path object if valid
-        - is_valid: True if path is within base_dir, False otherwise
-    """
+    """Resolve an Admin file-manager path without allowing traversal."""
     try:
-        # Normalize the path (handles .. and .)
-        target_path = (base_dir / user_path).resolve()
-        
-        # Check if the resolved path is within the base directory
-        # Using is_relative_to() (Python 3.9+) or manual check
+        base = base_dir.resolve()
+        relative = _normalise_file_manager_path(user_path)
+        target_path = (base / relative).resolve()
         try:
-            is_safe = target_path.is_relative_to(base_dir)
+            is_safe = target_path.is_relative_to(base)
         except AttributeError:
-            # Python < 3.9 fallback
-            is_safe = str(target_path).startswith(str(base_dir))
-        
+            is_safe = str(target_path) == str(base) or str(target_path).startswith(str(base) + os.sep)
         return target_path, is_safe
     except (OSError, ValueError):
-        # Invalid path characters or other errors
         return base_dir, False
+
+
+def _path_is_within(path: Path, parent: Path) -> bool:
+    """Compatibility helper for checking either equal or nested paths."""
+    try:
+        path.resolve().relative_to(parent.resolve())
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+async def _release_sessions_for_file_download(target_path: Path) -> List[str]:
+    """Close sessions that own a profile before the file is read or zipped.
+
+    Browser processes keep Chrome's profile files locked and can otherwise
+    produce an incomplete archive. Only sessions whose stable profile path
+    contains the requested path (or is contained by it) are released.
+    """
+    if not session_manager:
+        return []
+    try:
+        async with session_manager._sessions_lock:
+            active = list(session_manager.sessions.items())
+    except Exception:
+        return []
+
+    profile_root = Path(getattr(getattr(session_manager, "config", None), "profile_base_path", "profiles"))
+    if not profile_root.is_absolute():
+        profile_root = Path(__file__).parent / profile_root
+    profile_root = profile_root.resolve()
+    released: List[str] = []
+    for session_id, session in active:
+        user_id = str(getattr(session, "user_id", "") or "").strip()
+        if not user_id:
+            continue
+        try:
+            durable_profile = (profile_root / user_id).resolve()
+        except (OSError, ValueError):
+            continue
+        if not _path_is_within(durable_profile, profile_root):
+            continue
+        if not (_path_is_within(target_path, durable_profile)
+                or _path_is_within(durable_profile, target_path)):
+            continue
+        try:
+            if await session_manager.remove_session(session_id, force=True):
+                released.append(session_id)
+        except Exception:
+            logger.warning("[File Manager] Could not release session %s before download", session_id, exc_info=True)
+    return released
+
+
+def _configured_profile_root(base_dir: Path) -> Path:
+    """Resolve the configured durable profile directory."""
+    configured = getattr(getattr(session_manager, "config", None), "profile_base_path", None)
+    profile_root = Path(configured or (base_dir / "profiles"))
+    if not profile_root.is_absolute():
+        profile_root = base_dir / profile_root
+    return profile_root.resolve()
+
+
+def _resolve_file_manager_path(base_dir: Path, user_path: str) -> tuple[Path, bool, str]:
+    """Resolve a file-manager path, mapping the virtual ``profiles`` folder.
+
+    The Admin UI always addresses the profile store as ``profiles`` even when
+    ``profile_base_path`` is configured elsewhere. The virtual prefix is not
+    allowed to escape that configured directory.
+    """
+    relative = _normalise_file_manager_path(user_path)
+    if relative == "profiles" or relative.startswith("profiles/"):
+        profile_root = _configured_profile_root(base_dir)
+        suffix = relative[len("profiles"):].lstrip("/")
+        target, is_safe = safe_resolve_path(profile_root, suffix)
+        return target, is_safe, relative
+    target, is_safe = safe_resolve_path(base_dir, relative)
+    return target, is_safe, relative
+
+
+def _file_manager_child_path(current_path: str, name: str) -> str:
+    current = _normalise_file_manager_path(current_path)
+    return f"{current}/{name}" if current else name
+
+
+def _file_manager_parent_path(current_path: str) -> Optional[str]:
+    current = _normalise_file_manager_path(current_path)
+    if not current:
+        return None
+    parent = current.rsplit("/", 1)[0]
+    return parent or "/"
 
 
 @app.get("/api/files/list")
 async def list_files(path: str = ""):
-    """List files and directories at the given path"""
+    """List the real filesystem below the project and configured profile roots."""
     try:
-        from pathlib import Path
-        
-        # Base directory is the project root
-        base_dir = Path(__file__).parent
-        
-        # Validate path to prevent directory traversal
-        target_path, is_safe = safe_resolve_path(base_dir, path)
+        base_dir = Path(__file__).parent.resolve()
+        target_path, is_safe, relative = _resolve_file_manager_path(base_dir, path)
+        if relative == "" or relative == "profiles" or relative.startswith("profiles/"):
+            # Keep the configured durable store visible even before the first
+            # browser session has created a profile.
+            _configured_profile_root(base_dir).mkdir(parents=True, exist_ok=True)
         if not is_safe:
             return JSONResponse({
                 "items": [],
-                "current_path": path,
+                "current_path": relative or "/",
                 "parent_path": None,
                 "error": "Access denied"
             }, status_code=403)
-        
         if not target_path.exists():
             return JSONResponse({
                 "items": [],
-                "current_path": path,
-                "parent_path": None,
+                "current_path": relative or "/",
+                "parent_path": _file_manager_parent_path(relative),
                 "error": "Path not found"
-            })
-        
+            }, status_code=404)
         if not target_path.is_dir():
             return JSONResponse({
                 "items": [],
-                "current_path": path,
-                "parent_path": None,
+                "current_path": relative or "/",
+                "parent_path": _file_manager_parent_path(relative),
                 "error": "Path is not a directory"
-            })
-        
+            }, status_code=400)
+
         items = []
         for item in sorted(target_path.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
             try:
                 stat = item.stat()
                 items.append({
                     "name": item.name,
-                    "path": str(item.relative_to(base_dir)) if path else item.name,
+                    "path": _file_manager_child_path(relative, item.name),
                     "is_dir": item.is_dir(),
                     "size": stat.st_size if item.is_file() else 0,
                     "modified": stat.st_mtime,
                 })
             except (PermissionError, OSError):
-                # Skip inaccessible files
                 continue
-        
+
+        # A profile_base_path outside the project still appears through the
+        # virtual ``profiles`` entry used by the Admin UI.
+        if not relative and not any(item.get("name") == "profiles" for item in items):
+            items.append({
+                "name": "profiles",
+                "path": "profiles",
+                "is_dir": True,
+                "size": 0,
+                "modified": _configured_profile_root(base_dir).stat().st_mtime,
+            })
+            items.sort(key=lambda item: (not item["is_dir"], item["name"].lower()))
+
         return JSONResponse({
             "items": items,
-            "current_path": str(target_path.relative_to(base_dir)) if path else "/",
-            "parent_path": str(target_path.parent.relative_to(base_dir)) if target_path.parent != base_dir and path else None
+            "current_path": relative or "/",
+            "parent_path": _file_manager_parent_path(relative)
         })
     except Exception as e:
-        logger.error(f"Error listing files: {e}")
+        logger.error("Error listing files: %s", e, exc_info=True)
         return JSONResponse({
             "items": [],
-            "current_path": path,
+            "current_path": _normalise_file_manager_path(path) or "/",
             "parent_path": None,
-            "error": str(e)
+            "error": "Unable to list this directory"
         }, status_code=500)
 
 
 @app.get("/api/files/profiles")
 async def list_profiles():
-    """List files in the profiles directory"""
+    """List the actual configured profile storage directory."""
+    return await list_files("profiles")
+
+
+@app.post("/api/files/profiles/import")
+async def import_profile_zip(request: Request, profile_name: str = ""):
+    """Safely persist an uploaded browser-profile ZIP under profile storage.
+
+    The archive may contain a complete Chromium user-data directory or a
+    cookies.json file plus other profile state. It is extracted into a private
+    staging directory first; absolute paths, traversal entries, symlinks and
+    oversized archives are rejected before anything is installed.
+    """
+    base_dir = Path(__file__).parent.resolve()
+    profile_root = _configured_profile_root(base_dir)
+    staging = profile_root / f".profile-import-{uuid.uuid4().hex}"
+    max_upload_bytes = 4 * 1024 * 1024 * 1024
+    max_unpacked_bytes = 8 * 1024 * 1024 * 1024
+    max_members = 100000
+
+    def _safe_name(value: str) -> str:
+        candidate = str(value or "").strip()
+        if not candidate or candidate in {".", ".."} or "/" in candidate or "\\" in candidate:
+            return ""
+        if candidate.startswith(".") or len(candidate) > 120:
+            return ""
+        return candidate
+
     try:
-        from pathlib import Path
-        
-        base_dir = Path(__file__).parent
-        profiles_path = base_dir / "profiles"
-        
-        if not profiles_path.exists():
-            return JSONResponse({
-                "items": [],
-                "current_path": "profiles",
-                "parent_path": "",
-                "message": "Profiles directory not found"
-            })
-        
-        items = []
-        for item in sorted(profiles_path.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
-            try:
-                stat = item.stat()
-                items.append({
-                    "name": item.name,
-                    "path": str(item.relative_to(base_dir)),
-                    "is_dir": item.is_dir(),
-                    "size": stat.st_size if item.is_file() else 0,
-                    "modified": stat.st_mtime,
-                })
-            except (PermissionError, OSError):
-                continue
-        
+        content_length = request.headers.get("content-length")
+        if content_length and int(content_length) > max_upload_bytes:
+            return JSONResponse({"error": "Profile ZIP is too large"}, status_code=413)
+
+        profile_root.mkdir(parents=True, exist_ok=True)
+        staging.mkdir(parents=True, exist_ok=False)
+        upload_path = staging / "upload.zip"
+        total = 0
+        with upload_path.open("wb") as output:
+            async for chunk in request.stream():
+                total += len(chunk)
+                if total > max_upload_bytes:
+                    raise HTTPException(status_code=413, detail="Profile ZIP is too large")
+                output.write(chunk)
+
+        if not zipfile.is_zipfile(upload_path):
+            raise HTTPException(status_code=400, detail="The uploaded file is not a ZIP archive")
+
+        extracted = staging / "extracted"
+        extracted.mkdir()
+        total_unpacked = 0
+        with zipfile.ZipFile(upload_path, "r") as archive:
+            members = archive.infolist()
+            if len(members) > max_members:
+                raise HTTPException(status_code=400, detail="Profile ZIP contains too many files")
+            for member in members:
+                member_name = member.filename.replace("\\", "/")
+                parts = [part for part in member_name.split("/") if part]
+                if (not parts or member_name.startswith("/") or ":" in parts[0]
+                        or any(part in {".", ".."} for part in parts)):
+                    raise HTTPException(status_code=400, detail="Profile ZIP contains an unsafe path")
+                if stat.S_ISLNK((member.external_attr >> 16) & 0o170000):
+                    raise HTTPException(status_code=400, detail="Profile ZIP contains a symlink")
+                total_unpacked += int(member.file_size or 0)
+                if total_unpacked > max_unpacked_bytes:
+                    raise HTTPException(status_code=413, detail="Unpacked profile is too large")
+                destination = (extracted.joinpath(*parts)).resolve()
+                if not _path_is_within(destination, extracted):
+                    raise HTTPException(status_code=400, detail="Profile ZIP contains an unsafe path")
+                if member.is_dir() or member_name.endswith("/"):
+                    destination.mkdir(parents=True, exist_ok=True)
+                    continue
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                with archive.open(member, "r") as source, destination.open("wb") as target:
+                    shutil.copyfileobj(source, target, length=1024 * 1024)
+
+        children = [child for child in extracted.iterdir() if child.name != "upload.zip"]
+        raw_profile_name = str(profile_name or "").strip()
+        requested_name = _safe_name(raw_profile_name)
+        if raw_profile_name and not requested_name:
+            raise HTTPException(status_code=400, detail="Invalid profile name")
+        inferred_name = ""
+        source_root = extracted
+        # Archives produced from the file manager have profiles/<name>/...;
+        # ordinary browser exports commonly have <name>/... . Strip only the
+        # known wrapper, never an arbitrary internal Default directory.
+        if len(children) == 1 and children[0].is_dir():
+            wrapper = children[0]
+            if wrapper.name in {"profiles", "browser_profiles"}:
+                source_root = wrapper
+                nested = [child for child in wrapper.iterdir() if child.is_dir()]
+                files = [child for child in wrapper.iterdir() if child.is_file()]
+                if len(nested) == 1 and not files:
+                    source_root = nested[0]
+                    inferred_name = nested[0].name
+            elif requested_name or not any(child.is_file() for child in children):
+                source_root = wrapper
+                inferred_name = wrapper.name
+
+        final_name = requested_name or _safe_name(inferred_name)
+        if not final_name:
+            final_name = f"profile-{uuid.uuid4().hex[:10]}"
+        target = (profile_root / final_name).resolve()
+        if not _path_is_within(target, profile_root) or target == profile_root:
+            raise HTTPException(status_code=400, detail="Invalid profile name")
+
+        await _release_sessions_for_file_download(target)
+        if target.exists() or target.is_symlink():
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(source_root), str(target))
+        cookies_present = (target / "cookies.json").is_file()
         return JSONResponse({
-            "items": items,
-            "current_path": "profiles",
-            "parent_path": ""
+            "ok": True,
+            "profile": final_name,
+            "path": f"profiles/{final_name}",
+            "cookies_json": cookies_present,
+            "message": "Profile imported"
         })
-    except Exception as e:
-        logger.error(f"Error listing profiles: {e}")
-        return JSONResponse({
-            "items": [],
-            "current_path": "profiles",
-            "parent_path": None,
-            "error": str(e)
-        }, status_code=500)
+    except HTTPException as exc:
+        return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
+    except Exception as exc:
+        logger.error("Error importing profile ZIP: %s", exc, exc_info=True)
+        return JSONResponse({"error": "Unable to import profile ZIP"}, status_code=500)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 @app.get("/api/profiles/favicons/{filename}")
@@ -2881,24 +3061,26 @@ async def download_file(path: str):
     try:
         from pathlib import Path
         
-        base_dir = Path(__file__).parent
-        
-        # Validate path to prevent directory traversal
-        file_path, is_safe = safe_resolve_path(base_dir, path)
+        base_dir = Path(__file__).parent.resolve()
+        file_path, is_safe, _ = _resolve_file_manager_path(base_dir, path)
         if not is_safe:
             return JSONResponse({"error": "Access denied"}, status_code=403)
-        
         if not file_path.exists():
             return JSONResponse({"error": "File not found"}, status_code=404)
-        
         if not file_path.is_file():
             return JSONResponse({"error": "Path is not a file"}, status_code=400)
-        
-        return FileResponse(
+
+        # Release the owner before Starlette opens the real file. This is
+        # targeted to the requested profile, not a global browser shutdown.
+        released_sessions = await _release_sessions_for_file_download(file_path)
+        response = FileResponse(
             file_path,
             filename=file_path.name,
             media_type="application/octet-stream"
         )
+        if released_sessions:
+            response.headers["X-Released-Sessions"] = str(len(released_sessions))
+        return response
     except Exception as e:
         logger.error(f"Error downloading file: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -2908,28 +3090,38 @@ async def download_file(path: str):
 zip_jobs: Dict[str, Dict] = {}
 
 
-def create_zip_archive(base_dir: Path, target_path: Path, zip_id: str):
-    """Create a ZIP archive in background"""
+def create_zip_archive(base_dir: Path, target_path: Path, zip_id: str, archive_prefix: str = ""):
+    """Create a ZIP archive from a validated real filesystem path."""
     try:
         zip_path = base_dir / "cache" / f"{zip_id}.zip"
         zip_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        prefix = Path(_normalise_file_manager_path(archive_prefix)) if archive_prefix else Path()
+
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
             if target_path.is_file():
-                zipf.write(target_path, target_path.name)
+                arcname = prefix if archive_prefix else Path(target_path.name)
+                zipf.write(target_path, arcname)
             else:
-                for root, dirs, files in os.walk(target_path):
+                for root, dirs, files in os.walk(target_path, followlinks=False):
+                    root_path = Path(root)
+                    # Do not follow directory symlinks and do not read a
+                    # symlinked file that resolves outside the validated root.
+                    dirs[:] = [name for name in dirs if not (root_path / name).is_symlink()]
                     for file in sorted(files):
-                        file_path = Path(root) / file
-                        arcname = file_path.relative_to(base_dir)
+                        file_path = root_path / file
+                        if file_path.is_symlink() or not _path_is_within(file_path, target_path):
+                            continue
+                        relative_file = file_path.relative_to(target_path)
+                        arcname = prefix / relative_file if archive_prefix else relative_file
                         zipf.write(file_path, arcname)
-        
+
         zip_jobs[zip_id] = {
             "status": "completed",
             "path": str(zip_path),
             "filename": f"{target_path.name}.zip"
         }
     except Exception as e:
+        logger.error("Error creating ZIP %s: %s", zip_id, e, exc_info=True)
         zip_jobs[zip_id] = {
             "status": "failed",
             "error": str(e)
@@ -2938,43 +3130,39 @@ def create_zip_archive(base_dir: Path, target_path: Path, zip_id: str):
 
 @app.post("/api/files/zip")
 async def create_zip(path: str, background_tasks: BackgroundTasks):
-    """Create a ZIP archive of a directory or file"""
+    """Create a ZIP archive of a real directory or file."""
     try:
-        from pathlib import Path
-        
-        base_dir = Path(__file__).parent
-        
-        # Validate path to prevent directory traversal
-        target_path, is_safe = safe_resolve_path(base_dir, path)
+        base_dir = Path(__file__).parent.resolve()
+        target_path, is_safe, relative = _resolve_file_manager_path(base_dir, path)
         if not is_safe:
             return JSONResponse({"error": "Access denied"}, status_code=403)
-        
         if not target_path.exists():
             return JSONResponse({"error": "Path not found"}, status_code=404)
-        
-        # Generate unique ID
+        if not (target_path.is_dir() or target_path.is_file()):
+            return JSONResponse({"error": "Path cannot be archived"}, status_code=400)
+
+        # Release only the active session(s) owning this profile before the
+        # background worker starts reading its files.
+        released_sessions = await _release_sessions_for_file_download(target_path)
         zip_id = str(uuid.uuid4())[:8]
-        
-        # Check if cache directory exists
         cache_dir = base_dir / "cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Start background task
-        background_tasks.add_task(create_zip_archive, base_dir, target_path, zip_id)
-        
         zip_jobs[zip_id] = {
             "status": "creating",
             "path": None,
-            "filename": f"{target_path.name}.zip"
+            "filename": f"{target_path.name}.zip",
+            "released_sessions": len(released_sessions),
         }
-        
+        background_tasks.add_task(create_zip_archive, base_dir, target_path, zip_id, relative)
+
         return JSONResponse({
             "zip_id": zip_id,
             "status": "creating",
-            "message": "ZIP creation started"
+            "message": "ZIP creation started",
+            "released_sessions": len(released_sessions),
         })
     except Exception as e:
-        logger.error(f"Error creating ZIP: {e}")
+        logger.error("Error creating ZIP: %s", e, exc_info=True)
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
@@ -4393,39 +4581,56 @@ async def download_profile(user_id: str):
         profile_manager = getattr(session_manager, 'browser_manager', None)
         if not profile_manager:
             return JSONResponse({"error": "Profile manager not available"}, status_code=500)
-        
+        from pathlib import Path
+        profile_root = _configured_profile_root(Path(__file__).parent.resolve())
+        if (not user_id or user_id in {".", ".."} or "/" in user_id or "\\" in user_id):
+            return JSONResponse({"error": "Invalid profile path"}, status_code=403)
+        requested_path = (profile_root / user_id).resolve()
+        if requested_path == profile_root or not _path_is_within(requested_path, profile_root):
+            return JSONResponse({"error": "Invalid profile path"}, status_code=403)
         if not profile_manager.profile_manager.profile_exists(user_id):
             return JSONResponse({"error": "Profile not found"}, status_code=404)
-        profile_path = profile_manager.profile_manager.get_user_profile_path(user_id)
-        
+        profile_path = profile_manager.profile_manager.get_user_profile_path(user_id).resolve()
+        if not _path_is_within(profile_path, profile_root):
+            return JSONResponse({"error": "Invalid profile path"}, status_code=403)
+
+        # Release this profile through SessionManager before taking the
+        # filesystem snapshot, rather than shutting down unrelated sessions.
+        await _release_sessions_for_file_download(profile_path)
+
         # Create ZIP file synchronously (fast for small profiles)
         import asyncio
-        from pathlib import Path
         import tempfile
-        
+
         cache_dir = Path(__file__).parent / "cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
-        
+
         zip_path = cache_dir / f"{user_id}_{uuid.uuid4().hex}_profile.zip"
-        
+
         def create_zip_sync():
             from browser_manager import _profile_io_lock
             # Hold only this parent's lock while taking the filesystem snapshot;
             # unrelated profiles remain fully concurrent.
             with _profile_io_lock(profile_path):
                 with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                    for root, dirs, files in os.walk(profile_path):
-                        # Skip lock files
-                        dirs[:] = [d for d in dirs if d not in ['SingletonLock', 'SingletonSocket']]
+                    for root, dirs, files in os.walk(profile_path, followlinks=False):
+                        # Skip lock files, symlinked directories, and anything
+                        # that could leave the permitted profile root.
+                        dirs[:] = [
+                            d for d in dirs
+                            if d not in ['SingletonLock', 'SingletonSocket']
+                            and not (Path(root) / d).is_symlink()
+                        ]
 
                         for file in files:
                             file_path = Path(root) / file
-                            # Skip lock and temp files
-                            if file.endswith('.lock') or file.startswith('.'):
+                            if (file.endswith('.lock') or file.startswith('.')
+                                    or file_path.is_symlink()
+                                    or not _path_is_within(file_path, profile_path)):
                                 continue
-                            # Use relative path within the profile folder only
                             arcname = file_path.relative_to(profile_path)
                             zipf.write(file_path, arcname)
+
         
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, create_zip_sync)
