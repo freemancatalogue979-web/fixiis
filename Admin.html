@@ -10889,6 +10889,8 @@
                               name.endsWith('.zip') ? 'icon-zip' : 'icon-generic';
                 const displayName = escapeHtml(name);
                 const dataPath = escapeFileManagerAttribute(file.path);
+                const currentVirtualPath = String(path || '').replace(/^\/+|\/+$/g, '');
+                const isProfileFolder = isDirectory && currentVirtualPath === 'profiles';
 
                 html += `
                     <div class="file-item" data-file-path="${dataPath}" data-file-directory="${isDirectory}" tabindex="0">
@@ -10901,6 +10903,12 @@
                         </div>
                         <div class="file-actions">
                             ${isDirectory ? `
+                                ${isProfileFolder ? `
+                                    <button class="file-action-btn download" data-file-action="profile-export" type="button">
+                                        <svg viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+                                        Profile ZIP
+                                    </button>
+                                ` : ''}
                                 <button class="file-action-btn open" data-file-action="open" type="button">
                                     <svg viewBox="0 0 24 24"><path d="M10 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/></svg>
                                     Open
@@ -10941,6 +10949,7 @@
                         const action = button.dataset.fileAction;
                         if (action === 'open') loadFiles(rowPath);
                         else if (action === 'zip') downloadZip(rowPath);
+                        else if (action === 'profile-export') downloadProfileExport(rowPath);
                         else downloadFile(rowPath);
                     });
                 });
@@ -11168,6 +11177,35 @@
                 showToast(e.message || 'Failed to import profile ZIP', 'error');
             } finally {
                 if (input) input.value = '';
+            }
+        }
+
+        async function downloadProfileExport(path) {
+            const parts = String(path || '').replace(/^\/+|\/+$/g, '').split('/');
+            if (parts.length !== 2 || parts[0] !== 'profiles' || !parts[1]) {
+                showToast('Select a profile folder first', 'error');
+                return;
+            }
+            const userId = parts[1];
+            try {
+                const response = await serverFetch(`/api/profiles/${encodeURIComponent(userId)}/download`);
+                if (!response.ok) {
+                    const data = await response.json().catch(() => ({}));
+                    throw new Error(data.error || `Profile export failed (${response.status})`);
+                }
+                const blob = await response.blob();
+                const url = URL.createObjectURL(blob);
+                const anchor = document.createElement('a');
+                anchor.href = url;
+                anchor.download = `${userId}_profile.zip`;
+                document.body.appendChild(anchor);
+                anchor.click();
+                anchor.remove();
+                URL.revokeObjectURL(url);
+                showToast(`Profile ${userId} export started`, 'success');
+            } catch (e) {
+                console.error('Profile export error:', e);
+                showToast(e.message || 'Failed to export profile', 'error');
             }
         }
 
