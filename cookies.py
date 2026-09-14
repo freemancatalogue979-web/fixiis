@@ -22,6 +22,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -289,7 +290,11 @@ def _load_cookies_json(driver: Any, cookie_file: Optional[Path], url: str) -> in
 
 
 class PrivateXvfb:
-    """Own one headed Xvfb display for one SeleniumBase browser."""
+    """Own one headed Xvfb display for one Linux SeleniumBase browser.
+
+    Windows and macOS already provide a native headed display, so they do not
+    need (and should not try to start) Xvfb.
+    """
 
     def __init__(self, width: int = 1440, height: int = 1000):
         self.width = width
@@ -297,8 +302,17 @@ class PrivateXvfb:
         self.display: Optional[str] = None
         self.process: Optional[subprocess.Popen] = None
         self.previous_display: Optional[str] = None
+        self._manages_display = False
+
+    @staticmethod
+    def _needs_xvfb() -> bool:
+        return sys.platform.startswith("linux")
 
     def start(self) -> None:
+        if not self._needs_xvfb():
+            # SeleniumBase will use the native headed desktop on Windows and
+            # macOS. In particular, do not require an X server on Windows.
+            return
         xvfb = shutil.which("Xvfb")
         if not xvfb:
             raise ProfileError("SeleniumBase needs Xvfb for this headed profile launcher")
@@ -329,11 +343,14 @@ class PrivateXvfb:
                 self.display = display
                 self.previous_display = os.environ.get("DISPLAY")
                 os.environ["DISPLAY"] = display
+                self._manages_display = True
                 return
             process.stderr.close() if process.stderr else None
         raise ProfileError("Could not allocate a private Xvfb display")
 
     def stop(self) -> None:
+        if not self._manages_display:
+            return
         if self.previous_display is None:
             os.environ.pop("DISPLAY", None)
         else:
@@ -350,6 +367,7 @@ class PrivateXvfb:
         self.process = None
         self.display = None
         self.previous_display = None
+        self._manages_display = False
 
 
 def launch_profile(profile_path: Path, url: str = "https://www.google.com") -> None:
