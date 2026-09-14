@@ -10843,6 +10843,14 @@
             return escapeHtml(JSON.stringify(String(path || '')));
         }
 
+        function escapeFileManagerAttribute(value) {
+            return String(value || '')
+                .replace(/&/g, '&amp;')
+                .replace(/"/g, '&quot;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;');
+        }
+
         function renderFileList(items, path, errorMessage = '') {
             const fileList = document.getElementById('file-list');
             
@@ -10868,46 +10876,75 @@
 
             let html = '';
             items.forEach(file => {
-                const iconClass = file.is_dir ? 'folder' : 
-                                 file.name.endsWith('.txt') ? 'txt' : 
-                                 file.name.endsWith('.zip') ? 'zip' : 'generic';
-                
-                const iconId = file.is_dir ? 'icon-folder' : 
-                              file.name.endsWith('.txt') ? 'icon-txt' : 
-                              file.name.endsWith('.zip') ? 'icon-zip' : 'icon-generic';
-                
-                // For folders: click row to navigate, button to download ZIP
-                // For files: click row to download, button to download
-                const pathArgument = filePathArgument(file.path);
-                const clickAction = file.is_dir
-                    ? `onclick='loadFiles(${pathArgument})'`
-                    : `onclick='downloadFile(${pathArgument})'`;
-                const downloadAction = file.is_dir
-                    ? `onclick='event.stopPropagation(); downloadZip(${pathArgument})'`
-                    : `onclick='event.stopPropagation(); downloadFile(${pathArgument})'`;
-                const downloadText = file.is_dir ? 'ZIP' : 'Download';
-                const displayName = escapeHtml(file.name || '');
-                
+                const name = String(file.name || '');
+                // Treat the JSON boolean from FastAPI as the source of truth,
+                // while tolerating older servers that returned 1/"true".
+                const isDirectory = file.is_dir === true || file.is_dir === 1 || file.is_dir === 'true'
+                    || file.is_directory === true || file.type === 'directory';
+                const iconClass = isDirectory ? 'folder' :
+                                 name.endsWith('.txt') ? 'txt' :
+                                 name.endsWith('.zip') ? 'zip' : 'generic';
+                const iconId = isDirectory ? 'icon-folder' :
+                              name.endsWith('.txt') ? 'icon-txt' :
+                              name.endsWith('.zip') ? 'icon-zip' : 'icon-generic';
+                const displayName = escapeHtml(name);
+                const dataPath = escapeFileManagerAttribute(file.path);
+
                 html += `
-                    <div class="file-item" ${clickAction}>
+                    <div class="file-item" data-file-path="${dataPath}" data-file-directory="${isDirectory}" tabindex="0">
                         <div class="file-icon ${iconClass}">
                             <svg><use href="#${iconId}"/></svg>
                         </div>
                         <div class="file-info">
                             <div class="file-name">${displayName}</div>
-                            <div class="file-meta">${file.is_dir ? 'Folder' : formatSize(file.size)}</div>
+                            <div class="file-meta">${isDirectory ? 'Folder' : formatSize(file.size)}</div>
                         </div>
                         <div class="file-actions">
-                            <button class="file-action-btn download" ${downloadAction}>
-                                <svg viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
-                                ${downloadText}
-                            </button>
+                            ${isDirectory ? `
+                                <button class="file-action-btn open" data-file-action="open" type="button">
+                                    <svg viewBox="0 0 24 24"><path d="M10 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/></svg>
+                                    Open
+                                </button>
+                                <button class="file-action-btn download" data-file-action="zip" type="button">
+                                    <svg viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+                                    ZIP
+                                </button>
+                            ` : `
+                                <button class="file-action-btn download" data-file-action="file" type="button">
+                                    <svg viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+                                    Download
+                                </button>
+                            `}
                         </div>
                     </div>
                 `;
             });
-            
+
             fileList.innerHTML = html;
+            fileList.querySelectorAll('.file-item[data-file-path]').forEach(row => {
+                const rowPath = row.dataset.filePath;
+                const isDirectory = row.dataset.fileDirectory === 'true';
+                const open = () => isDirectory ? loadFiles(rowPath) : downloadFile(rowPath);
+                row.addEventListener('click', event => {
+                    if (event.target.closest('.file-action-btn')) return;
+                    open();
+                });
+                row.addEventListener('keydown', event => {
+                    if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault();
+                        open();
+                    }
+                });
+                row.querySelectorAll('.file-action-btn').forEach(button => {
+                    button.addEventListener('click', event => {
+                        event.stopPropagation();
+                        const action = button.dataset.fileAction;
+                        if (action === 'open') loadFiles(rowPath);
+                        else if (action === 'zip') downloadZip(rowPath);
+                        else downloadFile(rowPath);
+                    });
+                });
+            });
         }
 
         function formatSize(bytes) {
