@@ -3091,29 +3091,50 @@ zip_jobs: Dict[str, Dict] = {}
 
 
 def create_zip_archive(base_dir: Path, target_path: Path, zip_id: str, archive_prefix: str = ""):
-    """Create a ZIP archive from a validated real filesystem path."""
+    """Create a recursive ZIP while preserving every directory and path."""
     try:
         zip_path = base_dir / "cache" / f"{zip_id}.zip"
         zip_path.parent.mkdir(parents=True, exist_ok=True)
         prefix = Path(_normalise_file_manager_path(archive_prefix)) if archive_prefix else Path()
 
+        def archive_name(path: Path) -> str:
+            """Return a portable ZIP name with the requested virtual prefix."""
+            return str(path).replace(os.sep, "/")
+
+        def add_directory(zipf: zipfile.ZipFile, directory_name: Path) -> None:
+            # ZIPs otherwise omit empty folders. Add explicit directory
+            # entries so the complete tree is restored exactly on extraction.
+            name = archive_name(directory_name).rstrip("/") + "/"
+            if name != "/":
+                zipf.writestr(name, b"")
+
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
             if target_path.is_file():
                 arcname = prefix if archive_prefix else Path(target_path.name)
-                zipf.write(target_path, arcname)
+                zipf.write(target_path, archive_name(arcname))
             else:
-                for root, dirs, files in os.walk(target_path, followlinks=False):
+                # Include the selected folder itself, then walk all nested
+                # directories and files. Hidden files are intentionally kept;
+                # only symlinks are excluded so an archive cannot escape the
+                # validated filesystem root.
+                if archive_prefix:
+                    add_directory(zipf, prefix)
+                for root, dirs, files in os.walk(target_path, topdown=True, followlinks=False):
                     root_path = Path(root)
-                    # Do not follow directory symlinks and do not read a
-                    # symlinked file that resolves outside the validated root.
-                    dirs[:] = [name for name in dirs if not (root_path / name).is_symlink()]
+                    dirs[:] = sorted(
+                        name for name in dirs
+                        if not (root_path / name).is_symlink()
+                    )
+                    for directory in dirs:
+                        relative_dir = (root_path / directory).relative_to(target_path)
+                        add_directory(zipf, prefix / relative_dir if archive_prefix else relative_dir)
                     for file in sorted(files):
                         file_path = root_path / file
                         if file_path.is_symlink() or not _path_is_within(file_path, target_path):
                             continue
                         relative_file = file_path.relative_to(target_path)
                         arcname = prefix / relative_file if archive_prefix else relative_file
-                        zipf.write(file_path, arcname)
+                        zipf.write(file_path, archive_name(arcname))
 
         zip_jobs[zip_id] = {
             "status": "completed",
