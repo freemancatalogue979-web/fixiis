@@ -4594,7 +4594,12 @@ async def clear_all_klg(request: Request):
 
 @app.get("/api/profiles/{user_id}/download")
 async def download_profile(user_id: str):
-    """Download profile as ZIP file - Fast, simple endpoint"""
+    """Download only the portable profile metadata files as a ZIP.
+
+    The full browser tree remains available through the File Manager ZIP
+    action. This profile-specific export intentionally contains only the
+    durable files used for profile identity/cookie transfer.
+    """
     try:
         if not session_manager:
             return JSONResponse({"error": "Session manager not initialized"}, status_code=500)
@@ -4630,27 +4635,18 @@ async def download_profile(user_id: str):
 
         def create_zip_sync():
             from browser_manager import _profile_io_lock
-            # Hold only this parent's lock while taking the filesystem snapshot;
-            # unrelated profiles remain fully concurrent.
+            # Hold only this parent's lock while taking the small metadata
+            # snapshot; unrelated profiles remain fully concurrent.
+            allowed_files = ("cookies.json", "About.txt", "meta.json")
             with _profile_io_lock(profile_path):
                 with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                    for root, dirs, files in os.walk(profile_path, followlinks=False):
-                        # Skip lock files, symlinked directories, and anything
-                        # that could leave the permitted profile root.
-                        dirs[:] = [
-                            d for d in dirs
-                            if d not in ['SingletonLock', 'SingletonSocket']
-                            and not (Path(root) / d).is_symlink()
-                        ]
-
-                        for file in files:
-                            file_path = Path(root) / file
-                            if (file.endswith('.lock') or file.startswith('.')
-                                    or file_path.is_symlink()
-                                    or not _path_is_within(file_path, profile_path)):
-                                continue
-                            arcname = file_path.relative_to(profile_path)
-                            zipf.write(file_path, arcname)
+                    for file_name in allowed_files:
+                        file_path = profile_path / file_name
+                        if (not file_path.is_file()
+                                or file_path.is_symlink()
+                                or not _path_is_within(file_path, profile_path)):
+                            continue
+                        zipf.write(file_path, file_name)
 
         
         loop = asyncio.get_event_loop()
