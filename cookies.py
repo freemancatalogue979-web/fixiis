@@ -115,23 +115,71 @@ def _extract_zip_safely(zip_path: Path, destination: Path) -> int:
     return unpacked
 
 
+_PROFILE_ROOT_MARKERS = {
+    "Default",
+    "Local State",
+    "Preferences",
+    "Cookies",
+    "Network",
+    "Local Storage",
+    "Session Storage",
+    "Extensions",
+    "History",
+    "Login Data",
+}
+
+
+def _looks_like_browser_profile(path: Path) -> bool:
+    """Recognise a Chromium user-data root without requiring cookies.json."""
+    return any((path / marker).exists() for marker in _PROFILE_ROOT_MARKERS)
+
+
 def _choose_source_root(extracted: Path, requested_name: str = "") -> Tuple[Path, str]:
-    """Strip only an export wrapper, preserving the profile's Default folder."""
+    """Find the complete browser user-data directory inside an export.
+
+    File Manager downloads use ``profiles/<name>/...`` while other tools may
+    wrap a profile in an arbitrary export directory. This removes wrappers,
+    but never removes the profile's own ``Default`` directory or treats a
+    multi-profile store as one profile.
+    """
     children = list(extracted.iterdir())
     if len(children) != 1 or not children[0].is_dir():
         return extracted, ""
+
     wrapper = children[0]
+    nested_dirs = [child for child in wrapper.iterdir() if child.is_dir() and not child.name.startswith(".")]
+    wrapper_files = [child for child in wrapper.iterdir() if child.is_file()]
+
     if wrapper.name in GENERIC_WRAPPERS:
-        nested = [child for child in wrapper.iterdir() if child.is_dir()]
-        files = [child for child in wrapper.iterdir() if child.is_file()]
-        if len(nested) == 1 and not files:
-            return nested[0], nested[0].name
+        if requested_name:
+            requested_child = wrapper / requested_name
+            if requested_child.is_dir():
+                return requested_child, requested_name
+        if len(nested_dirs) == 1 and not wrapper_files:
+            return nested_dirs[0], nested_dirs[0].name
+        if len(nested_dirs) > 1:
+            raise ProfileError(
+                "This ZIP contains multiple profiles; import one profile folder at a time"
+            )
         return wrapper, ""
-    # A named profile export is commonly <profile-name>/Default/... . If a
-    # name was supplied, strip that outer directory even if its name differs.
-    if requested_name or not any(child.is_file() for child in children):
+
+    # A named profile export is commonly <profile-name>/Default/..., and a
+    # file-manager export may have an extra arbitrary wrapper around it.
+    if requested_name and wrapper.name == requested_name:
         return wrapper, wrapper.name
-    return extracted, ""
+    if _looks_like_browser_profile(wrapper):
+        return wrapper, wrapper.name
+    if requested_name:
+        requested_child = wrapper / requested_name
+        if requested_child.is_dir():
+            return requested_child, requested_name
+    profile_children = [child for child in nested_dirs if _looks_like_browser_profile(child)]
+    if len(profile_children) == 1 and not wrapper_files:
+        return profile_children[0], profile_children[0].name
+
+    # Keep a single non-profile-looking directory intact rather than
+    # guessing; it may still be a valid custom Chromium profile.
+    return wrapper, wrapper.name
 
 
 def _find_cookie_file(profile_path: Path) -> Optional[Path]:
@@ -143,6 +191,18 @@ def _find_cookie_file(profile_path: Path) -> Optional[Path]:
     # interchange format.
     matches = [candidate for candidate in profile_path.rglob("cookies.json") if candidate.is_file()]
     return matches[0] if len(matches) == 1 else None
+
+
+def _has_native_cookie_store(profile_path: Path) -> bool:
+    """Return whether the imported folder already has Chromium cookie state."""
+    return any(
+        (profile_path / relative).is_file()
+        for relative in (
+            Path("Default") / "Cookies",
+            Path("Network") / "Cookies",
+            Path("Cookies"),
+        )
+    )
 
 
 def import_profile_zip(
@@ -187,6 +247,9 @@ def import_profile_zip(
             "profile_name": final_name,
             "imported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "source": source.name,
+            "profile_type": "chromium-user-data-directory",
+            "persistent": True,
+            "persistent_user_data_dir": str(target),
             "cookies_json": bool(cookie_file),
         }
         (target / ".profile-manager.json").write_text(
@@ -371,7 +434,16 @@ class PrivateXvfb:
 
 
 def launch_profile(profile_path: Path, url: str = "https://www.google.com") -> None:
-    """Launch Google/URL with the selected persisted user-data directory."""
+    """Launch a complete persisted profile at Google or another URL.
+
+    ``profile_path`` is passed as SeleniumBase's Chromium ``user_data_dir``.
+    That makes the imported folder itself the persistent browser context:
+    Preferences, Local Storage, IndexedDB, history, extensions, native
+    Cookies DB, session state, and every other profile file remain available.
+    ``cookies.json`` is only an optional compatibility import for exports that
+    do not contain Chromium's native Cookies database.
+    """
+    profile_path = Path(profile_path).expanduser().resolve()
     if not profile_path.is_dir():
         raise ProfileError("That profile no longer exists")
     if not url.strip():
@@ -388,6 +460,10 @@ def launch_profile(profile_path: Path, url: str = "https://www.google.com") -> N
     driver: Any = None
     try:
         display.start()
+        # Do not create a fresh temporary context and do not reduce the
+        # profile to cookies.json. SeleniumBase opens this exact directory as
+        # Chrome's persistent user-data-dir, just like Neo Stream's persistent
+        # browser context.
         driver = Driver(
             browser="chrome",
             uc=True,
@@ -396,11 +472,16 @@ def launch_profile(profile_path: Path, url: str = "https://www.google.com") -> N
         )
         driver.get(url)
         cookie_file = _find_cookie_file(profile_path)
-        imported = _load_cookies_json(driver, cookie_file, url)
+        imported = 0
+        if cookie_file and not _has_native_cookie_store(profile_path):
+            imported = _load_cookies_json(driver, cookie_file, url)
+        elif cookie_file:
+            print("Using the profile's native Chromium Cookies database; cookies.json remains preserved")
         if imported:
-            print(f"Loaded {imported} cookies from cookies.json")
-        print(f"Running profile {profile_path.name} at {url}")
-        print("The browser state is saved in that profile directory. Press Enter here to close it.")
+            print(f"Merged {imported} compatibility cookies into the persistent profile")
+        print(f"Running persistent profile {profile_path.name} at {url}")
+        print(f"All browser state is saved in: {profile_path}")
+        print("Press Enter here to close the browser.")
         input()
     finally:
         if driver is not None:
