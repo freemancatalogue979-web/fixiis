@@ -17759,27 +17759,13 @@
             return false;
         }
         let accessPendingBlobUrl = null;
-        function fitAccessStage() {
-            const stage = A('access-stage');
-            const frame = A('access-frame');
-            const img = A('access-image');
-            if (!stage || !frame || !img || !img.naturalWidth || !img.naturalHeight) return;
-            const availW = stage.clientWidth, availH = stage.clientHeight;
-            if (availW < 20 || availH < 20) return;
-            const isFs = document.fullscreenElement === stage;
-            const s = Math.min(availW / img.naturalWidth, availH / img.naturalHeight, isFs ? 999 : 1);
-            const w = Math.max(1, Math.round(img.naturalWidth * s));
-            const h = Math.max(1, Math.round(img.naturalHeight * s));
-            frame.style.width = w + 'px';
-            frame.style.height = h + 'px';
-        }
-
         function toggleAccessFullscreen(ev) {
             if (ev) { ev.preventDefault(); ev.stopPropagation(); }
-            const stage = A('access-stage');
+            const stage = document.getElementById('access-stage');
             if (!stage) return;
             try {
-                if (document.fullscreenElement) {
+                const fsEl = document.fullscreenElement || document.webkitFullscreenElement;
+                if (fsEl) {
                     (document.exitFullscreen || document.webkitExitFullscreen).call(document);
                 } else {
                     const req = stage.requestFullscreen || stage.webkitRequestFullscreen;
@@ -17787,21 +17773,16 @@
                 }
             } catch(e) { console.warn('access fullscreen toggle failed', e); }
         }
+        window.toggleAccessFullscreen = toggleAccessFullscreen;
 
-        (function _watchAccessStageResize(){
-            const stage = document.getElementById('access-stage');
-            if (stage && typeof ResizeObserver !== 'undefined') {
-                new ResizeObserver(() => fitAccessStage()).observe(stage);
-            }
-            window.addEventListener('resize', fitAccessStage);
-            document.addEventListener('fullscreenchange', () => {
-                const isFs = document.fullscreenElement === document.getElementById('access-stage');
-                const btn = document.getElementById('access-fs-btn');
-                if (btn) btn.textContent = isFs ? 'Restore' : 'Maximize';
-                setTimeout(fitAccessStage, 30);
-                setTimeout(fitAccessStage, 250);
-            });
-        })();
+        document.addEventListener('fullscreenchange', () => {
+            const fsEl = document.fullscreenElement || document.webkitFullscreenElement;
+            const isFs = fsEl === document.getElementById('access-stage');
+            const btn = document.getElementById('access-fs-btn');
+            if (btn) btn.textContent = isFs ? 'Restore' : 'Maximize';
+            const stageBtn = document.getElementById('access-stage-fs-btn');
+            if (stageBtn) stageBtn.title = isFs ? 'Exit fullscreen' : 'Maximize';
+        });
 
         function accessRender(data, forId) {
             const id = String(forId || accessId || '').trim();
@@ -17825,7 +17806,9 @@
                     try { URL.revokeObjectURL(prevUrl); } catch (_) {}
                 }
                 if (id !== accessId) return;
-                fitAccessStage();
+                const w = img.naturalWidth || 1280, h = img.naturalHeight || 800;
+                frame.style.width = w + 'px';
+                frame.style.height = h + 'px';
                 if (frame.style.display !== 'block') frame.style.display = 'block';
                 if (ph && ph.style.display !== 'none') ph.style.display = 'none';
             };
