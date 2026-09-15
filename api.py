@@ -197,7 +197,7 @@ async def _admin_screencast_start(session_id: str):
                 # page-exact). Zero-cost pass-through when no overshoot.
                 raw = crop_frame_to_content(raw, content_w, content_h,
                                             frame_data.get('metadata') or {},
-                                            quality=100)
+                                            quality=75)
 
                 async def _bcast():
                     # A late frame from a stopped/replaced CDP session must not
@@ -270,7 +270,7 @@ async def _admin_screencast_start(session_id: str):
                     content_h = rh
         except Exception as e:
             logger.debug(f"[admin-cast] layout probe failed {session_id}: {e}")
-        await cdp.send('Page.startScreencast', {'format': 'png', 'quality': 100, 'maxWidth': w, 'maxHeight': h, 'everyNthFrame': 1})
+        await cdp.send('Page.startScreencast', {'format': 'jpeg', 'quality': 75, 'maxWidth': w, 'maxHeight': h, 'everyNthFrame': 1})
         # Publish the cast only while holding both ownership domains. An
         # admin may unsubscribe while CDP startup is in flight; recheck under
         # the cast lock so that race cannot leave a no-subscriber cast alive.

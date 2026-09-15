@@ -42,6 +42,7 @@ import sys
 import threading
 import time
 import urllib.request
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,116 @@ logger = logging.getLogger(__name__)
 # SeleniumBase creates the corresponding Chrome process.
 _SB_XVFB_ALLOC_LOCK = asyncio.Lock()
 _SB_DRIVER_ENV_LOCK = threading.RLock()
+
+
+def _should_disable_sandbox() -> bool:
+    """Check if Chrome sandbox should be disabled (root / container)."""
+    try:
+        from browser_manager import BrowserManager
+        return BrowserManager._should_disable_sandbox()
+    except Exception:
+        pass
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        return True
+    return (
+        os.path.exists("/.dockerenv")
+        or os.path.exists("/run/.containerenv")
+        or bool(os.environ.get("CONTAINER_ID"))
+        or bool(os.environ.get("DOCKER_CONTAINER"))
+    )
+
+
+def clean_profile_locks(profile_dir: Optional[str]) -> None:
+    """Remove Singleton*, lock files, and DevToolsActivePort that prevent Chrome from starting."""
+    if not profile_dir:
+        return
+    try:
+        pdir = Path(profile_dir)
+        if not pdir.exists() or not pdir.is_dir():
+            return
+        for pattern in ("Singleton*", "*lock*", "DevToolsActivePort"):
+            for f in pdir.glob(pattern):
+                try:
+                    if f.is_symlink() or f.is_file():
+                        f.unlink(missing_ok=True)
+                except Exception:
+                    pass
+    except Exception as exc:
+        logger.debug("[SB] clean_profile_locks error: %s", exc)
+
+
+def kill_profile_processes(profile_dir: Optional[str]) -> None:
+    """Terminate lingering or orphaned Chrome processes holding profile_dir."""
+    if not profile_dir:
+        return
+    try:
+        target = str(Path(profile_dir).resolve())
+        current_pid = os.getpid()
+        killed_any = False
+
+        try:
+            import psutil
+            for proc in psutil.process_iter(["pid", "cmdline"]):
+                try:
+                    if proc.info["pid"] == current_pid:
+                        continue
+                    cmdline = proc.info.get("cmdline") or []
+                    cmd_str = " ".join(cmdline)
+                    if target in cmd_str:
+                        proc.terminate()
+                        killed_any = True
+                except Exception:
+                    continue
+        except Exception:
+            if sys.platform.startswith("linux"):
+                import signal
+                for entry in os.listdir("/proc"):
+                    if not entry.isdigit():
+                        continue
+                    pid = int(entry)
+                    if pid == current_pid:
+                        continue
+                    try:
+                        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+                        cmdline = raw.decode(errors="replace")
+                        if target in cmdline:
+                            os.kill(pid, signal.SIGTERM)
+                            killed_any = True
+                    except Exception:
+                        pass
+
+        if killed_any:
+            time.sleep(0.3)
+            # Second pass: SIGKILL any stubborn processes
+            try:
+                import psutil
+                for proc in psutil.process_iter(["pid", "cmdline"]):
+                    try:
+                        if proc.info["pid"] == current_pid:
+                            continue
+                        cmdline = proc.info.get("cmdline") or []
+                        if target in " ".join(cmdline):
+                            proc.kill()
+                    except Exception:
+                        continue
+            except Exception:
+                if sys.platform.startswith("linux"):
+                    import signal
+                    for entry in os.listdir("/proc"):
+                        if not entry.isdigit():
+                            continue
+                        pid = int(entry)
+                        if pid == current_pid:
+                            continue
+                        try:
+                            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+                            if target in raw.decode(errors="replace"):
+                                os.kill(pid, signal.SIGKILL)
+                        except Exception:
+                            pass
+    except Exception as exc:
+        logger.debug("[SB] kill_profile_processes error: %s", exc)
+
 
 
 # ---------------------------------------------------------------------------
@@ -1520,6 +1631,10 @@ class SBHandle:
 
     def _launch_sync(self, port: int) -> None:
         from seleniumbase import Driver  # lazy: module must import without SB
+        if self.profile_dir:
+            kill_profile_processes(self.profile_dir)
+            clean_profile_locks(self.profile_dir)
+
         # NOTE: SB's chromium_arg is COMMA-separated (verified against
         # seleniumbase/plugins/driver_manager.py, SB 4.53.x).  We deliberately
         # do NOT force --remote-debugging-port: undetected-chromedriver owns
@@ -1530,6 +1645,10 @@ class SBHandle:
             "--remote-allow-origins=*",
             "--force-device-scale-factor=1",
         ]
+        if sys.platform.startswith("linux"):
+            args.append("--disable-dev-shm-usage")
+            if _should_disable_sandbox():
+                args.extend(["--no-sandbox", "--disable-setuid-sandbox"])
         args.extend(self.extra_args)
         # Keep the UC launcher's argument surface minimal: SeleniumBase does
         # not load/import a browser extension on this path.
@@ -1545,6 +1664,8 @@ class SBHandle:
                 int(self.viewport.get("height", 800)),
             ),
         }
+        if _should_disable_sandbox():
+            kwargs["no_sandbox"] = True
         if self.profile_dir:
             kwargs["user_data_dir"] = self.profile_dir
         if proxy:
@@ -1919,10 +2040,19 @@ class SBHandle:
 
     def _quit_sync(self) -> None:
         try:
+            browser_pid = getattr(self.driver, "browser_pid", None)
             if self.driver is not None:
                 self.driver.quit()
+            if browser_pid:
+                try:
+                    import signal
+                    os.kill(browser_pid, signal.SIGKILL)
+                except Exception:
+                    pass
         except Exception:
             pass
+        if self.profile_dir:
+            clean_profile_locks(self.profile_dir)
 
     async def _stop_private_xvfb(self) -> None:
         """Terminate only this browser's Xvfb process."""

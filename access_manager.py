@@ -142,7 +142,11 @@ class AccessSession:
                     pass
                 self.browser = None
 
-            from sb_backend import launch_for_access
+            from sb_backend import launch_for_access, clean_profile_locks, kill_profile_processes
+
+            if self.profile_dir:
+                kill_profile_processes(self.profile_dir)
+                clean_profile_locks(self.profile_dir)
 
             # Access is intentionally SeleniumBase-only.  SBHandle creates a
             # private Xvfb on Linux and restores the parent DISPLAY immediately
@@ -293,6 +297,12 @@ class AccessSession:
                 except Exception:
                     pass
             self.browser = None
+            if self.profile_dir:
+                try:
+                    from sb_backend import clean_profile_locks
+                    clean_profile_locks(self.profile_dir)
+                except Exception:
+                    pass
             self.subscribers.clear()
             self._pressed_mouse_buttons.clear()
 
@@ -435,8 +445,8 @@ class AccessSession:
                 self._relay_frames(cast_cdp, frame_queue)
             )
             await cdp.send("Page.startScreencast", {
-                "format": "png",
-                "quality": 100,
+                "format": "jpeg",
+                "quality": 75,
                 "maxWidth": self._cast_width,
                 "maxHeight": self._cast_height,
                 "everyNthFrame": 1,

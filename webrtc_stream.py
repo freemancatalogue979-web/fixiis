@@ -43,9 +43,9 @@ class WebRTCConfig:
     # Capture method - "cdp" uses CDP screencast, "screenshot" uses Playwright screenshot
     method: str = "cdp"
 
-    # Frame format - PNG for lossless (no quality artifacts/blinking)
-    cdp_format: str = "png"  # png for lossless, no compression artifacts
-    cdp_quality: int = 100   # 100 lossless - no blinking from quality loss
+    # Frame format - JPEG for fast capture and transmission
+    cdp_format: str = "jpeg"
+    cdp_quality: int = 75   # Quality 75 optimized for speed
 
     # Target FPS
     target_fps: int = 60

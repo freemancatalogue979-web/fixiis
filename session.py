@@ -1783,8 +1783,8 @@ class NeoStreamingSession:
             # and fine UI crisp - no JPEG ringing on any domain.
             webrtc_config = WebRTCConfig(
                 method="cdp",
-                cdp_format="png",
-                cdp_quality=100,
+                cdp_format="jpeg",
+                cdp_quality=self.config.quality,
                 target_fps=self.config.target_fps if not self.is_mobile else min(20, self.config.target_fps),
                 capture_width=capture_width,
                 capture_height=capture_height,
