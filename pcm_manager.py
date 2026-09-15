@@ -1181,7 +1181,7 @@ class PCMManager:
             # to this rect in _on_frame before broadcast — stream px == page
             # CSS px, so click coordinates map 1:1.
             self._cast_content = (int(mcw), int(mch), mquality)
-            await self._cdp.send("Page.startScreencast", {"format": "jpeg", "quality": mquality, "maxWidth": w, "maxHeight": h, "everyNthFrame": 1})
+            await self._cdp.send("Page.startScreencast", {"format": "png", "maxWidth": w, "maxHeight": h, "everyNthFrame": 1})
             self._screencast_running = True
             logger.debug(f"[PCM] screencast started {w}x{h} (mode={self._mode}, q={mquality})")
         except Exception as e:

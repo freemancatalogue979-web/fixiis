@@ -3708,6 +3708,13 @@ class DOMCaptureSession:
                 "html": html_data,
                 "gen": self._gen,
             }
+            try:
+                if self.page is not None:
+                    _cur_title = await self.page.title()
+                    if _cur_title:
+                        msg["title"] = _cur_title
+            except Exception:
+                pass
             if capture_delta_active:
                 # Snapshot-preferred hosts use the same patch channel between
                 # full fidelity/recovery documents; the client keeps the

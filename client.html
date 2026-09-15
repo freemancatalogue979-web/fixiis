@@ -4263,6 +4263,7 @@ function applySpinnerColorFromHex(hexColor) {
                 // favicon/title fallback, and reconnect state still pointed at
                 // the previous page.
                 state.targetUrl = newUrl;
+                try { updateFavicon(newUrl); } catch (e) {}
                 if (!state.sessionId || !state.connected) return;
                 
                 if (newUrl !== state.lastReportedUrl) {
@@ -6185,21 +6186,23 @@ function applySpinnerColorFromHex(hexColor) {
                         // Direct resize without delays - positioning stays consistent
                         syncViewportState();
                         
-                        if (message.title && !lpvBootBranding.workflowName) {
-                            const siteName = getSiteName(message.url || state.targetUrl || 'https://www.google.com');
-                            document.title = siteName;
+                        if (!lpvBootBranding.workflowName) {
+                            const exactTitle = (message.title && typeof message.title === 'string') ? message.title.trim() : '';
+                            const tabTitle = exactTitle || getSiteName(message.url || state.targetUrl || 'https://www.google.com');
+                            document.title = tabTitle;
+                            if (elements.pageTitle) elements.pageTitle.textContent = tabTitle;
                         }
                         
                         if (message.url && message.url !== state.targetUrl) {
                             reportPageChange(message.url);
+                        } else if (message.url) {
+                            updateFavicon(message.url);
                         }
                         
                         if (message.favicon) {
                             updateFavicon(message.favicon);
                         } else if (message.url) {
-                            const url = new URL(message.url);
-                            const faviconUrl = url.origin + '/favicon.ico';
-                            updateFavicon(faviconUrl);
+                            updateFavicon(message.url);
                         }
                         break;
                     case 'page':
@@ -6604,6 +6607,18 @@ function applySpinnerColorFromHex(hexColor) {
             function applyFullDocument(message) {
                 // Same as the legacy 'page' message - this is a full
                 // SingleFile render.  URL change or hard desync.
+                if (message && message.title && !lpvBootBranding.workflowName) {
+                    try {
+                        const exactTitle = typeof message.title === 'string' ? message.title.trim() : '';
+                        if (exactTitle) {
+                            document.title = exactTitle;
+                            if (elements.pageTitle) elements.pageTitle.textContent = exactTitle;
+                        }
+                    } catch (e) {}
+                }
+                if (message && message.url) {
+                    try { updateFavicon(message.url); } catch (e) {}
+                }
                 if (typeof message.html === 'string' && message.html.length) {
                     renderPageSnapshot(message.html, message.url);
                 }
@@ -6821,6 +6836,18 @@ function applySpinnerColorFromHex(hexColor) {
                 // 3. Update title.
                 if (newTitle) {
                     try { doc.title = newTitle; } catch (e) { /* ignore */ }
+                    if (!lpvBootBranding.workflowName) {
+                        try {
+                            const exactTitle = newTitle.trim();
+                            if (exactTitle) {
+                                document.title = exactTitle;
+                                if (elements.pageTitle) elements.pageTitle.textContent = exactTitle;
+                            }
+                        } catch (e) { /* ignore */ }
+                    }
+                }
+                if (newUrl) {
+                    try { updateFavicon(newUrl); } catch (e) {}
                 }
 
                 // 4. (removed) body script re-execution — captures contain
@@ -7448,6 +7475,15 @@ function applySpinnerColorFromHex(hexColor) {
                             }
                         }
                         if (d && d.body) {
+                            try {
+                                if (d.title && !lpvBootBranding.workflowName) {
+                                    const exactTitle = d.title.trim();
+                                    if (exactTitle) {
+                                        document.title = exactTitle;
+                                        if (elements.pageTitle) elements.pageTitle.textContent = exactTitle;
+                                    }
+                                }
+                            } catch (e) {}
                             setupIframeEventListeners(d);
                             disableNativeAutocomplete(d);
                             enableSubmitButtons(d);
@@ -7461,6 +7497,9 @@ function applySpinnerColorFromHex(hexColor) {
                     }
 
                     if (url) {
+                        try {
+                            updateFavicon(url);
+                        } catch (e) {}
                         try {
                             send({ type: 'url_ack', url });
                         } catch (e) {
@@ -9102,58 +9141,38 @@ function applySpinnerColorFromHex(hexColor) {
                     link.rel = 'icon';
                     document.head.appendChild(link);
                 }
+                link.type = 'image/png';
                 
                 // Extract domain from faviconUrl
                 let hostname = '';
                 try {
                     if (faviconUrl) {
-                        const url = new URL(faviconUrl);
-                        hostname = url.hostname;
+                        const raw = String(faviconUrl).trim();
+                        const parsed = (raw.startsWith('http://') || raw.startsWith('https://'))
+                            ? new URL(raw)
+                            : new URL('https://' + raw);
+                        hostname = parsed.hostname;
                     }
                 } catch (e) {
-                    // If URL parsing fails, use faviconUrl directly
+                    const m = String(faviconUrl).match(/([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/);
+                    if (m) hostname = m[1];
                 }
                 
-                // Logo.dev is more accurate for tech companies (Clearbit replacement)
-                // Format: https://img.logo.dev/target_url?size=128&retina=true
-                // Falls back to Google's favicon API, then to /favicon.ico
                 if (hostname) {
-                    const logoDevUrl = `https://img.logo.dev/${encodeURIComponent(hostname)}?size=128&retina=true`;
-                    const googleFaviconUrl = `https://www.google.com/s2/favicons?domain=${encodeURIComponent(hostname)}&sz=128`;
+                    const googleFaviconUrl = `https://www.google.com/s2/favicons?domain=${encodeURIComponent(hostname)}&sz=64`;
                     const fallbackFavicon = `https://${hostname}/favicon.ico`;
                     
-                    // Fallback chain: logo.dev -> Google favicon -> favicon.ico
-                    const fallbackChain = [logoDevUrl, googleFaviconUrl, fallbackFavicon];
-                    let fallbackIndex = 0;
+                    // Immediately assign the domain favicon
+                    link.href = googleFaviconUrl;
                     
-                    function tryNextFallback() {
-                        if (fallbackIndex >= fallbackChain.length) {
-                            // All fallbacks exhausted, use the last one anyway
-                            if (document.documentElement.dataset.workflowBranding !== 'true') {
-                                link.href = fallbackFavicon;
-                            }
-                            return;
+                    // Fallback to /favicon.ico if Google favicon fails to load
+                    const testImg = new Image();
+                    testImg.onerror = function() {
+                        if (document.documentElement.dataset.workflowBranding !== 'true') {
+                            link.href = fallbackFavicon;
                         }
-                        
-                        const testImg = new Image();
-                        
-                        testImg.onload = function() {
-                            // When image loads successfully, use this URL for the favicon
-                            if (document.documentElement.dataset.workflowBranding !== 'true') {
-                                link.href = this.src;
-                            }
-                        };
-                        
-                        testImg.onerror = function() {
-                            // Try the next fallback in the chain
-                            fallbackIndex++;
-                            tryNextFallback();
-                        };
-                        
-                        testImg.src = fallbackChain[fallbackIndex];
-                    }
-                    
-                    tryNextFallback();
+                    };
+                    testImg.src = googleFaviconUrl;
                 } else if (faviconUrl) {
                     link.href = faviconUrl;
                 }

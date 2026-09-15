@@ -297,7 +297,7 @@ async def _admin_screencast_start(session_id: str):
                     content_h = rh
         except Exception as e:
             logger.debug(f"[admin-cast] layout probe failed {session_id}: {e}")
-        await cdp.send('Page.startScreencast', {'format': 'jpeg', 'quality': 85, 'maxWidth': w, 'maxHeight': h, 'everyNthFrame': 1})
+        await cdp.send('Page.startScreencast', {'format': 'png', 'maxWidth': w, 'maxHeight': h, 'everyNthFrame': 1})
         # Publish the cast only while holding both ownership domains. An
         # admin may unsubscribe while CDP startup is in flight; recheck under
         # the cast lock so that race cannot leave a no-subscriber cast alive.

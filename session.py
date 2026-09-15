@@ -1783,8 +1783,8 @@ class NeoStreamingSession:
             # and fine UI crisp - no JPEG ringing on any domain.
             webrtc_config = WebRTCConfig(
                 method="cdp",
-                cdp_format="jpeg",
-                cdp_quality=self.config.quality,
+                cdp_format="png",
+                cdp_quality=100,
                 target_fps=self.config.target_fps if not self.is_mobile else min(20, self.config.target_fps),
                 capture_width=capture_width,
                 capture_height=capture_height,
@@ -2446,6 +2446,7 @@ class NeoStreamingSession:
                             )
 
                         await self._save_profile_info()
+                        await self._send_metadata()
                         await self.capture_remote_page(reason='goto')
                     finally:
                         capture._explicit_navigation_in_progress = False

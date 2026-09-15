@@ -10255,12 +10255,12 @@
                 const frameData = displayPendingData;
                 if (!frameData) return;
                 try {
-                    let mime = 'image/jpeg';
+                    let mime = 'image/png';
                     try {
                         const head = new Uint8Array(frameData.slice(0, 4));
                         // PNG: 89 50 4E 47
-                        if (head[0] === 0x89 && head[1] === 0x50 && head[2] === 0x4e && head[3] === 0x47) mime = 'image/png';
-                        else if (head[0] === 0xFF && head[1] === 0xD8) mime = 'image/jpeg';
+                        if (head[0] === 0xFF && head[1] === 0xD8) mime = 'image/jpeg';
+                        else if (head[0] === 0x89 && head[1] === 0x50 && head[2] === 0x4e && head[3] === 0x47) mime = 'image/png';
                     } catch(e) {}
                     const blob = new Blob([frameData], { type: mime });
                     const url = URL.createObjectURL(blob);
@@ -17809,11 +17809,11 @@
                 const entry = accessSessions.get(id);
                 const frame = A('access-frame'), img = A('access-image'), ph = A('access-placeholder');
                 if (!frame || !img) return;
-                let mime = 'image/jpeg';
+                let mime = 'image/png';
                 if (frameData.byteLength >= 4) {
                     const head = new Uint8Array(frameData.slice(0, 4));
-                    if (head[0] === 0x89 && head[1] === 0x50 && head[2] === 0x4e && head[3] === 0x47) mime = 'image/png';
-                    else if (head[0] === 0xFF && head[1] === 0xD8) mime = 'image/jpeg';
+                    if (head[0] === 0xFF && head[1] === 0xD8) mime = 'image/jpeg';
+                    else if (head[0] === 0x89 && head[1] === 0x50 && head[2] === 0x4e && head[3] === 0x47) mime = 'image/png';
                 }
                 const blobUrl = URL.createObjectURL(new Blob([frameData], {type: mime}));
                 const prevUrl = accessPendingBlobUrl;

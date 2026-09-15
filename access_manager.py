@@ -483,8 +483,7 @@ class AccessSession:
                 self._relay_frames(cast_cdp, frame_queue)
             )
             await cdp.send("Page.startScreencast", {
-                "format": "jpeg",
-                "quality": 85,
+                "format": "png",
                 "maxWidth": self._cast_width,
                 "maxHeight": self._cast_height,
                 "everyNthFrame": 1,
