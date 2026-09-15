@@ -1788,7 +1788,7 @@ class NeoStreamingSession:
                 target_fps=self.config.target_fps if not self.is_mobile else min(20, self.config.target_fps),
                 capture_width=capture_width,
                 capture_height=capture_height,
-                max_queue_size=240,
+                max_queue_size=2,
                 debug=False,
             )
 

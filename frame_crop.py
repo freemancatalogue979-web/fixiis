@@ -86,6 +86,11 @@ def crop_frame_to_content(frame_bytes: bytes,
     if dev_w <= 0 or dev_h <= 0:
         return frame_bytes
 
+    # Fast path: when surface matches content within 2px on desktop widths (>= 500px),
+    # cropping is guaranteed unnecessary. Skip the expensive cv2 decode entirely.
+    if content_w >= 500 and abs(dev_w - content_w) <= 2 and abs(dev_h - content_h) <= 2:
+        return frame_bytes
+
     cv2 = _cv()
     if cv2 is None:
         return frame_bytes

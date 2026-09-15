@@ -185,23 +185,23 @@ async def _admin_screencast_start(session_id: str):
         w = max(640, min(int(w), 1920))
         h = max(360, min(int(h), 2600))
 
-        def _on_frame(frame_data: dict):
-            try:
-                b64 = frame_data.get('data', '')
-                sid = frame_data.get('sessionId', '')
-                if not b64 or not sid:
-                    return
-                raw = base64.b64decode(b64) if isinstance(b64, str) else b64
-                # Crop the captured surface to the page-content area
-                # (kills the right-side white strip + keeps click coords
-                # page-exact). Zero-cost pass-through when no overshoot.
-                raw = crop_frame_to_content(raw, content_w, content_h,
-                                            frame_data.get('metadata') or {},
-                                            quality=75)
+        frame_queue: asyncio.Queue = asyncio.Queue(maxsize=1)
 
-                async def _bcast():
-                    # A late frame from a stopped/replaced CDP session must not
-                    # leak into the replacement cast.
+        def _schedule_ack(sid: str):
+            async def _ack():
+                try:
+                    await cdp.send('Page.screencastFrameAck', {'sessionId': sid})
+                except Exception:
+                    pass
+            try:
+                asyncio.create_task(_ack())
+            except Exception:
+                pass
+
+        async def _relay():
+            try:
+                while True:
+                    raw = await frame_queue.get()
                     async with _admin_screencast_lock:
                         current = _admin_screencast_sessions.get(session_id)
                     if not current or current.get('cdp') is not cdp:
@@ -211,10 +211,6 @@ async def _admin_screencast_start(session_id: str):
                         if session_manager else None
                     )
                     if live_session is not session:
-                        # The runtime id may have been reused after cleanup.
-                        # Never deliver the old browser's frames to the new
-                        # browser; replace the cast only if admins remain
-                        # subscribed to that runtime id.
                         await _admin_screencast_stop(session_id, force=True)
                         async with admin_stream_manager.lock:
                             has_subscribers = bool(
@@ -223,29 +219,46 @@ async def _admin_screencast_start(session_id: str):
                         if has_subscribers:
                             asyncio.create_task(_admin_screencast_start(session_id))
                         return
-                    # A different frame task may have replaced this cast while
-                    # the live-session lookup was awaiting. Check ownership a
-                    # second time immediately before broadcasting.
-                    async with _admin_screencast_lock:
-                        current = _admin_screencast_sessions.get(session_id)
-                    if not current or current.get('cdp') is not cdp:
-                        return
                     await admin_stream_manager.broadcast_frame(session_id, raw)
-                    # A send failure can remove the last subscriber without a
-                    # corresponding unsubscribe message. Let the ownership
-                    # check in _admin_screencast_stop decide whether to tear
-                    # down (or preserve) the cast.
                     async with admin_stream_manager.lock:
                         has_subscribers = bool(
                             admin_stream_manager.subscriptions.get(session_id)
                         )
                     if not has_subscribers:
                         await _admin_screencast_stop(session_id)
-                    try:
-                        await cdp.send('Page.screencastFrameAck', {'sessionId': sid})
-                    except Exception:
-                        pass
-                asyncio.create_task(_bcast())
+                        return
+            except asyncio.CancelledError:
+                pass
+
+        relay_task = asyncio.create_task(_relay())
+
+        def _on_frame(frame_data: dict):
+            try:
+                sid = frame_data.get('sessionId', '')
+                if not sid:
+                    return
+                # Immediately ack CDP so Chrome is never throttled waiting for broadcast
+                _schedule_ack(sid)
+                b64 = frame_data.get('data', '')
+                if not b64:
+                    return
+                raw = base64.b64decode(b64) if isinstance(b64, str) else b64
+                # Crop the captured surface to the page-content area
+                # (kills the right-side white strip + keeps click coords
+                # page-exact). Zero-cost pass-through when no overshoot.
+                raw = crop_frame_to_content(raw, content_w, content_h,
+                                            frame_data.get('metadata') or {},
+                                            quality=75)
+                # Latest-wins queue: drop stale frame so only the newest reaches admins
+                try:
+                    while True:
+                        frame_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    frame_queue.put_nowait(raw)
+                except asyncio.QueueFull:
+                    pass
             except Exception as e:
                 logger.debug(f"[admin-cast] frame handler error: {e}")
 
@@ -281,7 +294,7 @@ async def _admin_screencast_start(session_id: str):
             if has_subscribers:
                 _admin_screencast_sessions[session_id] = {
                     'cdp': cdp, 'page': page, 'session': session,
-                    'subs': set(), 'w': w, 'h': h
+                    'subs': set(), 'w': w, 'h': h, 'task': relay_task,
                 }
             else:
                 orphan_cdp = cdp
@@ -315,6 +328,9 @@ async def _admin_screencast_stop(session_id: str, force: bool = False):
         ent = _admin_screencast_sessions.pop(session_id, None)
     if not ent:
         return
+    task = ent.get('task')
+    if task:
+        task.cancel()
     cdp = ent.get('cdp')
     try:
         if cdp:

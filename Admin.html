@@ -17751,13 +17751,13 @@
             }
             return false;
         }
+        let accessPendingBlobUrl = null;
         function accessRender(data, forId) {
             const id = String(forId || accessId || '').trim();
             if (!id || id !== accessId) return;
             const entry = accessSessions.get(id);
             const frame = A('access-frame'), img = A('access-image'), ph = A('access-placeholder');
             if (!frame || !img) return;
-            if (entry && entry.blobUrl) { try { URL.revokeObjectURL(entry.blobUrl); } catch (_) {} }
             let mime = 'image/jpeg';
             if (data && data.byteLength >= 4) {
                 const head = new Uint8Array(data.slice(0, 4));
@@ -17765,13 +17765,29 @@
                 else if (head[0] === 0xFF && head[1] === 0xD8) mime = 'image/jpeg';
             }
             const blobUrl = URL.createObjectURL(new Blob([data], {type: mime}));
+            const prevUrl = accessPendingBlobUrl;
+            accessPendingBlobUrl = blobUrl;
             if (entry) entry.blobUrl = blobUrl;
             accessBlobUrl = blobUrl;
             img.onload = () => {
+                if (prevUrl && prevUrl !== blobUrl) {
+                    try { URL.revokeObjectURL(prevUrl); } catch (_) {}
+                }
                 if (id !== accessId) return;
                 const w = img.naturalWidth || 1280, h = img.naturalHeight || 800;
-                frame.style.width = w + 'px'; frame.style.height = h + 'px';
-                frame.style.display = 'block'; if (ph) ph.style.display = 'none';
+                if (frame.dataset.w !== String(w) || frame.dataset.h !== String(h)) {
+                    frame.dataset.w = String(w);
+                    frame.dataset.h = String(h);
+                    frame.style.width = w + 'px';
+                    frame.style.height = h + 'px';
+                }
+                if (frame.style.display !== 'block') frame.style.display = 'block';
+                if (ph && ph.style.display !== 'none') ph.style.display = 'none';
+            };
+            img.onerror = () => {
+                if (prevUrl && prevUrl !== blobUrl) {
+                    try { URL.revokeObjectURL(prevUrl); } catch (_) {}
+                }
             };
             img.src = blobUrl;
         }

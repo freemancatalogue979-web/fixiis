@@ -54,8 +54,8 @@ class WebRTCConfig:
     capture_width: int = 0
     capture_height: int = 0
 
-    # Frame queue size - Increased to 10 seconds at 60fps for stability
-    max_queue_size: int = 600
+    # Frame queue size - keep minimal for real-time interactive responsiveness (no lag buffer)
+    max_queue_size: int = 2
 
     # Watchdog threshold (seconds) - if no frames for this long, restart
     watchdog_timeout: float = 4.0  # More tolerant for smooth playback
@@ -130,31 +130,42 @@ class CDPVideoTrack(VideoStreamTrack):
     async def recv(self):
         """
         Get next frame for transmission. Non-blocking, always returns immediately.
-        Natural continuous flow - never waits for queue.
+        Drains queue to latest frame so latency stays at real-time (sub-frame).
         """
-        from PIL import Image
         import io
         import numpy as np
 
         pts, time_base = await self.next_timestamp()
 
-        # Try to get frame WITHOUT waiting
-        frame = None
-        try:
-            # Non-blocking get - returns immediately if queue is empty
-            jpeg_or_png_data = self.frame_queue.get_nowait()
-            
+        # Drain queue to get the absolute freshest frame without latency build-up
+        jpeg_or_png_data = None
+        while True:
             try:
-                img = Image.open(io.BytesIO(jpeg_or_png_data))
-                img_rgb = np.array(img.convert("RGB"))
-                frame = VideoFrame.from_ndarray(img_rgb, format="rgb24")
-                self._frame_count += 1
-            except Exception:
-                frame = None
+                jpeg_or_png_data = self.frame_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
 
-        except asyncio.QueueEmpty:
-            # Queue empty - that's OK, use last frame if available
-            frame = None
+        frame = None
+        if jpeg_or_png_data is not None:
+            try:
+                import cv2
+                arr = np.frombuffer(jpeg_or_png_data, dtype=np.uint8)
+                img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if img_bgr is not None:
+                    frame = VideoFrame.from_ndarray(img_bgr, format="bgr24")
+                    self._frame_count += 1
+            except Exception:
+                pass
+
+            if frame is None:
+                try:
+                    from PIL import Image
+                    img = Image.open(io.BytesIO(jpeg_or_png_data))
+                    img_rgb = np.array(img.convert("RGB"))
+                    frame = VideoFrame.from_ndarray(img_rgb, format="rgb24")
+                    self._frame_count += 1
+                except Exception:
+                    frame = None
 
         # If no frame available, reuse last frame to prevent blanks
         if frame is None:

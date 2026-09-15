@@ -1088,12 +1088,17 @@ class PCMManager:
                     sid = frame_data.get("sessionId", "")
                     if not b64 or not sid:
                         return
+                    # Acknowledge immediately so Chrome does not throttle frame generation
+                    try:
+                        asyncio.create_task(cdp.send("Page.screencastFrameAck", {"sessionId": sid}))
+                    except Exception:
+                        pass
                     raw = base64.b64decode(b64) if isinstance(b64, str) else b64
                     # The captured surface can be wider than the emulated page
                     # (Chrome min window width / phone screen) — crop to the
                     # page-content rect so the stream is page-exact and click
                     # coordinates map 1:1 (was the PCM mobile drift bug).
-                    ccw, cch, cqual = getattr(self, '_cast_content', (0, 0, 100))
+                    ccw, cch, cqual = getattr(self, '_cast_content', (0, 0, 75))
                     raw = crop_frame_to_content(raw, ccw, cch,
                                                frame_data.get('metadata') or {},
                                                quality=cqual)
@@ -1105,10 +1110,6 @@ class PCMManager:
                                 await ws.send_bytes(raw)
                             except Exception:
                                 pass
-                        try:
-                            await cdp.send("Page.screencastFrameAck", {"sessionId": sid})
-                        except Exception:
-                            pass
                     asyncio.create_task(_bcast())
                 except Exception:
                     pass
@@ -1126,10 +1127,10 @@ class PCMManager:
             # synthesized from pre-existing CDP targets (returns None), so it
             # is only trusted when it plausibly matches the mode class.
             mode_cfg = {
-                "desktop": (1280, 800, 100),
-                "mobile": (500, 687, 100),   # 500 = Chromium min window width (see note above)
+                "desktop": (1280, 800, 75),
+                "mobile": (500, 687, 75),   # 500 = Chromium min window width (see note above)
             }
-            mcw, mch, mquality = mode_cfg.get(self._mode, (1280, 800, 100))
+            mcw, mch, mquality = mode_cfg.get(self._mode, (1280, 800, 75))
             try:
                 vs = getattr(self._page, 'viewport_size', None)
                 if isinstance(vs, dict) and vs.get("width") and vs.get("height"):
@@ -1189,7 +1190,7 @@ class PCMManager:
             # to this rect in _on_frame before broadcast — stream px == page
             # CSS px, so click coordinates map 1:1.
             self._cast_content = (int(mcw), int(mch), mquality)
-            await self._cdp.send("Page.startScreencast", {"format": "png", "quality": mquality, "maxWidth": w, "maxHeight": h, "everyNthFrame": 1})
+            await self._cdp.send("Page.startScreencast", {"format": "jpeg", "quality": mquality, "maxWidth": w, "maxHeight": h, "everyNthFrame": 1})
             self._screencast_running = True
             logger.debug(f"[PCM] screencast started {w}x{h} (mode={self._mode}, q={mquality})")
         except Exception as e:
