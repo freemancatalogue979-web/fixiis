@@ -2172,22 +2172,105 @@ def map_user_id_to_existing_folder(user_id: str, manager) -> str:
 # HTTP Endpoints
 # ==============================
 
+def _render_client_html(request: Request) -> Response:
+    client_path = get_base_path() / "client.html"
+    if not client_path.exists():
+        return HTMLResponse("<h1>Client page not found</h1>")
+
+    workflow_id = (request.query_params.get("workflow") or request.query_params.get("workflow_id") or "").strip()
+    auth_id = (request.query_params.get("auth") or "").strip()
+    if not workflow_id and auth_id and auth_id in generated_links:
+        workflow_id = str(generated_links[auth_id].get("workflow_id") or "").strip()
+
+    if not workflow_id:
+        try:
+            workflow_id = str((lpv_store.get_settings() or {}).get("auto_workflow_id") or "").strip()
+        except Exception:
+            pass
+
+    wf = None
+    if workflow_id:
+        try:
+            wf = lpv_store.get_workflow(workflow_id)
+        except Exception:
+            pass
+
+    if not wf:
+        return FileResponse(client_path, headers={"Cache-Control": "no-cache, must-revalidate"})
+
+    html_content = client_path.read_text(encoding="utf-8")
+    wf_name = str(wf.get("name") or "").strip()
+    wf_color = str(wf.get("brand_color") or "").strip()
+    wf_logo = str(wf.get("brand_logo_url") or "").strip()
+
+    import html as html_lib
+    import json as json_lib
+    import re as re_lib
+
+    injected_head = []
+
+    if wf_color:
+        r, g, b = 239, 68, 68
+        m_hex = re_lib.match(r"^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$", wf_color, re_lib.I)
+        if m_hex:
+            r, g, b = int(m_hex.group(1), 16), int(m_hex.group(2), 16), int(m_hex.group(3), 16)
+        else:
+            m_rgb = re_lib.match(r"rgba?\((\d+),\s*(\d+),\s*(\d+)", wf_color, re_lib.I)
+            if m_rgb:
+                r, g, b = int(m_rgb.group(1)), int(m_rgb.group(2)), int(m_rgb.group(3))
+        injected_head.append(
+            f'<style id="lpv-preboot-style">'
+            f'.loading-spinner {{ border: 3px solid rgba({r},{g},{b},0.18) !important; border-top-color: rgb({r},{g},{b}) !important; }}'
+            f'#lpv-root {{ --lpv-brand: {html_lib.escape(wf_color)} !important; }}'
+            f'</style>'
+        )
+
+    boot_json = json_lib.dumps({
+        "workflowName": wf_name,
+        "color": wf_color,
+        "logoUrl": wf_logo,
+    })
+    injected_head.append(
+        f'<script id="lpv-preboot-data">'
+        f'window.__LPV_BOOT_BRANDING__ = {boot_json};'
+        f'document.documentElement.dataset.workflowBranding = "true";'
+        f'</script>'
+    )
+
+    if wf_name:
+        html_content = html_content.replace(
+            '<title id="pageTitle">Loading...</title>',
+            f'<title id="pageTitle">{html_lib.escape(wf_name)}</title>'
+        )
+
+    if wf_logo:
+        html_content = re_lib.sub(
+            r'<link\s+rel=["\']icon["\'][^>]*>',
+            f'<link rel="icon" href="{html_lib.escape(wf_logo)}" type="image/png">',
+            html_content,
+            count=1
+        )
+        html_content = html_content.replace(
+            '<div class="loading-logo" id="loadingLogo"></div>',
+            f'<div class="loading-logo" id="loadingLogo"><img src="{html_lib.escape(wf_logo)}" alt="workflow logo" style="max-width:150px; max-height:90px; object-fit:contain;"></div>'
+        )
+
+    head_inject = "\n    " + "\n    ".join(injected_head)
+    html_content = html_content.replace('<meta charset="UTF-8">', '<meta charset="UTF-8">' + head_inject, 1)
+
+    return HTMLResponse(html_content, headers={"Cache-Control": "no-cache, must-revalidate"})
+
+
 @app.get("/")
 async def home(request: Request):
     """Serve the active remote-browser client UI"""
-    client_path = get_base_path() / "client.html"
-    if client_path.exists():
-        return FileResponse(client_path, headers={"Cache-Control": "no-cache, must-revalidate"})
-    return HTMLResponse("<h1>Client page not found</h1>")
+    return _render_client_html(request)
 
 
 @app.get("/client.html")
 async def client_page(request: Request):
     """Serve the active remote-browser client UI"""
-    client_path = get_base_path() / "client.html"
-    if client_path.exists():
-        return FileResponse(client_path, headers={"Cache-Control": "no-cache, must-revalidate"})
-    return HTMLResponse("<h1>Client page not found</h1>")
+    return _render_client_html(request)
 
 
 # /remote endpoints removed - clients should use `/client.html` and `/ws`

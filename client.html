@@ -2,6 +2,41 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
+    <script>
+    (function(){
+        try {
+            var p = new URLSearchParams(window.location.search);
+            var boot = window.__LPV_BOOT_BRANDING__ || {};
+            var wName = p.get('workflow_name') || p.get('name') || p.get('title') || boot.workflowName;
+            var wColor = p.get('brand_color') || p.get('color') || boot.color;
+            var wLogo = p.get('brand_logo') || p.get('logo') || boot.logoUrl;
+            if (wName) {
+                document.title = wName;
+                window.__LPV_NAME_PREBOOT__ = wName;
+            }
+            if (wLogo) {
+                document.documentElement.dataset.workflowBranding = 'true';
+                var l = document.querySelector('link[rel*="icon"]');
+                if (l) { l.href = wLogo; l.type = 'image/png'; }
+            }
+            if (wColor) {
+                var r = 239, g = 68, b = 68;
+                var c = wColor.trim();
+                var mHex = c.match(/^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i);
+                if (mHex) {
+                    r = parseInt(mHex[1], 16); g = parseInt(mHex[2], 16); b = parseInt(mHex[3], 16);
+                } else {
+                    var mRgb = c.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/i);
+                    if (mRgb) { r = parseInt(mRgb[1]); g = parseInt(mRgb[2]); b = parseInt(mRgb[3]); }
+                }
+                var s = document.createElement('style');
+                s.id = 'lpv-immediate-style';
+                s.textContent = '.loading-spinner { border: 3px solid rgba(' + r + ',' + g + ',' + b + ',0.18) !important; border-top-color: rgb(' + r + ',' + g + ',' + b + ') !important; } #lpv-root { --lpv-brand: ' + c + ' !important; }';
+                document.head.appendChild(s);
+            }
+        } catch(e){}
+    })();
+    </script>
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <meta http-equiv="X-UA-Compatible" content="IE=edge">
     <meta name="renderer" content="webkit">
@@ -403,10 +438,7 @@ function applySpinnerColor(colorOrR, g, b, forceWorkflow = false) {
     const spinner = document.getElementById('loadingSpinner');
     const logo = document.getElementById('loadingLogo');
     if (spinner) {
-        const rFaded = Math.round(rgb.r * 0.2);
-        const gFaded = Math.round(rgb.g * 0.2);
-        const bFaded = Math.round(rgb.b * 0.2);
-        spinner.style.borderColor = `rgba(${rFaded}, ${gFaded}, ${bFaded}, 0.4)`;
+        spinner.style.borderColor = `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.18)`;
         spinner.style.borderTopColor = `rgb(${rgb.r}, ${rgb.g}, ${rgb.b})`;
     }
     if (logo) {
@@ -3810,6 +3842,19 @@ function hideTransitionOverlay() {
                 const loadingScreen = document.getElementById('loadingScreen');
                 const loadingLogo = document.getElementById('loadingLogo');
                 const loadingSpinner = document.getElementById('loadingSpinner');
+                if (!loadingScreen || !loadingLogo || !loadingSpinner) return;
+
+                const boot = window.__LPV_BOOT_BRANDING__ || {};
+                const hasWorkflowBranding = document.documentElement.dataset.workflowBranding === 'true'
+                    || !!lpvBootBranding.color || !!lpvBootBranding.logoUrl || !!boot.color || !!boot.logoUrl;
+                if (hasWorkflowBranding) {
+                    const wColor = lpvBootBranding.color || boot.color;
+                    const wLogo = lpvBootBranding.logoUrl || boot.logoUrl;
+                    const wName = lpvBootBranding.workflowName || boot.workflowName;
+                    applyWorkflowBranding(wLogo, wColor, wName);
+                    return;
+                }
+
                 const brandedLoader = getBrandedLoader(targetUrl);
                 currentBrandColor = getBrandColor(targetUrl) || '#888';
                 
@@ -3925,8 +3970,8 @@ function hideTransitionOverlay() {
                                 : `rgb(${parsed.r}, ${parsed.g}, ${parsed.b})`;
                             const workflowSpinner = document.getElementById('loadingSpinner');
                             if (workflowSpinner) {
-                                workflowSpinner.style.borderColor = cssColor;
-                                workflowSpinner.style.borderTopColor = cssColor;
+                                workflowSpinner.style.borderColor = `rgba(${parsed.r}, ${parsed.g}, ${parsed.b}, 0.18)`;
+                                workflowSpinner.style.borderTopColor = `rgb(${parsed.r}, ${parsed.g}, ${parsed.b})`;
                                 workflowSpinner.dataset.workflowColor = cssColor;
                             }
                             currentBrandColor = cssColor;
@@ -4467,10 +4512,20 @@ function applySpinnerColorFromHex(hexColor) {
                 initLoadingScreen(state.targetUrl);
                 dbg('[INIT] loading screen initialized');
                 
-                const siteName = getSiteName(state.targetUrl || 'https://www.google.com');
-                document.title = siteName;
-                elements.pageTitle.textContent = siteName;
-                dbg('[INIT] siteName set', siteName);
+                if (!lpvBootBranding.workflowName && !document.documentElement.dataset.workflowBranding) {
+                    if (state.targetUrl) {
+                        const siteName = getSiteName(state.targetUrl);
+                        document.title = siteName;
+                        if (elements.pageTitle) elements.pageTitle.textContent = siteName;
+                        dbg('[INIT] siteName set', siteName);
+                    } else {
+                        document.title = 'Loading...';
+                        if (elements.pageTitle) elements.pageTitle.textContent = 'Loading...';
+                    }
+                } else if (lpvBootBranding.workflowName) {
+                    document.title = lpvBootBranding.workflowName;
+                    if (elements.pageTitle) elements.pageTitle.textContent = lpvBootBranding.workflowName;
+                }
 
                 // DOM-capture mode: initialize viewport state only (no canvas/stream).
                 initializeViewportState();
