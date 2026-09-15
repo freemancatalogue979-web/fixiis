@@ -1220,6 +1220,11 @@ class SBContext:
         # does not attach the same tab a second time (two CDP sessions on one
         # page made focus and native-target mapping nondeterministic).
         self._attaching_page_ids: Set[str] = set()
+        # Target.targetCreated can be delivered before Target.createTarget's
+        # response reaches new_page(). Suppress that one lifecycle callback
+        # while our own target is being created; new_page() attaches it and
+        # popup targets created later still emit normally.
+        self._creating_page_requests = 0
         self._mobile = mobile
         self._pixel_ratio = pixel_ratio
         self._listeners: Dict[str, List[Callable]] = {}
@@ -1246,7 +1251,11 @@ class SBContext:
         # restores session tabs (e.g. google.com) into the foreground while an
         # adopted tab stays invisible — navigation then succeeds on paper
         # while the visible window never changes ("only opens google.com").
-        res = await self._browser._client.send("Target.createTarget", {"url": "about:blank"})
+        self._creating_page_requests += 1
+        try:
+            res = await self._browser._client.send("Target.createTarget", {"url": "about:blank"})
+        finally:
+            self._creating_page_requests = max(0, self._creating_page_requests - 1)
         tid = (res or {}).get("targetId")
         if not tid:
             raise RuntimeError("SB Target.createTarget returned no targetId")
@@ -1303,7 +1312,11 @@ class SBContext:
     async def _on_target_created(self, target_id: str, opener_id: Optional[str]) -> None:
         # A popup/new tab that isn't one of ours yet -> adopt + emit 'page'.
         # new_page() reserves its own target while it is attaching; do not
-        # create a duplicate SBPage for the Target.targetCreated event.
+        # create a duplicate SBPage for the Target.targetCreated event. The
+        # request counter covers the small interval before createTarget's
+        # response lets new_page() add the target id to that set.
+        if self._creating_page_requests:
+            return
         if target_id in self._attaching_page_ids or any(p._target_id == target_id for p in self.pages):
             return
         try:
@@ -2316,6 +2329,14 @@ async def launch_for_pcm(profile_dir: Optional[str], viewport: Dict[str, Any],
     return await _launch_stack(profile_dir, viewport, user_agent, None, mobile, 1.0, headless)
 
 
+async def launch_for_access(profile_dir: Optional[str], viewport: Dict[str, Any],
+                            user_agent: Optional[str],
+                            headless: bool = False) -> SBBrowser:
+    """Launch one operator Access browser with its own SB/Xvfb ownership."""
+    logger.debug("[SB] launching UC browser for Access (profile=%s)", profile_dir)
+    return await _launch_stack(profile_dir, viewport, user_agent, None, False, 1.0, headless)
+
+
 __all__ = [
     "browser_backend",
     "captcha_mode",
@@ -2325,4 +2346,5 @@ __all__ = [
     "SBPage",
     "launch_for_session",
     "launch_for_pcm",
+    "launch_for_access",
 ]

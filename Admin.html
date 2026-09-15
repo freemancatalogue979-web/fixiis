@@ -7042,6 +7042,29 @@
         .pcm-meta { color: rgba(255,255,255,0.75); font-weight: 500; letter-spacing: 0.02em; text-transform: none; }
         @keyframes pcmPulse { 0% { box-shadow: 0 0 0 0 rgba(34,197,94,0.35); } 70% { box-shadow: 0 0 0 8px rgba(34,197,94,0); } 100% { box-shadow: 0 0 0 0 rgba(34,197,94,0); } }
 
+        /* PCM areas: CM stays the archive-maker; Access is a separate
+           operator-controlled browser surface with its own WS/session. */
+        .pcm-area-tabs { display:flex; gap:6px; padding:4px; width:max-content; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.09); border-radius:12px; }
+        .pcm-area-tab { border:0; border-radius:9px; padding:8px 15px; color:rgba(255,255,255,.62); background:transparent; cursor:pointer; font:600 12px Montserrat,sans-serif; letter-spacing:.03em; }
+        .pcm-area-tab.active { color:#0f172a; background:#fff; box-shadow:0 2px 10px rgba(0,0,0,.25); }
+        .pcm-area-panel { min-height:0; }
+        .access-layout { display:flex; flex-direction:column; gap:14px; height:calc(100vh - 192px); min-height:500px; }
+        .access-topbar { display:flex; align-items:center; gap:10px; flex-wrap:wrap; padding:12px 14px; border:1px solid rgba(255,255,255,.08); border-radius:14px; background:rgba(18,24,39,.9); box-shadow:0 8px 24px rgba(0,0,0,.35); }
+        .access-user-select { min-width:220px; max-width:310px; padding:10px 12px; border-radius:9px; border:1px solid rgba(255,255,255,.12); color:#e6e9f2; background:rgba(255,255,255,.06); outline:none; font:600 12px Montserrat,sans-serif; }
+        .access-urlbar { display:flex; flex:1 1 360px; min-width:240px; gap:7px; }
+        .access-url-input { flex:1; min-width:0; padding:10px 12px; color:#e6e9f2; background:rgba(255,255,255,.05); border:1px solid rgba(255,255,255,.12); border-radius:9px; outline:none; font:500 12px Montserrat,sans-serif; }
+        .access-btn { padding:10px 14px; border:1px solid rgba(255,255,255,.12); border-radius:9px; color:#fff; background:rgba(255,255,255,.08); cursor:pointer; font:700 11px Montserrat,sans-serif; letter-spacing:.04em; text-transform:uppercase; }
+        .access-btn.primary { background:linear-gradient(180deg,#4a90d9,#357ab8); border-color:transparent; }
+        .access-btn.danger { background:rgba(239,68,68,.16); color:#fecaca; }
+        .access-btn.active { background:#facc15; color:#111827; }
+        .access-status { flex:0 0 auto; color:rgba(255,255,255,.55); font:500 11px Montserrat,sans-serif; }
+        .access-stage { position:relative; flex:1; min-height:380px; display:flex; overflow:auto; border:1px solid rgba(255,255,255,.08); border-radius:14px; background:radial-gradient(1200px 600px at 20% 0%,rgba(74,144,217,.12),transparent 60%),linear-gradient(180deg,rgba(18,24,39,.95),rgba(10,14,24,.98)); box-shadow:inset 0 1px 0 rgba(255,255,255,.06),0 12px 36px rgba(0,0,0,.4); }
+        .access-frame { position:relative; margin:auto; flex:none; line-height:0; overflow:hidden; border-radius:10px; box-shadow:0 18px 50px -14px rgba(0,0,0,.65),0 0 0 1px rgba(255,255,255,.08); }
+        .access-image { display:block; width:100%; height:100%; object-fit:fill; user-select:none; -webkit-user-drag:none; image-rendering:auto; outline:none; }
+        .access-placeholder { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:9px; color:rgba(255,255,255,.65); text-align:center; padding:24px; font:500 12px Montserrat,sans-serif; }
+        .access-placeholder strong { color:#fff; font-size:15px; }
+        .access-help { color:rgba(255,255,255,.46); font:500 10px Montserrat,sans-serif; letter-spacing:.02em; }
+
         /* PCM capture modal — premium blurred overlay like KLG profile modal */
         .pcm-modal-overlay { position: fixed; inset: 0; display: none; align-items: center; justify-content: flex-start; flex-direction: column; padding-top: 80px; background: rgba(3,7,18,0.55); backdrop-filter: blur(12px) saturate(1.15); -webkit-backdrop-filter: blur(12px) saturate(1.15); z-index: 10050; opacity: 0; transition: opacity 0.22s ease; }
         .pcm-modal-overlay.open { display: flex; opacity: 1; }
@@ -8024,6 +8047,11 @@
 
             
             <div class="tab-content" id="pcm-content">
+                <div class="pcm-area-tabs" id="pcm-area-tabs">
+                    <button class="pcm-area-tab active" data-pcm-area="cm" type="button">CM · Page Creation Maker</button>
+                    <button class="pcm-area-tab" data-pcm-area="access" type="button">Access</button>
+                </div>
+                <div class="pcm-area-panel" id="pcm-cm-area">
                 <div class="pcm-layout">
                     <!-- Top half: URL bar + mode selector -->
                     <div class="pcm-topbar">
@@ -8078,6 +8106,34 @@
                                 <div class="pcm-placeholder-hint">Powered by CDP screencast — every frame is the browser's real viewport, no screenshot polling</div>
                             </div>
                         </div>
+                    </div>
+                </div>
+                </div>
+                <div class="pcm-area-panel" id="pcm-access-area" style="display:none;">
+                    <div class="access-layout">
+                        <div class="access-topbar">
+                            <select id="access-user-select" class="access-user-select" aria-label="Select profile">
+                                <option value="">Select a user profile…</option>
+                            </select>
+                            <div class="access-urlbar">
+                                <input id="access-url-input" class="access-url-input" type="text" value="https://www.google.com" placeholder="https://www.example.com" spellcheck="false" autocomplete="off">
+                                <button id="access-open-btn" class="access-btn primary" type="button">Open</button>
+                                <button id="access-go-btn" class="access-btn" type="button">Go</button>
+                            </div>
+                            <button id="access-highlight-btn" class="access-btn" type="button" title="Outline the element under the pointer">Highlight</button>
+                            <button id="access-close-btn" class="access-btn danger" type="button">Release</button>
+                            <span id="access-status" class="access-status">Choose a profile to start Access</span>
+                        </div>
+                        <div class="access-stage" id="access-stage">
+                            <div class="access-frame" id="access-frame" style="display:none;">
+                                <img id="access-image" class="access-image" tabindex="0" alt="Access live browser" draggable="false">
+                            </div>
+                            <div id="access-placeholder" class="access-placeholder">
+                                <strong>Access · operator browser</strong>
+                                <span>Select a user profile. Access releases that user's connected client before opening the persistent SeleniumBase profile.</span>
+                            </div>
+                        </div>
+                        <div class="access-help">Click the live browser to focus it. Mouse, drag-to-select, keyboard, navigation, copy/paste, and normal browser controls are forwarded to the selected profile.</div>
                     </div>
                 </div>
             </div>
@@ -13087,6 +13143,10 @@
                             <svg viewBox="0 0 24 24"><path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"/></svg>
                             View
                         </button>
+                        <button class="profile-action-btn" onclick="event.stopPropagation(); openAccessForUser('${session.user_id || session.client_id}', '${(session.last_url || '').replace(/'/g, "\\'")}')" title="Open this profile in PCM Access">
+                            <svg viewBox="0 0 24 24"><path d="M4 4h16v12H4V4zm2 2v8h12V6H6zm-4 12h20v2H2v-2z"/></svg>
+                            Access
+                        </button>
                         <button class="profile-action-btn" onclick="event.stopPropagation(); copyImpersonationLink('${session.client_id}')" title="Copy Impersonation Link">
                             <svg viewBox="0 0 24 24"><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>
                             Copy Link
@@ -14021,6 +14081,13 @@
             const session = allSessions[clientId];
             if (!session) {
                 showToast('Session not found', 'error');
+                return;
+            }
+            // Profiles' historical "Impersonate" action is now the in-panel
+            // Access handoff. It releases the public owner server-side and
+            // selects the same persistent profile in the operator browser.
+            if (typeof window.openAccessForUser === 'function') {
+                window.openAccessForUser(session.user_id || clientId, targetUrl || session.last_url || 'https://www.google.com');
                 return;
             }
 
@@ -17364,5 +17431,177 @@
     })();
     </script>
 
+    <!-- =======================================================
+         PCM Access — multi-profile SeleniumBase control surface
+         ======================================================= -->
+    <script>
+    (function(){
+        let accessWs = null;
+        let accessId = null;
+        let accessUser = null;
+        let accessBlobUrl = null;
+        let accessDragging = false;
+        let accessHighlight = false;
+        let accessHighlightTimer = 0;
+        let accessManualClose = false;
+        const A = (id) => document.getElementById(id);
+        const accessStatus = (text, error) => {
+            const el = A('access-status');
+            if (el) { el.textContent = text || ''; el.style.color = error ? '#fca5a5' : ''; }
+        };
+        const accessWsUrl = (id) => {
+            let u;
+            try { u = new URL(serverWebSocketUrl('/ws/access'), location.href); }
+            catch (_) { u = new URL((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/access'); }
+            u.searchParams.set('access_id', id);
+            const token = localStorage.getItem('admin_jwt');
+            if (token) u.searchParams.set('token', token);
+            return u.toString();
+        };
+        function accessShowArea(area) {
+            const cm = A('pcm-cm-area'), ac = A('pcm-access-area');
+            if (!cm || !ac) return;
+            const isAccess = area === 'access';
+            cm.style.display = isAccess ? 'none' : '';
+            ac.style.display = isAccess ? '' : 'none';
+            document.querySelectorAll('[data-pcm-area]').forEach(b => b.classList.toggle('active', b.dataset.pcmArea === (isAccess ? 'access' : 'cm')));
+            if (isAccess) accessLoadUsers();
+        }
+        async function accessLoadUsers(selectUser) {
+            const sel = A('access-user-select');
+            if (!sel) return;
+            try {
+                const r = await serverFetch('/api/access/users');
+                const j = await r.json();
+                if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+                const profiles = j.profiles || [];
+                sel.innerHTML = '<option value="">Select a user profile…</option>' + profiles.map(p => {
+                    const uid = String(p.user_id || '');
+                    const tag = p.access && p.access.connected ? ' · Access active' : (p.public_connected ? ' · connected' : '');
+                    return '<option value="' + uid.replace(/"/g, '&quot;') + '">' + uid.replace(/</g, '&lt;') + tag + '</option>';
+                }).join('');
+                if (selectUser) {
+                    const exact = Array.from(sel.options).find(o => o.value === selectUser);
+                    const suffix = Array.from(sel.options).find(o => o.value.endsWith('_' + selectUser));
+                    if (exact) sel.value = exact.value; else if (suffix) sel.value = suffix.value;
+                }
+            } catch (e) { accessStatus('Could not load profiles: ' + (e.message || e), true); }
+        }
+        function accessSend(payload) {
+            if (accessWs && accessWs.readyState === WebSocket.OPEN) {
+                try { accessWs.send(JSON.stringify(payload)); return true; } catch (_) {}
+            }
+            return false;
+        }
+        function accessRender(data) {
+            const frame = A('access-frame'), img = A('access-image'), ph = A('access-placeholder');
+            if (!frame || !img) return;
+            if (accessBlobUrl) { try { URL.revokeObjectURL(accessBlobUrl); } catch (_) {} }
+            const head = new Uint8Array(data.slice ? data.slice(0,4) : data);
+            const mime = head[0] === 0x89 && head[1] === 0x50 ? 'image/png' : 'image/jpeg';
+            accessBlobUrl = URL.createObjectURL(new Blob([data], {type:mime}));
+            img.onload = () => {
+                const w = img.naturalWidth || 1280, h = img.naturalHeight || 800;
+                frame.style.width = w + 'px'; frame.style.height = h + 'px';
+                frame.style.display = 'block'; if (ph) ph.style.display = 'none';
+            };
+            img.src = accessBlobUrl;
+        }
+        function accessPosition(ev) {
+            const img = A('access-image'), r = img && img.getBoundingClientRect();
+            if (!r) return {x:0,y:0};
+            const sx = (img.naturalWidth || r.width) / r.width;
+            const sy = (img.naturalHeight || r.height) / r.height;
+            return {x: Math.max(0, (ev.clientX-r.left)*sx), y: Math.max(0, (ev.clientY-r.top)*sy)};
+        }
+        function accessOpenSocket() {
+            if (!accessId) return;
+            if (accessWs) { try { accessWs.onclose = null; accessWs.close(); } catch (_) {} }
+            accessWs = new WebSocket(accessWsUrl(accessId));
+            accessWs.binaryType = 'arraybuffer';
+            accessWs.onopen = () => { accessStatus('Live Access · ' + accessUser); accessSend({type:'get_info'}); };
+            accessWs.onclose = () => { if (!accessManualClose) accessStatus('Access browser disconnected', true); };
+            accessWs.onerror = () => accessStatus('Access WebSocket error', true);
+            accessWs.onmessage = (ev) => {
+                if (ev.data instanceof ArrayBuffer) { accessRender(ev.data); return; }
+                try {
+                    const m = JSON.parse(ev.data);
+                    if (m.type === 'access_ready' || m.type === 'access_info' || m.type === 'access_navigated') {
+                        if (m.url && A('access-url-input')) A('access-url-input').value = m.url;
+                        accessStatus('Live Access · ' + (accessUser || 'profile'));
+                    } else if (m.type === 'access_replaced') {
+                        accessStatus('Access tab was replaced by another tab', true);
+                    } else if (m.type === 'clipboard_text') {
+                        if (m.available && navigator.clipboard && navigator.clipboard.writeText) {
+                            navigator.clipboard.writeText(m.text || '').then(() => accessStatus('Copied remote text to local clipboard')).catch(() => accessStatus('Remote text ready; clipboard permission denied', true));
+                        } else accessStatus('Remote page denied clipboard read', true);
+                    } else if (m.type === 'heartbeat') accessSend({type:'heartbeat'});
+                } catch (_) {}
+            };
+        }
+        async function accessOpen(userId) {
+            const sel = A('access-user-select');
+            const uid = userId || (sel && sel.value);
+            if (!uid) { accessStatus('Select a user profile first', true); return; }
+            const url = (A('access-url-input') && A('access-url-input').value.trim()) || 'https://www.google.com';
+            accessStatus('Releasing client and opening persistent profile…');
+            try {
+                const r = await serverFetch('/api/access/open', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({user_id:uid, url, access_id:accessId || undefined})});
+                const j = await r.json(); if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+                accessId = j.access_id; accessUser = j.user_id;
+                if (sel) {
+                    const opt = Array.from(sel.options).find(o => o.value === accessUser) || Array.from(sel.options).find(o => o.value.endsWith('_' + accessUser));
+                    if (opt) sel.value = opt.value;
+                }
+                accessManualClose = false; accessOpenSocket();
+            } catch (e) { accessStatus('Access launch failed: ' + (e.message || e), true); }
+        }
+        async function accessGo() {
+            if (!accessId) return accessOpen();
+            const url = (A('access-url-input') && A('access-url-input').value.trim());
+            if (!url) return;
+            accessSend({type:'navigate', url});
+            accessStatus('Navigating…');
+        }
+        async function accessClose() {
+            accessManualClose = true;
+            if (accessWs) { try { accessWs.onclose = null; accessWs.close(); } catch (_) {} accessWs = null; }
+            if (accessId) { try { await serverFetch('/api/access/close', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({access_id:accessId})}); } catch (_) {} }
+            accessId = null; accessUser = null;
+            const frame = A('access-frame'), ph = A('access-placeholder');
+            if (frame) frame.style.display = 'none'; if (ph) ph.style.display = 'flex';
+            accessStatus('Choose a profile to start Access');
+        }
+        function accessWire() {
+            document.querySelectorAll('[data-pcm-area]').forEach(btn => { if (!btn._accessWired) { btn._accessWired = true; btn.addEventListener('click', () => accessShowArea(btn.dataset.pcmArea)); } });
+            const open = A('access-open-btn'), go = A('access-go-btn'), close = A('access-close-btn'), inp = A('access-url-input'), sel = A('access-user-select');
+            if (open && !open._wired) { open._wired = true; open.addEventListener('click', () => accessOpen()); }
+            if (go && !go._wired) { go._wired = true; go.addEventListener('click', accessGo); }
+            if (close && !close._wired) { close._wired = true; close.addEventListener('click', accessClose); }
+            if (inp && !inp._wired) { inp._wired = true; inp.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); accessGo(); } }); }
+            if (sel && !sel._wired) { sel._wired = true; sel.addEventListener('change', () => { if (sel.value) accessStatus('Ready to open ' + sel.value); }); }
+            const high = A('access-highlight-btn');
+            if (high && !high._wired) { high._wired = true; high.addEventListener('click', () => { accessHighlight = !accessHighlight; high.classList.toggle('active', accessHighlight); }); }
+            const img = A('access-image');
+            if (!img || img._wired) return;
+            img._wired = true; img.addEventListener('mousedown', e => { accessDragging = true; img.focus(); const p=accessPosition(e); accessSend({type:'mousedown',x:p.x,y:p.y,button:e.button||0}); e.preventDefault(); });
+            img.addEventListener('mousemove', e => { const p=accessPosition(e); accessSend({type:'mousemove',x:p.x,y:p.y}); if (accessHighlight && Date.now()-accessHighlightTimer>100) { accessHighlightTimer=Date.now(); accessSend({type:'highlight',x:p.x,y:p.y}); } });
+            img.addEventListener('mouseup', e => { accessDragging = false; const p=accessPosition(e); accessSend({type:'mouseup',x:p.x,y:p.y,button:e.button||0}); e.preventDefault(); });
+            img.addEventListener('wheel', e => { const p=accessPosition(e); accessSend({type:'wheel',x:p.x,y:p.y,deltaX:e.deltaX,deltaY:e.deltaY}); e.preventDefault(); }, {passive:false});
+            img.addEventListener('keydown', e => {
+                const mods=[]; if(e.ctrlKey)mods.push('Control'); if(e.shiftKey)mods.push('Shift'); if(e.altKey)mods.push('Alt'); if(e.metaKey)mods.push('Meta');
+                if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') { e.preventDefault(); (navigator.clipboard ? navigator.clipboard.readText() : Promise.reject()).then(t => accessSend({type:'paste',text:t})).catch(() => accessStatus('Local clipboard permission denied', true)); return; }
+                accessSend({type:'keydown',key:e.key,modifiers:mods}); e.preventDefault();
+            });
+            img.addEventListener('keyup', e => { const mods=[]; if(e.ctrlKey)mods.push('Control'); if(e.shiftKey)mods.push('Shift'); if(e.altKey)mods.push('Alt'); if(e.metaKey)mods.push('Meta'); accessSend({type:'keyup',key:e.key,modifiers:mods}); e.preventDefault(); });
+        }
+        window.openAccessForUser = function(profileId, targetUrl) {
+            switchTab('pcm'); accessShowArea('access'); accessWire();
+            accessLoadUsers(profileId).then(() => { const input=A('access-url-input'); if (input && targetUrl) input.value=targetUrl; accessOpen(profileId); });
+        };
+        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', accessWire); else accessWire();
+        window._access = {open: accessOpen, close: accessClose, navigate: accessGo};
+    })();
+    </script>
 </body>
 </html>

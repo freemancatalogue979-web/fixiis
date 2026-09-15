@@ -554,6 +554,13 @@ class XvfbManager:
         self._lock = asyncio.Lock()
         self._startup_complete = asyncio.Event()
         self._last_start_error: Optional[str] = None
+        # Xvfb installation can be started in a warm-up thread while the first
+        # browser request arrives. Coordinate callers so the launch path waits
+        # for that one installer instead of seeing `_install_tried` and
+        # incorrectly falling through to headed Chrome without DISPLAY.
+        self._install_lock = threading.Lock()
+        self._install_done = threading.Event()
+        self._install_tried = False
         # NOTE: the Xvfb availability check is LAZY on purpose - it must not
         # create asyncio tasks here, because this constructor can run outside
         # a running event loop (sync app startup) where create_task() crashes.
@@ -573,6 +580,31 @@ class XvfbManager:
         return self.xvfb_available
 
     def try_install(self) -> bool:
+        """Run the one process-wide Xvfb installation attempt.
+
+        A BrowserManager warm-up may already be installing in a daemon thread
+        when a request needs a browser. The request must wait for that attempt
+        to finish; returning early here used to leave DISPLAY unset while the
+        Playwright call still selected a headed launch.
+        """
+        if self.ensure_checked():
+            self._install_done.set()
+            return True
+        if self._install_done.is_set():
+            return bool(self.xvfb_available)
+        with self._install_lock:
+            if self.ensure_checked():
+                self._install_done.set()
+                return True
+            if self._install_done.is_set():
+                return bool(self.xvfb_available)
+            self._install_tried = True
+            try:
+                return self._try_install_impl()
+            finally:
+                self._install_done.set()
+
+    def _try_install_impl(self) -> bool:
         """Best-effort auto-install of Xvfb on Linux (one attempt per process).
 
         Headless VPSs usually lack the Xvfb *binary*; without it every launch
@@ -583,9 +615,6 @@ class XvfbManager:
         Disabled with XVFB_AUTOINSTALL=0.  Requires root or sudo; otherwise it
         logs the exact manual command and returns False.
         """
-        if getattr(self, '_install_tried', False):
-            return bool(self.xvfb_available)
-        self._install_tried = True
         if not sys.platform.startswith('linux'):
             return False
         if str(os.environ.get('XVFB_AUTOINSTALL', '1')).strip() in ('0', 'false', 'no', 'off'):
@@ -839,6 +868,7 @@ class XvfbManager:
     async def stop_async(self):
         """Stop Xvfb process - async version"""
         async with self._lock:
+            owned_display = f":{self.display_num}" if self.display_num is not None else None
             if self.process:
                 self.process.terminate()
                 try:
@@ -850,6 +880,8 @@ class XvfbManager:
                 except Exception:
                     pass
                 self.process = None
+            if owned_display and os.environ.get("DISPLAY") == owned_display:
+                os.environ.pop("DISPLAY", None)
             self.display_num = None
             self._startup_complete.clear()
     
@@ -859,17 +891,23 @@ class XvfbManager:
             loop = asyncio.get_event_loop()
             if loop.is_running():
                 # Can't await in sync context easily, just terminate
+                owned_display = f":{self.display_num}" if self.display_num is not None else None
                 if self.process:
                     self.process.terminate()
                     self.process = None
+                if owned_display and os.environ.get("DISPLAY") == owned_display:
+                    os.environ.pop("DISPLAY", None)
                 self.display_num = None
                 self._startup_complete.clear()
             else:
                 loop.run_until_complete(self.stop_async())
         except Exception:
+            owned_display = f":{self.display_num}" if self.display_num is not None else None
             if self.process:
                 self.process.terminate()
                 self.process = None
+            if owned_display and os.environ.get("DISPLAY") == owned_display:
+                os.environ.pop("DISPLAY", None)
             self.display_num = None
     
     def get_display(self) -> Optional[str]:
@@ -2668,9 +2706,12 @@ class BrowserManager:
     Supports both Playwright and direct Chrome launch modes
     """
 
-    def __init__(self, config, gpu_manager):
+    def __init__(self, config, gpu_manager, private_display: bool = False):
         self.config = config
         self.gpu_manager = gpu_manager
+        # PCM supplies its own per-browser Xvfb and must not eagerly publish
+        # the legacy process-wide fallback display from this constructor.
+        self._private_display = bool(private_display)
         # NOTE: BrowserPool removed - not used, browsers are managed per-session via active_browsers
         self.active_browsers: Dict[str, Dict] = {}
         # Browser ownership is per runtime session.  The lock protects map
@@ -2702,10 +2743,10 @@ class BrowserManager:
             _backend_hint = os.environ.get('PCM_BROWSER_BACKEND', '').strip().lower()
         if not _backend_hint:
             _backend_hint = str(getattr(config, 'browser_backend', '') or '').strip().lower()
-        _sb_owns_display = _backend_hint in ('sb', 'seleniumbase', 'uc')
+        _sb_owns_display = (_backend_hint in ('sb', 'seleniumbase', 'uc') or self._private_display)
         # Warm package installation off-thread, but never start the shared
-        # display on the SB path. This lets SB create the Xvfb it owns at the
-        # exact browser launch boundary.
+        # display on the SB/PCM-private path. This lets the owning browser
+        # create its Xvfb at the exact launch boundary.
         if (not _sb_owns_display and sys.platform.startswith('linux')
                 and not os.environ.get('DISPLAY')
                 and not os.environ.get('WAYLAND_DISPLAY')):
@@ -2927,14 +2968,19 @@ class BrowserManager:
             return
         try:
             xvfb = self._xvfb
-            if not xvfb.ensure_checked() and not getattr(xvfb, '_install_tried', False):
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    await loop.run_in_executor(None, xvfb.try_install)
-                else:
-                    xvfb.try_install()
+            # Always await the coordinated installer.  BrowserManager starts a
+            # warm attempt in __init__, so checking `_install_tried` here is a
+            # race: the first PCM request could otherwise launch before apt
+            # has installed Xvfb and before a DISPLAY exists.
+            if not xvfb.ensure_checked():
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, xvfb.try_install)
+            if xvfb.ensure_checked() and xvfb.process is None:
+                # Start the display before Playwright/SeleniumBase is called;
+                # setting DISPLAY after launch is too late for Chromium.
+                await xvfb.start_async()
         except Exception as e:
-            logger.debug(f"[Xvfb] screen ensure failed (non-fatal): {e}")
+            logger.warning(f"[Xvfb] screen ensure failed: {e}")
 
     async def _create_browser_direct(
         self,
@@ -3246,7 +3292,8 @@ class BrowserManager:
                              max_retries: int = 3,
                              retry_delay: float = 2.0,
                              proxy_config: dict = None,
-                             locale: str = None) -> tuple:
+                             locale: str = None,
+                             launch_env: Dict[str, str] = None) -> tuple:
         """
         Create a new browser instance using real Chrome with persistent profile
         Cross-platform: Windows (visible), Linux (headless with Xvfb)
@@ -3269,6 +3316,9 @@ class BrowserManager:
                     navigator.language). When None, NO language is forced -
                     the browser reports the system default, which stays
                     consistent with the rest of the fingerprint.
+            launch_env: Optional child-only environment override. PCM uses
+                    this for its private Xvfb DISPLAY without mutating the
+                    process-wide environment used by other sessions.
         """
         # Normalize Apple mobile clients before either the Playwright or direct
         # Chrome path sees the UA.  The mobile flag is forced on for iPhone,
@@ -3408,8 +3458,19 @@ class BrowserManager:
                 #   > headless (LAST RESORT - strongest bot signal:
                 #     outerHeight == innerHeight, no window frame, no screen pos)
                 force_headless = bool(getattr(self.config, 'headless', False))
-                await self._ensure_xvfb_screen()
-                launch_mode, _launch_display = self._resolve_launch_mode(force_headless)
+                # A caller such as PCM may own a private display for exactly
+                # this browser. Do not even resolve through the process-wide
+                # fallback manager in that case: `_resolve_launch_mode()`
+                # starts the fallback before a later override could run.
+                if launch_env and launch_env.get('DISPLAY'):
+                    # An explicit private display is the PCM contract: keep
+                    # this browser headed even if the general config carries
+                    # HEADLESS=true for another launch path.
+                    launch_mode = PlatformRuntime.MODE_VISIBLE
+                    _launch_display = launch_env.get('DISPLAY')
+                else:
+                    await self._ensure_xvfb_screen()
+                    launch_mode, _launch_display = self._resolve_launch_mode(force_headless)
                 is_headless = (launch_mode == PlatformRuntime.MODE_HEADLESS)
                 # NOTE: Mobile mode does NOT force headless. Mobile sessions
                 # run headed everywhere a display or Xvfb exists.
@@ -3505,6 +3566,11 @@ class BrowserManager:
                 # consistently. Never force en-US server-side.
                 if locale:
                     launch_kwargs['locale'] = locale
+                if launch_env:
+                    # Playwright copies this environment to the browser child;
+                    # unlike mutating os.environ it cannot leak a PCM display
+                    # into another concurrently launching session.
+                    launch_kwargs['env'] = {**os.environ, **launch_env}
 
                 # Always pass mobile emulation flags for Chromium.
                 # These affect UA / touch / mobile-media-query behavior only -

@@ -20,7 +20,7 @@ import base64
 from datetime import datetime, timedelta
 from urllib.parse import quote
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Tuple, Tuple
+from typing import Dict, Any, Optional, List, Tuple
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException, Query, BackgroundTasks
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse, Response, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -600,6 +600,11 @@ async def lifespan(app: FastAPI):
             watchdog_task.cancel()
         except Exception:
             pass
+        try:
+            from access_manager import access_manager
+            await access_manager.shutdown()
+        except Exception:
+            logger.debug("[Access] shutdown cleanup failed", exc_info=True)
 
 
 # Create FastAPI app
@@ -4128,7 +4133,7 @@ async def report_client_session(request: Request):
             "event_type": event_type,
             "client_id": client_id
         })
-        
+
     except Exception as e:
         logger.error(f"Error reporting client session: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -6143,6 +6148,199 @@ async def pcm_refresh(request: Request):
     except Exception as e:
         logger.error(f"[PCM] refresh failed: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# ---------------------------------------------------------------------------
+# Access — operator-controlled SeleniumBase profile browsers
+# ---------------------------------------------------------------------------
+
+
+def _access_profile_manager():
+    """Get the lightweight durable profile manager without starting a browser."""
+    if not session_manager:
+        raise RuntimeError("Session manager not initialized")
+    bm = getattr(session_manager, "browser_manager", None)
+    if bm is not None and getattr(bm, "profile_manager", None) is not None:
+        return bm.profile_manager
+    from browser_manager import UserProfileManager
+    return UserProfileManager(session_manager.config)
+
+
+def _access_profile_path(user_id: str) -> Tuple[str, Path]:
+    """Resolve one durable profile folder without accepting path traversal."""
+    if not session_manager:
+        raise RuntimeError("Session manager not initialized")
+    raw = str(user_id or "").strip()
+    if not raw or raw in (".", "..") or Path(raw).name != raw or "/" in raw or "\\" in raw:
+        raise ValueError("invalid user_id")
+    resolved = map_user_id_to_existing_folder(raw, session_manager)
+    if not resolved or Path(resolved).name != str(resolved):
+        raise ValueError("invalid profile id")
+    profile_manager = _access_profile_manager()
+    if not profile_manager.profile_exists(resolved):
+        raise ValueError("profile not found")
+    path = profile_manager.get_user_profile_path(resolved)
+    return resolved, path
+
+
+@app.get("/api/access/users")
+async def access_users(request: Request):
+    """Return selectable durable profiles plus public/access ownership state."""
+    if not await verify_admin_token(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    try:
+        from access_manager import access_manager
+        profile_manager = _access_profile_manager()
+        profiles = profile_manager.get_all_profiles_info()
+        active = {}
+        if session_manager:
+            for item in await session_manager.get_all_sessions():
+                uid = item.get("user_id") or item.get("profile_id")
+                if uid:
+                    active[str(uid)] = {
+                        "connected": True,
+                        "url": item.get("current_url") or item.get("url") or "",
+                    }
+        access_state = await access_manager.status()
+        by_user = {str(item.get("user_id")): item for item in access_state.get("sessions", [])}
+        for profile in profiles:
+            uid = str(profile.get("user_id") or "")
+            profile["public_connected"] = uid in active
+            profile["public_url"] = (active.get(uid) or {}).get("url", "")
+            profile["access"] = by_user.get(uid)
+        return JSONResponse({"profiles": profiles, "count": len(profiles)})
+    except Exception as exc:
+        logger.exception("[Access] list profiles failed")
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.post("/api/access/open")
+async def access_open(request: Request):
+    if not await verify_admin_token(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    try:
+        user_id, profile_path = _access_profile_path(body.get("user_id"))
+        url = str(body.get("url") or "https://www.google.com").strip()
+        access_id = str(body.get("access_id") or "").strip() or None
+        from access_manager import access_manager
+        result = await access_manager.open(user_id, str(profile_path), url, access_id=access_id)
+        if not result.get("ok"):
+            return JSONResponse(result, status_code=500)
+        return JSONResponse(result)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except Exception as exc:
+        logger.exception("[Access] open failed")
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.post("/api/access/navigate")
+async def access_navigate(request: Request):
+    if not await verify_admin_token(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    access_id = str(body.get("access_id") or "").strip()
+    url = str(body.get("url") or "").strip()
+    from access_manager import access_manager
+    session = await access_manager.get(access_id)
+    if session is None:
+        return JSONResponse({"error": "Access session not found"}, status_code=404)
+    try:
+        ok = await session.navigate(url)
+        return JSONResponse({"ok": ok, "access_id": access_id, "url": session.current_url})
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.post("/api/access/close")
+async def access_close(request: Request):
+    if not await verify_admin_token(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    from access_manager import access_manager
+    ok = await access_manager.close(str(body.get("access_id") or "").strip())
+    return JSONResponse({"ok": ok})
+
+
+@app.get("/api/access/status")
+async def access_status(request: Request):
+    if not await verify_admin_token(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    from access_manager import access_manager
+    return JSONResponse(await access_manager.status(str(request.query_params.get("access_id") or "").strip() or None))
+
+
+@app.websocket("/ws/access")
+async def access_websocket_endpoint(websocket: WebSocket):
+    """Multiplex one live Access browser per access_id over its own WS."""
+    token = websocket.query_params.get("token")
+    payload = verify_jwt_token(token or "")
+    if not payload or payload.get("sub") != ADMIN_USERNAME:
+        await websocket.close(code=4401, reason="Unauthorized")
+        return
+    await websocket.accept()
+    from access_manager import access_manager
+    access_id = str(websocket.query_params.get("access_id") or "").strip()
+    session = await access_manager.get(access_id) if access_id else None
+    if session is None:
+        try:
+            await websocket.send_json({"type": "access_error", "error": "Access session not found"})
+        except Exception:
+            pass
+        await websocket.close(code=4404, reason="Access session not found")
+        return
+    try:
+        await session.subscribe(websocket)
+        await websocket.send_json({
+            "type": "access_ready",
+            "access_id": session.access_id,
+            "user_id": session.user_id,
+            "url": session.current_url,
+            "width": session._cast_width,
+            "height": session._cast_height,
+        })
+        while True:
+            msg = await websocket.receive()
+            if msg.get("type") == "websocket.disconnect":
+                break
+            if "bytes" not in msg and "text" in msg:
+                try:
+                    data = json.loads(msg["text"])
+                except Exception:
+                    continue
+                mtype = str(data.get("type") or "")
+                if mtype == "heartbeat":
+                    await websocket.send_json({"type": "heartbeat_ack", "ts": time.time()})
+                elif mtype in ("navigate", "open"):
+                    url = str(data.get("url") or "").strip()
+                    if url:
+                        await session.navigate(url)
+                        await websocket.send_json({"type": "access_navigated", "url": session.current_url})
+                elif mtype == "get_info":
+                    await websocket.send_json({"type": "access_info", "url": session.current_url})
+                elif mtype == "input":
+                    await session.handle_input(data.get("payload") or data, websocket)
+                elif mtype in ("click", "mousemove", "mousedown", "mouseup", "wheel", "keydown", "keyup", "keypress", "press", "type", "paste", "copy", "clipboard_copy", "clipboard_paste", "highlight"):
+                    await session.handle_input(data, websocket)
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        logger.debug("[Access WS] closed: %s", exc)
+    finally:
+        try:
+            await session.unsubscribe(websocket)
+        except Exception:
+            pass
 
 
 @app.get("/api/pcm/status")

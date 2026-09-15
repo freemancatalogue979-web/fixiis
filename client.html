@@ -4774,13 +4774,27 @@ function applySpinnerColorFromHex(hexColor) {
                     event.code === 4001
                     || String(event.reason || '').includes('replaced_by_new_session')
                 );
-                if (replacementClose) {
-                    // This page was intentionally superseded. Do not run the
-                    // normal reconnect loop or it will evict the new session.
+                const accessReleaseClose = !!event && (
+                    event.code === 4003
+                    || String(event.reason || '').includes('access_takeover')
+                );
+                if (replacementClose || accessReleaseClose) {
+                    // Both an intentional replacement and an Access takeover
+                    // are terminal for this page. In particular, an old tab
+                    // must not reconnect and steal the profile back. A full
+                    // browser refresh deliberately creates a new page state
+                    // and is the only way to reconnect.
                     state.reconnectDisabled = true;
                     state.reconnectPending = false;
                     state.connected = false;
                     state.isSessionActive = false;
+                    if (state.reconnectTimer) { clearTimeout(state.reconnectTimer); state.reconnectTimer = null; }
+                    try {
+                        const title = accessReleaseClose ? 'Disconnected by Access — refresh this page to reconnect' : 'Session replaced — refresh this page to reconnect';
+                        if (elements.loadingScreen) elements.loadingScreen.style.display = 'flex';
+                        if (elements.streamContainer) elements.streamContainer.classList.remove('visible');
+                        if (elements.loadingLogo) elements.loadingLogo.textContent = title;
+                    } catch (_) {}
                     cleanup();
                     return;
                 }
@@ -6073,7 +6087,21 @@ function applySpinnerColorFromHex(hexColor) {
                         }
                         break;
                     case 'session_released':
+                        // Definitive server-side Access takeover. Do not wait
+                        // for the socket close event to decide whether to
+                        // reconnect; the old page is terminal immediately.
+                        state.reconnectDisabled = true;
+                        state.reconnectPending = false;
+                        state.connected = false;
                         state.isSessionActive = false;
+                        if (state.reconnectTimer) { clearTimeout(state.reconnectTimer); state.reconnectTimer = null; }
+                        try {
+                            if (elements.loadingScreen) elements.loadingScreen.style.display = 'flex';
+                            if (elements.streamContainer) elements.streamContainer.classList.remove('visible');
+                            if (elements.loadingLogo) elements.loadingLogo.textContent = 'Disconnected by Access — refresh this page to reconnect';
+                        } catch (_) {}
+                        try { if (state.ws) { state.ws.onclose = null; state.ws.close(4003, 'access_takeover'); } } catch (_) {}
+                        cleanup();
                         break;
                     case 'session_resumed':
                         state.isSessionActive = true;

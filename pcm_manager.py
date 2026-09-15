@@ -24,6 +24,8 @@ import json
 import logging
 import time
 import os
+import sys
+import shutil
 from pathlib import Path
 from typing import Dict, Any, Optional, Set, List
 from frame_crop import crop_frame_to_content
@@ -55,6 +57,116 @@ def _is_page_alive(page: Any) -> bool:
         return True
     except Exception:
         return False
+
+
+class _PCMPrivateXvfb:
+    """One private headed display owned by the PCM Playwright browser.
+
+    BrowserManager's normal session runtime has a process-wide fallback for
+    legacy callers. PCM is an operator-facing browser, however, and must not
+    accidentally share that display with another Access/session browser. The
+    display is therefore allocated and stopped with this PCM browser.
+    """
+
+    def __init__(self) -> None:
+        self.process = None
+        self.display: Optional[str] = None
+        self._stderr_task = None
+
+    async def start(self) -> Optional[str]:
+        if not sys.platform.startswith("linux") or os.environ.get("WAYLAND_DISPLAY"):
+            return None
+        if self.process is not None and self.process.returncode is None:
+            return self.display
+        inherited_display = os.environ.get("DISPLAY")
+        if inherited_display:
+            # A public BrowserManager may have published its process-wide
+            # fallback Xvfb display. PCM must not reuse it; a real/native
+            # DISPLAY is safe to retain and is intentionally not replaced.
+            try:
+                from browser_manager import get_xvfb_manager
+                shared = get_xvfb_manager()
+                owns_inherited = (
+                    shared.process is not None
+                    and shared.get_display() == inherited_display
+                    and getattr(shared.process, "returncode", None) is None
+                )
+            except Exception:
+                owns_inherited = False
+            if not owns_inherited:
+                return None
+
+        xvfb_bin = shutil.which("Xvfb")
+        if not xvfb_bin:
+            try:
+                from browser_manager import get_xvfb_manager
+                installer = get_xvfb_manager()
+                if not installer.ensure_checked():
+                    await asyncio.to_thread(installer.try_install)
+            except Exception as exc:
+                logger.warning("[PCM] Xvfb install attempt failed: %s", exc)
+            xvfb_bin = shutil.which("Xvfb")
+        if not xvfb_bin:
+            raise RuntimeError("PCM requires Xvfb on a display-less Linux host; install xvfb")
+
+        # SB uses :99-:199. Keep PCM in its own range and verify the child
+        # remains alive before publishing the display to Playwright.
+        for number in range(200, 300):
+            if os.path.exists(f"/tmp/.X{number}-lock") or os.path.exists(f"/tmp/.X11-unix/X{number}"):
+                continue
+            proc = None
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    xvfb_bin, f":{number}", "-screen", "0", "1920x1080x24", "-ac",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                await asyncio.sleep(0.5)
+                if proc.returncode is not None:
+                    if proc.stderr is not None:
+                        try:
+                            await asyncio.wait_for(proc.stderr.read(), timeout=1.0)
+                        except Exception:
+                            pass
+                    continue
+                self.process = proc
+                self.display = f":{number}"
+                if proc.stderr is not None:
+                    self._stderr_task = asyncio.create_task(proc.stderr.read())
+                logger.info("[PCM] created private headed Xvfb display %s", self.display)
+                return self.display
+            except Exception:
+                if proc is not None and proc.returncode is None:
+                    try:
+                        proc.terminate()
+                        await proc.wait()
+                    except Exception:
+                        pass
+        raise RuntimeError("PCM could not allocate a private Xvfb display in :200-:299")
+
+    async def stop(self) -> None:
+        proc = self.process
+        stderr_task = self._stderr_task
+        self.process = None
+        self.display = None
+        self._stderr_task = None
+        if proc is not None:
+            try:
+                if proc.returncode is None:
+                    proc.terminate()
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+            except Exception:
+                try:
+                    if proc.returncode is None:
+                        proc.kill()
+                    await proc.wait()
+                except Exception:
+                    pass
+        if stderr_task is not None:
+            try:
+                await asyncio.wait_for(stderr_task, timeout=0.5)
+            except Exception:
+                stderr_task.cancel()
 
 
 class PCMManager:
@@ -93,6 +205,9 @@ class PCMManager:
         # SeleniumBase UC backend handle (BROWSER_BACKEND=sb); the driver
         # thread must be stopped on close in addition to the CDP objects.
         self._sb_handle = None
+        # Playwright PCM gets its own Xvfb, separate from session/Access
+        # displays. SeleniumBase PCM owns its display in sb_backend instead.
+        self._private_xvfb = _PCMPrivateXvfb()
 
     async def _get_browser_manager(self):
         if self._browser_manager is not None:
@@ -114,7 +229,7 @@ class PCMManager:
                 from gpu_manager import GPUManager
                 cfg = UltraConfig()
                 gpu = GPUManager(cfg)
-            self._browser_manager = BrowserManager(cfg, gpu)
+            self._browser_manager = BrowserManager(cfg, gpu, private_display=True)
             return self._browser_manager
         except Exception as e:
             logger.warning(f"[PCM] BrowserManager init failed: {e}")
@@ -422,7 +537,7 @@ class PCMManager:
                     # PCM default = Playwright: the SingleFile extension
                     # loads reliably there; SB UC is opt-in via
                     # PCM_BROWSER_BACKEND=sb (user decision, Sept 2026).
-                    _pcm_be = _os.environ.get("PCM_BROWSER_BACKEND", "pw").strip().lower()
+                    _pcm_be = os.environ.get("PCM_BROWSER_BACKEND", "pw").strip().lower()
                     _sb_on = (_sb_be() == "sb") and _pcm_be in ("sb", "seleniumbase", "uc")
                 except Exception:
                     _sb_on = False
@@ -452,6 +567,13 @@ class PCMManager:
                         self._sb_handle = None
                         return None
                 if not _launched_sb:
+                    # Playwright must be headed even when the server has no
+                    # native display. Allocate a private Xvfb now and pass its
+                    # environment directly to the child browser. Do not set
+                    # process-global DISPLAY: concurrent Access/session
+                    # launches must never inherit PCM's screen.
+                    _pcm_display = await self._private_xvfb.start()
+                    _pcm_env = {"DISPLAY": _pcm_display} if _pcm_display else None
                     self._browser, self._context = await bm.create_browser(
                         self._session_id,
                         viewport,
@@ -461,6 +583,7 @@ class PCMManager:
                         ua,
                         is_mobile,
                         target,
+                        launch_env=_pcm_env,
                     )
                 if not self._browser or not self._context:
                     logger.error("[PCM] browser creation failed")
@@ -495,6 +618,11 @@ class PCMManager:
                 return self._page
             except Exception as e:
                 logger.error(f"[PCM] ensure_browser error: {e}")
+                if self._browser is None:
+                    try:
+                        await self._private_xvfb.stop()
+                    except Exception:
+                        pass
                 return None
             finally:
                 # The mode switch that led here is complete (browser + page
@@ -563,6 +691,10 @@ class PCMManager:
                     self._browser_manager.gpu_manager.unregister_session(self._session_id)
                 except Exception:
                     pass
+        except Exception:
+            pass
+        try:
+            await self._private_xvfb.stop()
         except Exception:
             pass
 
