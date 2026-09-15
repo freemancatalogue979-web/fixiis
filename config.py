@@ -27,7 +27,7 @@ class UltraConfig:
     # Performance
     target_fps: int = 60  # 60 FPS for maximum performance
     frame_interval: float = 0.01667  # 60 FPS (1/60)
-    quality: int = 100  # High quality
+    quality: int = 85  # Optimized high quality without buffer bloat
     bitrate: int = 10000  # 50 Mbps - maximum quality
     keyframe_interval: int = 30
 

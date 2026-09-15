@@ -1184,7 +1184,7 @@ class SBPage:
     async def set_viewport_size(self, size: Dict[str, Any]) -> None:
         await self._session.send("Emulation.setDeviceMetricsOverride", {
             "width": int(size.get("width", 1280)),
-            "height": int(size.get("height", 800)),
+            "height": int(size.get("height", 720)),
             "deviceScaleFactor": float(size.get("deviceScaleFactor", self._ctx._pixel_ratio or 1)),
             "mobile": bool(self._mobile),
         })
@@ -1604,7 +1604,7 @@ class SBHandle:
                  headless: bool = False,
                  extra_args: Optional[List[str]] = None) -> None:
         self.profile_dir = profile_dir
-        self.viewport = viewport or {"width": 1280, "height": 800}
+        self.viewport = viewport or {"width": 1280, "height": 720}
         self.user_agent = user_agent
         self.proxy_url = proxy_url
         self.mobile = mobile
@@ -1661,7 +1661,7 @@ class SBHandle:
             "chromium_arg": ",".join(args),
             "window_size": "%d,%d" % (
                 int(self.viewport.get("width", 1280)),
-                int(self.viewport.get("height", 800)),
+                int(self.viewport.get("height", 720)),
             ),
         }
         if _should_disable_sandbox():

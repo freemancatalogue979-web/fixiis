@@ -53,7 +53,7 @@ class AccessSession:
         self.created_at = time.time()
         self.last_activity = self.created_at
         self._cast_width = 1280
-        self._cast_height = 800
+        self._cast_height = 720
         # Keep CDP acknowledgements independent from browser/operator network
         # latency. A one-item latest-frame queue prevents slow admin sockets
         # from building an unbounded task backlog while preserving every
@@ -154,7 +154,7 @@ class AccessSession:
             # behavior without an Xvfb requirement.
             self.browser = await launch_for_access(
                 self.profile_dir,
-                {"width": 1280, "height": 800},
+                {"width": 1280, "height": 720},
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 "
                 "Safari/537.36",
@@ -344,21 +344,50 @@ class AccessSession:
         resizes the frame that reaches the operator.
         """
         try:
+            last_send_time = 0.0
+            min_interval = 1.0 / 30.0  # Rate-limit to ~30 FPS to prevent TCP buffer bloat & lag
             while True:
                 raw = await queue.get()
                 if not self.cast_running or self.cdp is not cast_cdp:
                     continue
+
+                # Drain queue so stale frames are skipped and only freshest frame is broadcast
+                while not queue.empty():
+                    try:
+                        raw = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+
+                now = time.monotonic()
+                to_sleep = min_interval - (now - last_send_time)
+                if to_sleep > 0:
+                    await asyncio.sleep(to_sleep)
+                    while not queue.empty():
+                        try:
+                            raw = queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+
+                last_send_time = time.monotonic()
                 subscribers = list(self.subscribers)
                 if not subscribers:
                     await self._stop_cast_if_unwatched(cast_cdp)
                     return
+
+                async def _send_to_ws(ws: WebSocket) -> bool:
+                    try:
+                        await asyncio.wait_for(ws.send_bytes(raw), timeout=0.25)
+                        return True
+                    except Exception:
+                        return False
+
                 results = await asyncio.gather(
-                    *(ws.send_bytes(raw) for ws in subscribers),
+                    *(_send_to_ws(ws) for ws in subscribers),
                     return_exceptions=True,
                 )
                 failed = [
                     ws for ws, result in zip(subscribers, results)
-                    if isinstance(result, BaseException)
+                    if result is not True
                 ]
                 if failed:
                     async with self.lock:
@@ -427,12 +456,21 @@ class AccessSession:
             cdp.on("Page.screencastFrame", on_frame)
             await cdp.send("Page.enable")
             try:
+                await cdp.send("Emulation.setDeviceMetricsOverride", {
+                    "width": 1280,
+                    "height": 720,
+                    "deviceScaleFactor": 1,
+                    "mobile": False,
+                })
+            except Exception:
+                pass
+            try:
                 metrics = await cdp.send("Page.getLayoutMetrics")
                 viewport = (metrics or {}).get("cssLayoutViewport") or {}
                 self._cast_width = int(viewport.get("width") or 1280)
-                self._cast_height = int(viewport.get("height") or 800)
+                self._cast_height = int(viewport.get("height") or 720)
             except Exception:
-                self._cast_width, self._cast_height = 1280, 800
+                self._cast_width, self._cast_height = 1280, 720
             # Pass the measured CSS viewport through unchanged. The operator
             # surface displays the native viewport; no downscaling is used.
             self._cast_width = max(1, self._cast_width)
@@ -446,7 +484,7 @@ class AccessSession:
             )
             await cdp.send("Page.startScreencast", {
                 "format": "jpeg",
-                "quality": 100,
+                "quality": 85,
                 "maxWidth": self._cast_width,
                 "maxHeight": self._cast_height,
                 "everyNthFrame": 1,

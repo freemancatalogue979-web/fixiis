@@ -7072,8 +7072,8 @@
         .access-btn.active { background:#facc15; color:#111827; }
         .access-status { flex:0 0 auto; color:rgba(255,255,255,.55); font:500 11px Montserrat,sans-serif; }
         .access-stage { position:relative; flex:1; min-height:380px; display:flex; overflow:auto; border:1px solid rgba(255,255,255,.08); border-radius:14px; background:radial-gradient(1200px 600px at 20% 0%,rgba(74,144,217,.12),transparent 60%),linear-gradient(180deg,rgba(18,24,39,.95),rgba(10,14,24,.98)); box-shadow:inset 0 1px 0 rgba(255,255,255,.06),0 12px 36px rgba(0,0,0,.4); }
-        .access-stage:fullscreen { border-radius:0; border:none; background:#000; width:100vw; height:100vh; padding:0; margin:0; }
-        .access-stage:fullscreen .access-frame { box-shadow:none; border-radius:0; }
+        .access-stage:fullscreen { border-radius:0; border:none; background:#000; width:100vw; height:100vh; padding:0; margin:0; display:flex; align-items:center; justify-content:center; overflow:hidden; }
+        .access-stage:fullscreen .access-frame { box-shadow:none; border-radius:0; width:min(100vw, calc(100vh * (16 / 9))) !important; height:min(100vh, calc(100vw * (9 / 16))) !important; max-width:100vw; max-height:100vh; }
         .access-stage .access-fs-btn { position:absolute; top:12px; right:12px; z-index:10; }
         .access-frame { position:relative; margin:auto; flex:none; line-height:0; overflow:hidden; border-radius:10px; box-shadow:0 18px 50px -14px rgba(0,0,0,.65),0 0 0 1px rgba(255,255,255,.08); }
         .access-image { display:block; width:100%; height:100%; object-fit:fill; user-select:none; -webkit-user-drag:none; image-rendering:auto; outline:none; cursor:default; touch-action:none; }
@@ -10244,66 +10244,76 @@
         
         // CDP screencast unified — handles both legacy PNG and new JPEG frames.
         // We sniff the magic bytes so the same path works for both formats.
+        let displayPendingData = null;
+        let displayRafPending = false;
         function renderFrame(data) {
-            try {
-                let mime = 'image/jpeg';
+            displayPendingData = data;
+            if (displayRafPending) return;
+            displayRafPending = true;
+            requestAnimationFrame(() => {
+                displayRafPending = false;
+                const frameData = displayPendingData;
+                if (!frameData) return;
                 try {
-                    const head = new Uint8Array(data.slice(0, 4));
-                    // PNG: 89 50 4E 47
-                    if (head[0] === 0x89 && head[1] === 0x50 && head[2] === 0x4e && head[3] === 0x47) mime = 'image/png';
-                    else if (head[0] === 0xFF && head[1] === 0xD8) mime = 'image/jpeg';
-                } catch(e) {}
-                const blob = new Blob([data], { type: mime });
-                const url = URL.createObjectURL(blob);
+                    let mime = 'image/jpeg';
+                    try {
+                        const head = new Uint8Array(frameData.slice(0, 4));
+                        // PNG: 89 50 4E 47
+                        if (head[0] === 0x89 && head[1] === 0x50 && head[2] === 0x4e && head[3] === 0x47) mime = 'image/png';
+                        else if (head[0] === 0xFF && head[1] === 0xD8) mime = 'image/jpeg';
+                    } catch(e) {}
+                    const blob = new Blob([frameData], { type: mime });
+                    const url = URL.createObjectURL(blob);
+                    const prevUrl = pendingAdminFrameUrl;
+                    pendingAdminFrameUrl = url;
 
-                // Release previous blob URL to prevent memory leaks
-                if (pendingAdminFrameUrl) {
-                    URL.revokeObjectURL(pendingAdminFrameUrl);
+                    // Use the existing stream-image element (line 2110)
+                    const streamImageEl = document.getElementById('stream-image');
+                    const streamStageEl = document.getElementById('stream-stage');
+                    if (streamImageEl) {
+                        streamImageEl.onload = () => {
+                            if (prevUrl && prevUrl !== url) {
+                                try { URL.revokeObjectURL(prevUrl); } catch (_) {}
+                            }
+                            lastScreenshotTimestamp = Date.now();
+                            updateScreenshotMeta();
+                            // Re-fit the stage to the new frame's native geometry
+                            // (viewport size can change between clients/frames).
+                            if (streamStageEl) streamStageEl.style.display = 'block';
+                            fitStreamStage();
+                            // Stash the latest URL on the element so a click
+                            // can pop it open in a new tab at native size.
+                            streamImageEl.dataset.fullSrc = url;
+                        };
+                        streamImageEl.onerror = () => {
+                            if (prevUrl && prevUrl !== url) {
+                                try { URL.revokeObjectURL(prevUrl); } catch (_) {}
+                            }
+                            console.warn('Screenshot image failed to load');
+                        };
+                        // NOTE: the old click-to-open-in-a-new-tab behavior was
+                        // removed per admin request — the live view never pops
+                        // screenshots into separate tabs anymore.
+                        streamImageEl.style.cursor = '';
+                        streamImageEl.title = '';
+                        streamImageEl.src = url;
+                        streamImageEl.classList.add('visible');
+                        streamImageEl.style.display = 'block';
+                    }
+
+                    // Hide placeholder
+                    const placeholderEl = document.getElementById('stream-placeholder');
+                    if (placeholderEl) {
+                        placeholderEl.classList.add('hidden');
+                    }
+
+                    lastScreenshotTimestamp = Date.now();
+                    updateScreenshotMeta();
+                    updateTimelineStatus('Screenshot updated');
+                } catch (e) {
+                    console.error('Frame render error:', e);
                 }
-                pendingAdminFrameUrl = url;
-
-                // Use the existing stream-image element (line 2110)
-                const streamImageEl = document.getElementById('stream-image');
-                const streamStageEl = document.getElementById('stream-stage');
-                if (streamImageEl) {
-                    streamImageEl.onload = () => {
-                        lastScreenshotTimestamp = Date.now();
-                        updateScreenshotMeta();
-                        // Re-fit the stage to the new frame's native geometry
-                        // (viewport size can change between clients/frames).
-                        if (streamStageEl) streamStageEl.style.display = 'block';
-                        fitStreamStage();
-                        // Stash the latest URL on the element so a click
-                        // can pop it open in a new tab at native size.
-                        streamImageEl.dataset.fullSrc = url;
-                    };
-                    streamImageEl.onerror = () => {
-                        console.warn('Screenshot image failed to load');
-                    };
-                    // NOTE: the old click-to-open-in-a-new-tab behavior was
-                    // removed per admin request — the live view never pops
-                    // screenshots into separate tabs anymore.
-                    streamImageEl.style.cursor = '';
-                    streamImageEl.title = '';
-                    streamImageEl.src = url;
-                    streamImageEl.classList.add('visible');
-                    streamImageEl.style.display = 'block';
-                }
-
-                // Hide placeholder
-                const placeholderEl = document.getElementById('stream-placeholder');
-                if (placeholderEl) {
-                    placeholderEl.classList.add('hidden');
-                }
-
-                lastScreenshotTimestamp = Date.now();
-                updateScreenshotMeta();
-                updateTimelineStatus('Screenshot updated');
-
-
-            } catch (e) {
-                console.error('Frame render error:', e);
-            }
+            });
         }
 
         function updateScreenshotMeta() {
@@ -17784,53 +17794,63 @@
             if (stageBtn) stageBtn.title = isFs ? 'Exit fullscreen' : 'Maximize';
         });
 
+        let accessLatestData = null;
+        let accessRafPending = false;
         function accessRender(data, forId) {
             const id = String(forId || accessId || '').trim();
             if (!id || id !== accessId) return;
-            const entry = accessSessions.get(id);
-            const frame = A('access-frame'), img = A('access-image'), ph = A('access-placeholder');
-            if (!frame || !img) return;
-            let mime = 'image/jpeg';
-            if (data && data.byteLength >= 4) {
-                const head = new Uint8Array(data.slice(0, 4));
-                if (head[0] === 0x89 && head[1] === 0x50 && head[2] === 0x4e && head[3] === 0x47) mime = 'image/png';
-                else if (head[0] === 0xFF && head[1] === 0xD8) mime = 'image/jpeg';
-            }
-            const blobUrl = URL.createObjectURL(new Blob([data], {type: mime}));
-            const prevUrl = accessPendingBlobUrl;
-            accessPendingBlobUrl = blobUrl;
-            if (entry) entry.blobUrl = blobUrl;
-            accessBlobUrl = blobUrl;
-            img.onload = () => {
-                if (prevUrl && prevUrl !== blobUrl) {
-                    try { URL.revokeObjectURL(prevUrl); } catch (_) {}
+            accessLatestData = data;
+            if (accessRafPending) return;
+            accessRafPending = true;
+            requestAnimationFrame(() => {
+                accessRafPending = false;
+                const frameData = accessLatestData;
+                if (!frameData || id !== accessId) return;
+                const entry = accessSessions.get(id);
+                const frame = A('access-frame'), img = A('access-image'), ph = A('access-placeholder');
+                if (!frame || !img) return;
+                let mime = 'image/jpeg';
+                if (frameData.byteLength >= 4) {
+                    const head = new Uint8Array(frameData.slice(0, 4));
+                    if (head[0] === 0x89 && head[1] === 0x50 && head[2] === 0x4e && head[3] === 0x47) mime = 'image/png';
+                    else if (head[0] === 0xFF && head[1] === 0xD8) mime = 'image/jpeg';
                 }
-                if (id !== accessId) return;
-                const w = img.naturalWidth || 1280, h = img.naturalHeight || 800;
-                frame.style.width = w + 'px';
-                frame.style.height = h + 'px';
-                if (frame.style.display !== 'block') frame.style.display = 'block';
-                if (ph && ph.style.display !== 'none') ph.style.display = 'none';
-            };
-            img.onerror = () => {
-                if (prevUrl && prevUrl !== blobUrl) {
-                    try { URL.revokeObjectURL(prevUrl); } catch (_) {}
-                }
-            };
-            img.src = blobUrl;
+                const blobUrl = URL.createObjectURL(new Blob([frameData], {type: mime}));
+                const prevUrl = accessPendingBlobUrl;
+                accessPendingBlobUrl = blobUrl;
+                if (entry) entry.blobUrl = blobUrl;
+                accessBlobUrl = blobUrl;
+                img.onload = () => {
+                    if (prevUrl && prevUrl !== blobUrl) {
+                        try { URL.revokeObjectURL(prevUrl); } catch (_) {}
+                    }
+                    if (id !== accessId) return;
+                    const w = img.naturalWidth || 1280, h = img.naturalHeight || 720;
+                    frame.style.width = w + 'px';
+                    frame.style.height = h + 'px';
+                    if (frame.style.display !== 'block') frame.style.display = 'block';
+                    if (ph && ph.style.display !== 'none') ph.style.display = 'none';
+                };
+                img.onerror = () => {
+                    if (prevUrl && prevUrl !== blobUrl) {
+                        try { URL.revokeObjectURL(prevUrl); } catch (_) {}
+                    }
+                };
+                img.src = blobUrl;
+            });
         }
         function accessPosition(ev) {
             const img = A('access-image'), r = img && img.getBoundingClientRect();
             if (!r || !r.width || !r.height) return {x:0,y:0};
-            const width = img.naturalWidth || r.width;
-            const height = img.naturalHeight || r.height;
+            const width = img.naturalWidth || 1280;
+            const height = img.naturalHeight || 720;
             const sx = width / r.width;
             const sy = height / r.height;
             const x = Number(ev && ev.clientX);
             const y = Number(ev && ev.clientY);
             const cssX = Math.max(0, Math.min(r.width, (Number.isFinite(x) ? x : r.left) - r.left));
             const cssY = Math.max(0, Math.min(r.height, (Number.isFinite(y) ? y : r.top) - r.top));
-            return {x: cssX * sx, y: cssY * sy};
+            return {x: Math.round(cssX * sx), y: Math.round(cssY * sy)};
         }
         function accessOpenSocket() {
             const sessionId = String(accessId || '').trim();

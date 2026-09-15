@@ -1118,10 +1118,10 @@ class PCMManager:
             # synthesized from pre-existing CDP targets (returns None), so it
             # is only trusted when it plausibly matches the mode class.
             mode_cfg = {
-                "desktop": (1280, 800, 100),
-                "mobile": (500, 687, 100),   # 500 = Chromium min window width (see note above)
+                "desktop": (1280, 720, 85),
+                "mobile": (500, 687, 85),   # 500 = Chromium min window width (see note above)
             }
-            mcw, mch, mquality = mode_cfg.get(self._mode, (1280, 800, 100))
+            mcw, mch, mquality = mode_cfg.get(self._mode, (1280, 720, 85))
             try:
                 vs = getattr(self._page, 'viewport_size', None)
                 if isinstance(vs, dict) and vs.get("width") and vs.get("height"):

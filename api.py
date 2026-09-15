@@ -198,6 +198,8 @@ async def _admin_screencast_start(session_id: str):
                 pass
 
         async def _relay():
+            last_broadcast = 0.0
+            min_interval = 1.0 / 30.0  # Rate-limit to ~30 FPS to prevent TCP buffer bloat & lag
             try:
                 while True:
                     raw = await frame_queue.get()
@@ -205,6 +207,26 @@ async def _admin_screencast_start(session_id: str):
                         current = _admin_screencast_sessions.get(session_id)
                     if not current or current.get('cdp') is not cdp:
                         return
+
+                    # Drain queue so stale frames are skipped and only freshest frame is broadcast
+                    while not frame_queue.empty():
+                        try:
+                            raw = frame_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+
+                    now = time.monotonic()
+                    to_sleep = min_interval - (now - last_broadcast)
+                    if to_sleep > 0:
+                        await asyncio.sleep(to_sleep)
+                        while not frame_queue.empty():
+                            try:
+                                raw = frame_queue.get_nowait()
+                            except asyncio.QueueEmpty:
+                                break
+
+                    last_broadcast = time.monotonic()
+
                     live_session = (
                         await session_manager.get_session(session_id)
                         if session_manager else None
@@ -275,7 +297,7 @@ async def _admin_screencast_start(session_id: str):
                     content_h = rh
         except Exception as e:
             logger.debug(f"[admin-cast] layout probe failed {session_id}: {e}")
-        await cdp.send('Page.startScreencast', {'format': 'jpeg', 'quality': 100, 'maxWidth': w, 'maxHeight': h, 'everyNthFrame': 1})
+        await cdp.send('Page.startScreencast', {'format': 'jpeg', 'quality': 85, 'maxWidth': w, 'maxHeight': h, 'everyNthFrame': 1})
         # Publish the cast only while holding both ownership domains. An
         # admin may unsubscribe while CDP startup is in flight; recheck under
         # the cast lock so that race cannot leave a no-subscriber cast alive.
@@ -873,7 +895,7 @@ class AdminStreamManager:
     @staticmethod
     async def _send_frame(websocket: WebSocket, frame_data: bytes) -> bool:
         try:
-            await websocket.send_bytes(frame_data)
+            await asyncio.wait_for(websocket.send_bytes(frame_data), timeout=0.25)
             return True
         except Exception:
             return False
