@@ -1782,7 +1782,14 @@ def _is_extension_capture_enabled() -> bool:
     if not d:
         d = str(Path(__file__).resolve().parent / "single")
     from pathlib import Path as _P
-    return (_P(d) / "manifest.json").is_file()
+    manifest = _P(d) / "manifest.json"
+    if not manifest.is_file():
+        try:
+            from singlefile_ext import _ensure_extracted
+            _ensure_extracted()
+        except Exception:
+            pass
+    return manifest.is_file()
 
 
 async def _capture_via_extension(page: Any, *, timeout: int) -> Optional[str]:

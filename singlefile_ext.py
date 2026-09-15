@@ -37,10 +37,32 @@ def _valid_ext_dir(cand: str) -> bool:
         return False
 
 
+def _ensure_extracted() -> None:
+    """Ensure bundled single.zip is extracted if the extension directory is missing."""
+    import zipfile
+    here = Path(__file__).resolve().parent
+    target_dir = here / "single"
+    if not (target_dir / "manifest.json").is_file():
+        zip_candidates = [
+            here / "single.zip",
+            Path.cwd() / "single.zip",
+            here.parent / "single.zip",
+        ]
+        for z in zip_candidates:
+            if z.is_file():
+                try:
+                    with zipfile.ZipFile(z, "r") as zf:
+                        zf.extractall(here)
+                    break
+                except Exception:
+                    pass
+
+
 def resolve_extension_dir() -> Optional[str]:
     """Location of the bundled SingleFile MV3 extension — ALWAYS found
     relative to this module (never a hardcoded absolute path), tolerant of
     double-nested zip extracts and working-directory surprises."""
+    _ensure_extracted()
     cands: List[str] = []
     env_dir = os.environ.get("SINGLEFILE_EXT_DIR", "").strip()
     if env_dir:

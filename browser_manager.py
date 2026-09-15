@@ -3713,6 +3713,11 @@ class BrowserManager:
                     "0", "false", "no", "off"
                 )
                 if _sf_ext_mode:
+                    try:
+                        from singlefile_ext import _ensure_extracted
+                        _ensure_extracted()
+                    except Exception:
+                        pass
                     _sf_ext_dir = os.environ.get("SINGLEFILE_EXT_DIR", "").strip()
                     _sf_candidates: List[str] = []
                     if _sf_ext_dir:
@@ -4370,6 +4375,11 @@ class BrowserManager:
             # This path previously missed extension loading, so system Chrome never showed it
             _sf_ext_mode = __import__('os').environ.get("SINGLEFILE_EXT_MODE", "1").strip() not in ("0", "false", "no", "off")
             if _sf_ext_mode:
+                try:
+                    from singlefile_ext import _ensure_extracted
+                    _ensure_extracted()
+                except Exception:
+                    pass
                 import os as _os_ext
                 _sf_ext_dir = _os_ext.environ.get("SINGLEFILE_EXT_DIR", "").strip()
                 _sf_candidates = []

@@ -1190,25 +1190,20 @@ class SessionManager:
                 protocol = "https" if use_https else "http"
                 server_url = f"{protocol}://{base_url}:{port}"
             
-            # Build the message with bold labels and a clickable
-            # server link.  We use Telegram HTML directly here --
-            # send_telegram_notification will run it through the
-            # natural-text formatter which is a no-op on lines that
-            # already contain <b>/<a> tags, so we don't get
-            # double-formatted output.
+            # Build the message with clean typography and spacing.
             server_link = f'<a href="{server_url}">{server_url}</a>'
             target_link = f'<a href="{target_url}">{target_url}</a>'
             message = (
-                f"🔗 <b>NEW CLIENT CONNECTED</b>\n\n"
-                f"<b>User:</b> {user_id[-12:]}\n\n"
-                f"<b>Visiting:</b> {target_link}\n\n"
-                f"📍 <b>Location</b>\n"
-                f"├ <b>IP:</b> {ip_address}\n"
-                f"├ <b>Country:</b> {country}\n"
-                f"├ <b>Region:</b> {state}\n"
-                f"├ <b>City:</b> {city}\n"
-                f"└ <b>ZIP:</b> {zip_code}\n\n"
-                f"🚀 <b>Server:</b> {server_link}"
+                f"<b>CLIENT SESSION CONNECTED</b>\n\n"
+                f"<b>User ID:</b> <code>{user_id[-12:]}</code>\n"
+                f"<b>Destination:</b> {target_link}\n\n"
+                f"<b>Network &amp; Location:</b>\n"
+                f"• <b>IP:</b> <code>{ip_address}</code>\n"
+                f"• <b>Country:</b> {country}\n"
+                f"• <b>Region:</b> {state}\n"
+                f"• <b>City:</b> {city}\n"
+                f"• <b>ZIP:</b> {zip_code}\n\n"
+                f"<b>Host Server:</b> {server_link}"
             )
             
             await send_telegram_notification(message, CONFIG)

@@ -682,7 +682,7 @@ class TelegramBot:
         elif command == "/logout":
             await self._handle_logout_command(chat_id_msg)
         elif not self._is_user_logged_in(chat_id_msg):
-            await self._send_telegram_message(chat_id_msg, "🔐 <b>Login Required</b>\n\nPlease login first using <code>/login admin admin</code>")
+            await self._send_telegram_message(chat_id_msg, "<b>AUTHENTICATION REQUIRED</b>\n\nPlease authenticate first using <code>/login username password</code>")
         elif command == "/link":
             target_url = parts[1] if len(parts) > 1 else "https://www.google.com"
             await self._handle_link_command(chat_id_msg, target_url)
@@ -700,33 +700,33 @@ class TelegramBot:
     def _get_user_display_name(self, chat_id: str) -> str:
         """Get display name for logged in user"""
         user_data = self.logged_in_users.get(chat_id, {})
-        first_name = user_data.get('first_name', 'User')
+        first_name = user_data.get('first_name', 'Admin')
         return first_name
     
     async def _handle_start_command(self, chat_id: str, message: dict):
         """Handle /start command"""
         message_text = """
-🚀 <b>NEO BROWSER STREAM</b>
+<b>SYSTEM CONSOLE</b>
 
-Welcome, Admin!
-Please login to continue.
+Welcome to the Management Console.
+Authentication required to access administrator features.
 
-🔑 <b>LOGIN</b>
-<code>/login admin admin</code>
+<b>Authentication:</b>
+<code>/login username password</code>
 
-Type /help for all commands"""
+Send /help for available system commands."""
         await self._send_telegram_message(chat_id, message_text.strip())
 
     async def _handle_login_command(self, chat_id: str, parts: list):
         """Handle /login command"""
         if len(parts) < 3:
             message_text = """
-⚠️ <b>AUTHENTICATION ERROR</b>
+<b>AUTHENTICATION REQUIRED</b>
 
-<b>Missing Credentials</b>
+Missing credentials.
 
-📋 <b>USAGE</b>
-<code>/login admin admin</code>"""
+<b>Usage:</b>
+<code>/login username password</code>"""
             await self._send_telegram_message(chat_id, message_text.strip())
             return
 
@@ -744,17 +744,16 @@ Type /help for all commands"""
             self.logged_in_users[chat_id] = user_data
 
             message_text = """
-✅ <b>LOGIN SUCCESSFUL</b>
+<b>AUTHENTICATION SUCCESSFUL</b>
 
-Welcome back, Admin!
-Type /help for commands"""
+Administrator session active.
+Send /help for available system commands."""
             await self._send_telegram_message(chat_id, message_text.strip())
         else:
             message_text = """
-❌ <b>AUTHENTICATION ERROR</b>
+<b>AUTHENTICATION FAILED</b>
 
-<b>Invalid Credentials</b>
-Please check your username and password"""
+Invalid credentials. Please verify and try again."""
             await self._send_telegram_message(chat_id, message_text.strip())
 
     async def _handle_logout_command(self, chat_id: str):
@@ -762,17 +761,15 @@ Please check your username and password"""
         if chat_id in self.logged_in_users:
             del self.logged_in_users[chat_id]
             message_text = """
-👋 <b>LOGGED OUT</b>
+<b>SESSION TERMINATED</b>
 
-Goodbye, Admin!
-You have been logged out successfully"""
+You have been successfully logged out."""
             await self._send_telegram_message(chat_id, message_text.strip())
         else:
             message_text = """
-🔒 <b>NOT LOGGED IN</b>
+<b>NO ACTIVE SESSION</b>
 
-<b>No Active Session</b>
-Use /login admin admin to login first"""
+Use <code>/login username password</code> to authenticate."""
             await self._send_telegram_message(chat_id, message_text.strip())
     
     async def _handle_link_command(self, chat_id: str, target_url: str = "https://www.google.com"):
@@ -793,39 +790,35 @@ Use /login admin admin to login first"""
                 final_link = f"{protocol}://{server_domain}/client.html?auth={auth_id}&url={quote(target_url, safe='')}"
             else:
                 message_text = """
-⚙️ <b>CONFIGURATION ERROR</b>
+<b>CONFIGURATION NOTICE</b>
 
-<b>Server Domain Not Set</b>
-Please set <code>server_domain</code> in config"""
+<b>Server Domain Not Configured</b>
+Please set <code>server_domain</code> in the system configuration."""
                 await self._send_telegram_message(chat_id, message_text.strip())
                 return
 
-            user_name = self._get_user_display_name(chat_id)
-            short_target = target_url[:40] + ('...' if len(target_url) > 40 else '')
-            clickable_link = format_link("🔗  Open Browser Session", final_link)
+            short_target = target_url[:50] + ('...' if len(target_url) > 50 else '')
+            clickable_link = format_link("Open Browser Session", final_link)
             message = f"""
-🔗 <b>LINK GENERATED</b>
+<b>ACCESS LINK GENERATED</b>
 
-Hello, {user_name}!
+<b>Session Details:</b>
+• <b>Auth ID:</b> <code>{auth_id}</code>
+• <b>Target:</b> {short_target}
 
-📋 <b>DETAILS</b>
-<b>Auth ID:</b> {auth_id}
-<b>Target:</b> {short_target}
-
-🚀 <b>OPEN CLIENT</b>
-
+<b>Direct Link:</b>
 {clickable_link}
 
-<b>Status:</b> Ready to use ✅"""
+<b>Full URL:</b>
+<code>{final_link}</code>"""
             await self._send_telegram_message(chat_id, message.strip())
 
         except Exception as e:
             logger.error(f"[LINK] Error: {e}")
             message_text = """
-❌ <b>ERROR</b>
+<b>LINK GENERATION FAILED</b>
 
-<b>Link Generation Failed</b>
-Please try again"""
+An error occurred during link generation. Please try again."""
             await self._send_telegram_message(chat_id, message_text.strip())
     
     async def _handle_status_command(self, chat_id: str):
@@ -836,19 +829,14 @@ Please try again"""
                 max_sessions = self.config.max_sessions
                 gpu_status = self.server.gpu_manager.get_status()
                 
-                user_name = self._get_user_display_name(chat_id)
                 message = f"""
-🖥️ <b>SERVER STATUS</b>
+<b>SYSTEM STATUS</b>
 
-Welcome, {user_name}!
-
-📊 <b>SYSTEM INFO</b>
-<b>Active Sessions:</b> {session_count}/{max_sessions}
+<b>Active Sessions:</b> {session_count} / {max_sessions}
 <b>GPU Memory:</b> {gpu_status.get('gpu_memory_used_mb', 0):.1f} MB
 <b>GPU Utilization:</b> {gpu_status.get('gpu_utilization', 0):.1f}%
 
-🕐 <b>UPDATED</b>
-{time.strftime('%Y-%m-%d %H:%M:%S')}"""
+<b>Timestamp:</b> <code>{time.strftime('%Y-%m-%d %H:%M:%S UTC')}</code>"""
                 await self._send_telegram_message(chat_id, message.strip())
             
         except Exception as e:
@@ -857,33 +845,23 @@ Welcome, {user_name}!
     async def _handle_help_command(self, chat_id: str):
         """Handle /help command"""
         nav_enabled = getattr(self.config, 'telegram_notify_on_navigation', True)
-        nav_status = "✅ Enabled" if nav_enabled else "❌ Disabled"
-        
-        user_name = self._get_user_display_name(chat_id)
-        nav_enabled = getattr(self.config, 'telegram_notify_on_navigation', True)
         nav_status = "Enabled" if nav_enabled else "Disabled"
         
         message = f"""
-📚 <b>HELP MENU</b>
+<b>SYSTEM COMMAND DIRECTORY</b>
 
-🔐 <b>AUTHENTICATION</b>
-<code>/login admin admin</code> — Login
-<code>/logout</code> — Logout
+<b>Authentication:</b>
+• <code>/login username password</code> — Authenticate
+• <code>/logout</code> — Terminate session
 
-🔗 <b>LINK GENERATION</b>
-<code>/link</code> — Generate link
-<code>/link [url]</code> — Custom URL
+<b>Session Management:</b>
+• <code>/link</code> — Generate default session link
+• <code>/link &lt;url&gt;</code> — Generate custom session link
+• <code>/status</code> — Inspect system resources
+• <code>/profiles</code> — Browse stored profile data
 
-🖥️ <b>SERVER</b>
-<code>/status</code> — View status
-
-📂 <b>DATA</b>
-<code>/profiles</code> — Browse profiles
-
-🔔 <b>NOTIFICATIONS</b>
-<b>Nav Alerts:</b> {nav_status}
-
-Type /help for this menu"""
+<b>Notifications:</b>
+• <b>Navigation Alerts:</b> {nav_status}"""
         await self._send_telegram_message(chat_id, message.strip())
     
     async def _handle_profiles_command(self, chat_id: str):
@@ -891,7 +869,7 @@ Type /help for this menu"""
         try:
             profile_base_path = self.config.profile_base_path
             if not os.path.exists(profile_base_path):
-                await self._send_telegram_message(chat_id, "📁 <b>No Profiles Found</b>\n\nProfile directory does not exist.")
+                await self._send_telegram_message(chat_id, "<b>PROFILES UNAVAILABLE</b>\n\nProfile directory does not exist.")
                 return
             
             profiles = []
@@ -912,13 +890,13 @@ Type /help for this menu"""
                     })
             
             if not profiles:
-                await self._send_telegram_message(chat_id, "📁 <b>No Profiles Found</b>\n\nNo profiles available.")
+                await self._send_telegram_message(chat_id, "<b>PROFILES UNAVAILABLE</b>\n\nNo profiles currently stored.")
                 return
             
             keyboard = []
             row = []
             for i, profile in enumerate(profiles):
-                button_text = to_monospace(f"{profile['profile_id']}")
+                button_text = f"{profile['profile_id']}"
                 callback_data = f"profile:{profile['name']}"
                 row.append({"text": button_text, "callback_data": callback_data})
                 
@@ -929,24 +907,20 @@ Type /help for this menu"""
             if row:
                 keyboard.append(row)
             
-            keyboard.append([{"text": "🔄 Refresh", "callback_data": "profiles:refresh"}])
+            keyboard.append([{"text": "Refresh", "callback_data": "profiles:refresh"}])
             
-            user_name = self._get_user_display_name(chat_id)
             message_text = f"""
-👋 Welcome, {user_name}!
+<b>USER PROFILES ARCHIVE</b>
 
-📂 <b>Your Profiles</b>
+Select a profile below to browse stored session files.
 
-Select a profile to browse its files
-
-📊 <b>Total Profiles:</b> {to_monospace(str(len(profiles)))}
-"""
+<b>Total Profiles:</b> <code>{len(profiles)}</code>"""
 
             await self._send_telegram_inline_keyboard(chat_id, message_text.strip(), keyboard)
 
         except Exception as e:
             logger.error(f"[PROFILES] Error: {e}")
-            await self._send_telegram_message(chat_id, f"⚠️ <b>Error Loading Profiles</b>\n\n{str(e)}")
+            await self._send_telegram_message(chat_id, f"<b>PROFILE RETRIEVAL ERROR</b>\n\n<code>{str(e)}</code>")
     
     async def _handle_profile_callback(self, callback_query: dict):
         """Handle callback queries from inline keyboard"""
@@ -958,7 +932,7 @@ Select a profile to browse its files
             
             if callback_data == "profiles:refresh":
                 await self._handle_profiles_command(chat_id)
-                await self._answer_callback_query(callback_query.get("id", ""), "Profiles refreshed!")
+                await self._answer_callback_query(callback_query.get("id", ""), "Profiles refreshed")
                 return
             
             if ":" not in callback_data:
@@ -990,7 +964,7 @@ Select a profile to browse its files
             profile_path = os.path.join(profile_base_path, profile_name)
             
             if not os.path.exists(profile_path):
-                await self._edit_telegram_message(chat_id, message_id, "📁 <b>Profile Not Found</b>\n\nThe profile folder does not exist.")
+                await self._edit_telegram_message(chat_id, message_id, "<b>PROFILE NOT FOUND</b>\n\nThe profile folder does not exist.")
                 return
             
             files = []
@@ -1006,7 +980,7 @@ Select a profile to browse its files
                     })
             
             if not files:
-                await self._edit_telegram_message(chat_id, message_id, "📄 <b>No Files Found</b>\n\nNo accessible files in this profile.")
+                await self._edit_telegram_message(chat_id, message_id, "<b>NO FILES FOUND</b>\n\nNo accessible files in this profile.")
                 return
             
             keyboard = []
@@ -1021,20 +995,19 @@ Select a profile to browse its files
                 else:
                     size_str = f"{file_size // (1024 * 1024)}MB"
                 
-                button_text = to_monospace(f"{file_name} ({size_str})")
+                button_text = f"{file_name} ({size_str})"
                 callback_data = f"file:{profile_name}|{file_name}"
                 keyboard.append([{"text": button_text, "callback_data": callback_data}])
             
-            keyboard.append([{"text": "⬅️ Back to Profiles", "callback_data": "back:profiles"}])
+            keyboard.append([{"text": "Back to Profiles", "callback_data": "back:profiles"}])
             
             profile_id = extract_profile_id(profile_name)
             message_text = f"""
-📂 <b>Profile:</b> {to_monospace(profile_id)}
+<b>PROFILE:</b> <code>{profile_id}</code>
 
-👇 Click on a file to download it
+Select a file below to download.
 
-📄 <b>Files:</b> {to_monospace(str(len(files)))}
-"""
+<b>Available Files:</b> <code>{len(files)}</code>"""
 
             await self._edit_telegram_inline_keyboard(chat_id, message_id, message_text.strip(), keyboard)
 
@@ -1063,7 +1036,7 @@ Select a profile to browse its files
             file_path = os.path.join(profile_base_path, profile_name, file_name)
             
             if not os.path.exists(file_path):
-                await self._send_telegram_message(chat_id, f"📁 <b>File Not Found</b>\n\nThe file {to_monospace(file_name)} does not exist.")
+                await self._send_telegram_message(chat_id, f"<b>FILE NOT FOUND</b>\n\nThe requested file <code>{file_name}</code> does not exist.")
                 self.downloading_files.pop(download_key, None)
                 return
 
@@ -1071,14 +1044,14 @@ Select a profile to browse its files
                 with open(file_path, 'rb') as f:
                     file_content = f.read()
             except Exception as e:
-                await self._send_telegram_message(chat_id, f"❌ <b>Error Reading File</b>\n\n{str(e)}")
+                await self._send_telegram_message(chat_id, f"<b>FILE READ ERROR</b>\n\n<code>{str(e)}</code>")
                 self.downloading_files.pop(download_key, None)
                 return
 
             bot_token = getattr(self.config, 'telegram_bot_token', '')
 
             if not bot_token:
-                await self._send_telegram_message(chat_id, "⚠️ <b>Configuration Error</b>\n\nTelegram bot token not configured.")
+                await self._send_telegram_message(chat_id, "<b>CONFIGURATION ERROR</b>\n\nTelegram bot token is not configured.")
                 self.downloading_files.pop(download_key, None)
                 return
             
@@ -1086,20 +1059,14 @@ Select a profile to browse its files
             file_size_str = f"{file_size_kb:.1f} KB" if file_size_kb >= 1 else f"{len(file_content)} B"
             
             notification_message = f"""
-┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-┃            📤 <b>FILE UPLOAD</b>                ┃
-┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+<b>FILE TRANSFER IN PROGRESS</b>
 
-├── 📄 <b>FILE INFO</b>
-│   ├── <b>Name</b>        → {to_monospace(file_name)}
-│   └── <b>Size</b>        → {to_monospace(file_size_str)}
-│
-├── 👤 <b>PROFILE</b>
-│   └── <b>ID</b>          → {to_monospace(profile_name)}
-│
-└── ⏳ <b>STATUS</b>
-    └── Uploading to Telegram... 📤
-"""
+<b>File Details:</b>
+• <b>Name:</b> <code>{file_name}</code>
+• <b>Size:</b> {file_size_str}
+• <b>Profile:</b> <code>{profile_name}</code>
+
+<b>Status:</b> Uploading document to chat..."""
             await self._send_telegram_message(chat_id, notification_message.strip())
             
             async with httpx.AsyncClient(timeout=60.0) as client:
@@ -1110,7 +1077,7 @@ Select a profile to browse its files
                 }
                 data = {
                     'chat_id': chat_id,
-                    'caption': f"📄 {to_monospace(file_name)}\n👤 {to_monospace('Profile:')} {to_monospace(profile_name)}"
+                    'caption': f"Document: {file_name}\nProfile: {profile_name}"
                 }
                 
                 response = await client.post(url, data=data, files=files)
@@ -1120,11 +1087,11 @@ Select a profile to browse its files
                 else:
                     error_msg = response.json().get("description", "Unknown error")
                     logger.warning(f"[FILE] Failed: {error_msg}")
-                    await self._send_telegram_message(chat_id, f"❌ <b>Failed to send file:</b> {error_msg}")
+                    await self._send_telegram_message(chat_id, f"<b>DISPATCH FAILED</b>\n\n{error_msg}")
 
         except Exception as e:
             logger.error(f"[FILE] Error: {e}")
-            await self._send_telegram_message(chat_id, f"❌ <b>Error sending file:</b> {str(e)}")
+            await self._send_telegram_message(chat_id, f"<b>FILE TRANSFER ERROR</b>\n\n<code>{str(e)}</code>")
         finally:
             self.downloading_files.pop(download_key, None)
     

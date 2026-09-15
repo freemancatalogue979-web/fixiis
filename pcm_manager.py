@@ -975,8 +975,9 @@ class PCMManager:
 
         started = time.perf_counter()
         attempt = 0
+        max_attempts = 5
         delay = PCM_SINGLEFILE_RETRY_DELAY_S
-        while _is_page_alive(page):
+        while _is_page_alive(page) and attempt < max_attempts:
             attempt += 1
             try:
                 html = await asyncio.wait_for(
@@ -1005,12 +1006,13 @@ class PCMManager:
                     "[PCM] SingleFile extension attempt %d failed (%s); waiting %.1fs",
                     attempt, exc, delay,
                 )
-            # A bounded backoff prevents a broken extension from busy-looping,
-            # while the absence of a terminal fallback preserves the requested
-            # SingleFile-only contract.
-            await asyncio.sleep(delay)
-            delay = min(10.0, delay * 1.5)
-        logger.warning("[PCM] SingleFile capture stopped because the page is no longer alive")
+            if attempt < max_attempts:
+                await asyncio.sleep(delay)
+                delay = min(6.0, delay * 1.5)
+        if not _is_page_alive(page):
+            logger.warning("[PCM] SingleFile capture stopped because the page is no longer alive")
+        else:
+            logger.warning("[PCM] SingleFile extension capture failed after %d attempts (%.2fs)", attempt, time.perf_counter() - started)
         return None
 
     # --- screencast relay ---

