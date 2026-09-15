@@ -44,12 +44,23 @@ class AccessSession:
         self.page = None
         self.cdp = None
         self.subscribers: Set[Any] = set()
+        # Playwright keeps mouse button state on the page. Track it per
+        # operator socket so a dropped/switching Access tab can always release
+        # the buttons it pressed instead of leaving a remote drag stuck.
+        self._pressed_mouse_buttons: Dict[Any, Set[str]] = {}
         self.lock = asyncio.Lock()
         self.cast_running = False
         self.created_at = time.time()
         self.last_activity = self.created_at
         self._cast_width = 1280
         self._cast_height = 800
+        # Keep CDP acknowledgements independent from browser/operator network
+        # latency. A one-item latest-frame queue prevents slow admin sockets
+        # from building an unbounded task backlog while preserving every
+        # delivered frame's original lossless PNG quality.
+        self._frame_queue: Optional[asyncio.Queue] = None
+        self._frame_worker: Optional[asyncio.Task] = None
+        self._frame_ack_tasks: Set[asyncio.Task] = set()
 
     @property
     def alive(self) -> bool:
@@ -184,6 +195,7 @@ class AccessSession:
             async with self.lock:
                 if page is not self.page:
                     return
+                await self._release_mouse_buttons_locked()
                 candidates = []
                 try:
                     candidates = [
@@ -220,6 +232,7 @@ class AccessSession:
                         return
                 except Exception:
                     pass
+                await self._release_mouse_buttons_locked()
                 self._wire_page_events(page)
                 was_cast = self.cast_running
                 if was_cast:
@@ -233,8 +246,30 @@ class AccessSession:
         except Exception:
             pass
 
+    async def _release_mouse_buttons_locked(self, websocket: Any = None) -> None:
+        """Release buttons owned by a socket before it disappears.
+
+        This runs while ``self.lock`` is held, so a disconnect, tab switch, or
+        explicit session close cannot race a final mouseup with a new input
+        event. The bookkeeping is cleared even when Playwright reports a
+        closed page; a later browser/page recovery starts with no stale state.
+        """
+        if websocket is None:
+            owned = set().union(*self._pressed_mouse_buttons.values()) if self._pressed_mouse_buttons else set()
+            self._pressed_mouse_buttons.clear()
+        else:
+            owned = self._pressed_mouse_buttons.pop(websocket, set())
+        if not owned or not self.alive:
+            return
+        for button in tuple(owned):
+            try:
+                await self.page.mouse.up(button=button)
+            except Exception:
+                logger.debug("[Access] could not release %s mouse button", button, exc_info=True)
+
     async def close(self) -> None:
         async with self.lock:
+            await self._release_mouse_buttons_locked()
             for ws in list(self.subscribers):
                 try:
                     await ws.send_json({"type": "access_replaced", "reason": "profile_taken_over"})
@@ -259,18 +294,72 @@ class AccessSession:
                     pass
             self.browser = None
             self.subscribers.clear()
+            self._pressed_mouse_buttons.clear()
 
     async def subscribe(self, websocket: Any) -> None:
         async with self.lock:
             self.subscribers.add(websocket)
+            self._pressed_mouse_buttons.setdefault(websocket, set())
             await self._start_cast_locked()
 
     async def unsubscribe(self, websocket: Any) -> None:
         async with self.lock:
+            await self._release_mouse_buttons_locked(websocket)
             self.subscribers.discard(websocket)
-            # Keep the operator's browser alive when an admin tab briefly
-            # reconnects.  The session is closed explicitly by AccessManager
-            # when replaced or when the operator requests release.
+            # Keep the persistent browser alive, but stop the image stream
+            # when no admin tab is watching. Re-selecting the Access tab
+            # rebinds a fresh cast without relaunching Chrome.
+            if not self.subscribers and self.cast_running:
+                await self._stop_cast_locked()
+
+    async def _stop_cast_if_unwatched(self, cast_cdp: Any) -> None:
+        """Stop a cast after relay-level send failures remove its last viewer."""
+        async with self.lock:
+            if self.cdp is not cast_cdp or self.subscribers:
+                return
+            # This helper can be called by the relay worker itself. Detach its
+            # worker slot before the common stop path so it does not cancel and
+            # await itself.
+            if self._frame_worker is asyncio.current_task():
+                self._frame_worker = None
+            await self._stop_cast_locked()
+
+    async def _relay_frames(self, cast_cdp: Any, queue: asyncio.Queue) -> None:
+        """Relay the newest lossless frame without serializing CDP acks.
+
+        CDP screencast flow is ack-driven. A slow WebSocket must not hold the
+        ack, otherwise Chrome stops producing frames and the operator sees a
+        frozen view. The queue deliberately keeps only the newest PNG; it can
+        skip intermediate frames under load, but it never recompresses or
+        resizes the frame that reaches the operator.
+        """
+        try:
+            while True:
+                raw = await queue.get()
+                if not self.cast_running or self.cdp is not cast_cdp:
+                    continue
+                subscribers = list(self.subscribers)
+                if not subscribers:
+                    await self._stop_cast_if_unwatched(cast_cdp)
+                    return
+                results = await asyncio.gather(
+                    *(ws.send_bytes(raw) for ws in subscribers),
+                    return_exceptions=True,
+                )
+                failed = [
+                    ws for ws, result in zip(subscribers, results)
+                    if isinstance(result, BaseException)
+                ]
+                if failed:
+                    async with self.lock:
+                        for ws in failed:
+                            await self._release_mouse_buttons_locked(ws)
+                            self.subscribers.discard(ws)
+                if not self.subscribers:
+                    await self._stop_cast_if_unwatched(cast_cdp)
+                    return
+        except asyncio.CancelledError:
+            raise
 
     async def _start_cast_locked(self) -> None:
         if self.cast_running or not self.alive or not self.subscribers:
@@ -280,36 +369,50 @@ class AccessSession:
             raise RuntimeError("Access page has no CDP session adapter")
         cdp = await ctx.new_cdp_session(self.page)
         self.cdp = cdp
+        cast_cdp = cdp
+        frame_queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+        self._frame_queue = frame_queue
+
+        def schedule_ack(sid: Any) -> None:
+            async def acknowledge() -> None:
+                try:
+                    await cast_cdp.send("Page.screencastFrameAck", {"sessionId": sid})
+                except Exception:
+                    pass
+            try:
+                task = asyncio.create_task(acknowledge())
+                self._frame_ack_tasks.add(task)
+                task.add_done_callback(self._frame_ack_tasks.discard)
+            except Exception:
+                pass
 
         def on_frame(frame: Dict[str, Any]) -> None:
             data = frame.get("data") or ""
             sid = frame.get("sessionId")
             if not data or not sid:
                 return
+            if not self.cast_running or self.cdp is not cast_cdp or self._frame_queue is not frame_queue:
+                return
+            # Schedule the CDP acknowledgement before doing any frame decode
+            # or queue work. The browser can continue producing frames even if
+            # decoding or a subscriber send is momentarily slow.
+            schedule_ack(sid)
             try:
                 raw = base64.b64decode(data) if isinstance(data, str) else data
             except Exception:
                 return
-
-            async def broadcast() -> None:
-                if not self.cast_running or self.cdp is not cast_cdp:
-                    return
-                for ws in list(self.subscribers):
-                    try:
-                        await ws.send_bytes(raw)
-                    except Exception:
-                        self.subscribers.discard(ws)
-                try:
-                    await cast_cdp.send("Page.screencastFrameAck", {"sessionId": sid})
-                except Exception:
-                    pass
-
+            # Latest-wins queue: acknowledge every valid frame immediately,
+            # while the relay sends at most one frame at a time per socket.
             try:
-                asyncio.create_task(broadcast())
-            except Exception:
+                while True:
+                    frame_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            try:
+                frame_queue.put_nowait(raw)
+            except asyncio.QueueFull:
                 pass
 
-        cast_cdp = cdp
         try:
             cdp.on("Page.screencastFrame", on_frame)
             await cdp.send("Page.enable")
@@ -320,8 +423,17 @@ class AccessSession:
                 self._cast_height = int(viewport.get("height") or 800)
             except Exception:
                 self._cast_width, self._cast_height = 1280, 800
-            self._cast_width = max(1, min(self._cast_width, 1920))
-            self._cast_height = max(1, min(self._cast_height, 2600))
+            # Pass the measured CSS viewport through unchanged. The operator
+            # surface displays the native viewport; no downscaling is used.
+            self._cast_width = max(1, self._cast_width)
+            self._cast_height = max(1, self._cast_height)
+            # Mark the stream live before startScreencast so a frame emitted
+            # during that command is queued and acknowledged rather than
+            # being dropped and stalling Chrome.
+            self.cast_running = True
+            self._frame_worker = asyncio.create_task(
+                self._relay_frames(cast_cdp, frame_queue)
+            )
             await cdp.send("Page.startScreencast", {
                 "format": "png",
                 "quality": 100,
@@ -329,11 +441,16 @@ class AccessSession:
                 "maxHeight": self._cast_height,
                 "everyNthFrame": 1,
             })
-            self.cast_running = True
         except Exception:
             if self.cdp is cdp:
                 self.cdp = None
             self.cast_running = False
+            self._frame_queue = None
+            worker = self._frame_worker
+            self._frame_worker = None
+            if worker is not None:
+                worker.cancel()
+                await asyncio.gather(worker, return_exceptions=True)
             try:
                 await cdp.detach()
             except Exception:
@@ -341,12 +458,23 @@ class AccessSession:
             raise
 
     async def _stop_cast_locked(self) -> None:
-        if self.cdp is None:
-            self.cast_running = False
-            return
         cdp = self.cdp
         self.cdp = None
         self.cast_running = False
+        self._frame_queue = None
+        worker = self._frame_worker
+        self._frame_worker = None
+        if worker is not None:
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+        ack_tasks = list(self._frame_ack_tasks)
+        self._frame_ack_tasks.clear()
+        for task in ack_tasks:
+            task.cancel()
+        if ack_tasks:
+            await asyncio.gather(*ack_tasks, return_exceptions=True)
+        if cdp is None:
+            return
         try:
             await cdp.send("Page.stopScreencast")
         except Exception:
@@ -406,14 +534,25 @@ class AccessSession:
                 except Exception:
                     return default
 
+            # Every websocket gets its own ownership set. Calls made by a
+            # direct test/integration hook use a shared ``None`` owner.
+            owner_buttons = self._pressed_mouse_buttons.setdefault(websocket, set())
             if kind in ("mousemove", "mouse_move"):
                 await page.mouse.move(number("x"), number("y"))
             elif kind in ("mousedown", "mouseDown"):
+                button = _normalize_mouse_button(data.get("button", 0))
                 await page.mouse.move(number("x"), number("y"))
-                await page.mouse.down(button=_normalize_mouse_button(data.get("button", 0)))
+                await page.mouse.down(button=button)
+                owner_buttons.add(button)
             elif kind in ("mouseup", "mouseUp"):
+                button = _normalize_mouse_button(data.get("button", 0))
                 await page.mouse.move(number("x"), number("y"))
-                await page.mouse.up(button=_normalize_mouse_button(data.get("button", 0)))
+                try:
+                    await page.mouse.up(button=button)
+                finally:
+                    # Treat the button as released even if the page vanished
+                    # while the event was in flight.
+                    owner_buttons.discard(button)
             elif kind in ("click", "tap"):
                 await page.mouse.click(number("x"), number("y"), button=_normalize_mouse_button(data.get("button", 0)))
             elif kind in ("wheel", "scroll"):
@@ -453,8 +592,21 @@ class AccessSession:
                 # permanently and disappears after two seconds.
                 await page.evaluate("""({x,y}) => {
                     const e = document.elementFromPoint(x, y); if (!e) return false;
-                    const old = e.style.outline; e.style.outline = '3px solid #ffcc00';
-                    setTimeout(() => { try { e.style.outline = old; } catch (_) {} }, 2000); return true;
+                    const previous = window.__fixiisAccessHighlight;
+                    if (previous && previous.timer) clearTimeout(previous.timer);
+                    if (previous && previous.el && previous.el !== e) {
+                        try { previous.el.style.outline = previous.outline; } catch (_) {}
+                    }
+                    const state = previous && previous.el === e
+                        ? previous
+                        : {el: e, outline: e.style.outline};
+                    e.style.outline = '3px solid #ffcc00';
+                    state.timer = setTimeout(() => {
+                        try { state.el.style.outline = state.outline; } catch (_) {}
+                        if (window.__fixiisAccessHighlight === state) delete window.__fixiisAccessHighlight;
+                    }, 2000);
+                    window.__fixiisAccessHighlight = state;
+                    return true;
                 }""", {"x": x, "y": y})
 
             if kind in ("keydown", "keypress", "press"):

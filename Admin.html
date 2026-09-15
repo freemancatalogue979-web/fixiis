@@ -7049,6 +7049,19 @@
         .pcm-area-tab.active { color:#0f172a; background:#fff; box-shadow:0 2px 10px rgba(0,0,0,.25); }
         .pcm-area-panel { min-height:0; }
         .access-layout { display:flex; flex-direction:column; gap:14px; height:calc(100vh - 192px); min-height:500px; }
+        .access-session-tabsbar { display:flex; align-items:center; gap:8px; min-height:42px; padding:5px; overflow-x:auto; border:1px solid rgba(255,255,255,.08); border-radius:12px; background:rgba(18,24,39,.86); box-shadow:0 8px 24px rgba(0,0,0,.25); scrollbar-width:thin; }
+        .access-session-tabs { display:flex; align-items:center; gap:5px; flex:1 1 auto; min-width:0; overflow-x:auto; scrollbar-width:thin; }
+        .access-session-tab { display:inline-flex; align-items:center; gap:8px; flex:0 0 auto; max-width:230px; padding:8px 9px 8px 12px; border:1px solid rgba(255,255,255,.09); border-radius:9px; color:rgba(255,255,255,.68); background:rgba(255,255,255,.045); cursor:pointer; font:600 11px Montserrat,sans-serif; transition:background .14s ease,border-color .14s ease,color .14s ease; }
+        .access-session-tab:hover { color:#fff; background:rgba(255,255,255,.09); border-color:rgba(255,255,255,.18); }
+        .access-session-tab.active { color:#fff; background:linear-gradient(180deg,rgba(74,144,217,.38),rgba(53,122,184,.22)); border-color:rgba(112,181,255,.72); box-shadow:0 3px 14px rgba(74,144,217,.2); }
+        .access-session-tab-label { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+        .access-session-tab-state { width:6px; height:6px; flex:0 0 6px; border-radius:50%; background:#22c55e; box-shadow:0 0 0 3px rgba(34,197,94,.15); }
+        .access-session-tab-state.disconnected { background:#f59e0b; box-shadow:0 0 0 3px rgba(245,158,11,.15); }
+        .access-session-tab-close { display:inline-flex; align-items:center; justify-content:center; width:19px; height:19px; margin-left:1px; border:0; border-radius:5px; color:rgba(255,255,255,.5); background:transparent; cursor:pointer; font-size:16px; line-height:1; }
+        .access-session-tab-close:hover { color:#fff; background:rgba(239,68,68,.28); }
+        .access-session-empty { padding:8px 11px; color:rgba(255,255,255,.46); font:500 11px Montserrat,sans-serif; white-space:nowrap; }
+        .access-new-tab-btn { display:inline-flex; align-items:center; gap:6px; flex:0 0 auto; padding:8px 11px; border:1px dashed rgba(255,255,255,.22); border-radius:8px; color:rgba(255,255,255,.72); background:transparent; cursor:pointer; font:700 11px Montserrat,sans-serif; }
+        .access-new-tab-btn:hover { color:#fff; background:rgba(255,255,255,.08); border-color:rgba(255,255,255,.42); }
         .access-topbar { display:flex; align-items:center; gap:10px; flex-wrap:wrap; padding:12px 14px; border:1px solid rgba(255,255,255,.08); border-radius:14px; background:rgba(18,24,39,.9); box-shadow:0 8px 24px rgba(0,0,0,.35); }
         .access-user-select { min-width:220px; max-width:310px; padding:10px 12px; border-radius:9px; border:1px solid rgba(255,255,255,.12); color:#e6e9f2; background:rgba(255,255,255,.06); outline:none; font:600 12px Montserrat,sans-serif; }
         .access-urlbar { display:flex; flex:1 1 360px; min-width:240px; gap:7px; }
@@ -7060,7 +7073,7 @@
         .access-status { flex:0 0 auto; color:rgba(255,255,255,.55); font:500 11px Montserrat,sans-serif; }
         .access-stage { position:relative; flex:1; min-height:380px; display:flex; overflow:auto; border:1px solid rgba(255,255,255,.08); border-radius:14px; background:radial-gradient(1200px 600px at 20% 0%,rgba(74,144,217,.12),transparent 60%),linear-gradient(180deg,rgba(18,24,39,.95),rgba(10,14,24,.98)); box-shadow:inset 0 1px 0 rgba(255,255,255,.06),0 12px 36px rgba(0,0,0,.4); }
         .access-frame { position:relative; margin:auto; flex:none; line-height:0; overflow:hidden; border-radius:10px; box-shadow:0 18px 50px -14px rgba(0,0,0,.65),0 0 0 1px rgba(255,255,255,.08); }
-        .access-image { display:block; width:100%; height:100%; object-fit:fill; user-select:none; -webkit-user-drag:none; image-rendering:auto; outline:none; }
+        .access-image { display:block; width:100%; height:100%; object-fit:fill; user-select:none; -webkit-user-drag:none; image-rendering:auto; outline:none; cursor:crosshair; touch-action:none; }
         .access-placeholder { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:9px; color:rgba(255,255,255,.65); text-align:center; padding:24px; font:500 12px Montserrat,sans-serif; }
         .access-placeholder strong { color:#fff; font-size:15px; }
         .access-help { color:rgba(255,255,255,.46); font:500 10px Montserrat,sans-serif; letter-spacing:.02em; }
@@ -8111,6 +8124,14 @@
                 </div>
                 <div class="pcm-area-panel" id="pcm-access-area" style="display:none;">
                     <div class="access-layout">
+                        <div class="access-session-tabsbar" aria-label="Open Access sessions">
+                            <div id="access-session-tabs" class="access-session-tabs">
+                                <span class="access-session-empty">No Access sessions open</span>
+                            </div>
+                            <button id="access-new-tab-btn" class="access-new-tab-btn" type="button" title="Open another user profile in a separate Access tab">
+                                <span aria-hidden="true">＋</span> New Access tab
+                            </button>
+                        </div>
                         <div class="access-topbar">
                             <select id="access-user-select" class="access-user-select" aria-label="Select profile">
                                 <option value="">Select a user profile…</option>
@@ -17436,11 +17457,19 @@
          ======================================================= -->
     <script>
     (function(){
+        // Each Access tab is a separate server-side browser/profile owner.
+        // Only the selected tab's WebSocket is attached to the image surface;
+        // inactive tabs keep their SeleniumBase browser alive and can be
+        // selected again without relaunching or sharing any browser state.
+        const accessSessions = new Map();
         let accessWs = null;
-        let accessId = null;
+        let accessId = null; // selected Access tab id
         let accessUser = null;
         let accessBlobUrl = null;
         let accessDragging = false;
+        let accessPointerId = null;
+        let accessPressedButton = null;
+        let accessLastPointerPosition = {x:0, y:0};
         let accessHighlight = false;
         let accessHighlightTimer = 0;
         let accessManualClose = false;
@@ -17458,6 +17487,64 @@
             if (token) u.searchParams.set('token', token);
             return u.toString();
         };
+        function accessTabLabel(entry) {
+            const id = String((entry && entry.user_id) || 'Access');
+            return id.length > 22 ? '…' + id.slice(-21) : id;
+        }
+        function accessRenderTabs() {
+            const host = A('access-session-tabs');
+            if (!host) return;
+            host.textContent = '';
+            if (!accessSessions.size) {
+                const empty = document.createElement('span');
+                empty.className = 'access-session-empty';
+                empty.textContent = 'No Access sessions open';
+                host.appendChild(empty);
+                return;
+            }
+            accessSessions.forEach((entry, id) => {
+                const tab = document.createElement('button');
+                tab.type = 'button';
+                tab.className = 'access-session-tab' + (id === accessId ? ' active' : '');
+                tab.title = (entry.user_id || id) + ' · click to switch';
+                const state = document.createElement('span');
+                state.className = 'access-session-tab-state' + (entry.connected === false ? ' disconnected' : '');
+                state.title = entry.connected === false ? 'Browser disconnected' : 'Persistent browser active';
+                const label = document.createElement('span');
+                label.className = 'access-session-tab-label';
+                label.textContent = accessTabLabel(entry);
+                const close = document.createElement('span');
+                close.className = 'access-session-tab-close';
+                close.setAttribute('role', 'button');
+                close.setAttribute('aria-label', 'Release ' + (entry.user_id || id));
+                close.textContent = '×';
+                close.addEventListener('click', (event) => {
+                    event.stopPropagation();
+                    accessCloseSession(id);
+                });
+                tab.append(state, label, close);
+                tab.addEventListener('click', () => accessActivate(id));
+                host.appendChild(tab);
+            });
+        }
+        function accessUpsertSession(data) {
+            const id = String((data && (data.access_id || data.id)) || '').trim();
+            if (!id) return null;
+            const entry = accessSessions.get(id) || {access_id: id, ws: null, blobUrl: null};
+            if (data) Object.assign(entry, data);
+            accessSessions.set(id, entry);
+            accessRenderTabs();
+            return entry;
+        }
+        function accessSessionsForUser(userId) {
+            const uid = String(userId || '');
+            if (!uid) return null;
+            let match = null;
+            accessSessions.forEach(entry => {
+                if (!match && String(entry.user_id || '') === uid) match = entry;
+            });
+            return match;
+        }
         function accessShowArea(area) {
             const cm = A('pcm-cm-area'), ac = A('pcm-access-area');
             if (!cm || !ac) return;
@@ -17465,7 +17552,10 @@
             cm.style.display = isAccess ? 'none' : '';
             ac.style.display = isAccess ? '' : 'none';
             document.querySelectorAll('[data-pcm-area]').forEach(b => b.classList.toggle('active', b.dataset.pcmArea === (isAccess ? 'access' : 'cm')));
-            if (isAccess) accessLoadUsers();
+            if (isAccess) {
+                accessRenderTabs();
+                accessLoadUsers();
+            }
         }
         async function accessLoadUsers(selectUser) {
             const sel = A('access-user-select');
@@ -17474,18 +17564,173 @@
                 const r = await serverFetch('/api/access/users');
                 const j = await r.json();
                 if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
-                const profiles = j.profiles || [];
-                sel.innerHTML = '<option value="">Select a user profile…</option>' + profiles.map(p => {
+                const profiles = Array.isArray(j.profiles) ? j.profiles : [];
+                const serverSessionIds = new Set();
+                sel.textContent = '';
+                const placeholder = document.createElement('option');
+                placeholder.value = '';
+                placeholder.textContent = 'Select a user profile…';
+                sel.appendChild(placeholder);
+                profiles.forEach(p => {
                     const uid = String(p.user_id || '');
+                    if (!uid) return;
+                    if (p.access && p.access.access_id) {
+                        const sessionId = String(p.access.access_id);
+                        serverSessionIds.add(sessionId);
+                        accessUpsertSession({
+                            access_id: sessionId,
+                            user_id: uid,
+                            url: p.access.url || '',
+                            connected: p.access.connected !== false,
+                        });
+                    }
+                    const option = document.createElement('option');
+                    option.value = uid;
                     const tag = p.access && p.access.connected ? ' · Access active' : (p.public_connected ? ' · connected' : '');
-                    return '<option value="' + uid.replace(/"/g, '&quot;') + '">' + uid.replace(/</g, '&lt;') + tag + '</option>';
-                }).join('');
-                if (selectUser) {
-                    const exact = Array.from(sel.options).find(o => o.value === selectUser);
-                    const suffix = Array.from(sel.options).find(o => o.value.endsWith('_' + selectUser));
+                    option.textContent = uid + tag;
+                    sel.appendChild(option);
+                });
+                for (const [sessionId, entry] of accessSessions) {
+                    if (serverSessionIds.has(sessionId)) continue;
+                    if (sessionId === accessId) {
+                        accessDetachSocket();
+                        accessId = null;
+                        accessUser = null;
+                        accessResetSurface('Access session is no longer active');
+                    }
+                    if (entry.blobUrl) {
+                        try { URL.revokeObjectURL(entry.blobUrl); } catch (_) {}
+                    }
+                    accessSessions.delete(sessionId);
+                }
+                const wantedUser = selectUser || ((accessSessions.get(accessId) || {}).user_id || '');
+                if (wantedUser) {
+                    const exact = Array.from(sel.options).find(o => o.value === wantedUser);
+                    const suffix = Array.from(sel.options).find(o => o.value.endsWith('_' + wantedUser));
                     if (exact) sel.value = exact.value; else if (suffix) sel.value = suffix.value;
                 }
+                accessRenderTabs();
             } catch (e) { accessStatus('Could not load profiles: ' + (e.message || e), true); }
+        }
+        function accessDomButton(value) {
+            const button = Number(value);
+            return Number.isFinite(button) && button >= 0 && button <= 2 ? Math.trunc(button) : 0;
+        }
+        function accessImageContains(target) {
+            const img = A('access-image');
+            return !!(img && target && (target === img || img.contains(target)));
+        }
+        function accessPointerMove(event) {
+            const img = A('access-image');
+            if (!img) return;
+            const overImage = accessImageContains(event.target);
+            const active = accessPointerId !== null;
+            if (!active && !overImage) return;
+            if (active && event.pointerId !== accessPointerId) return;
+            const p = accessPosition(event);
+            accessLastPointerPosition = p;
+            accessSend({type:'mousemove', x:p.x, y:p.y});
+            // Highlight follows ordinary hover movement. It is deliberately
+            // independent of pointerdown, so starting a drag never becomes a
+            // prerequisite for seeing the element under the pointer.
+            if (accessHighlight && (overImage || active) && Date.now() - accessHighlightTimer > 100) {
+                accessHighlightTimer = Date.now();
+                accessSend({type:'highlight', x:p.x, y:p.y});
+            }
+            if (active && event.cancelable) event.preventDefault();
+        }
+        function accessReleasePointer(sendRemote, event) {
+            const pointerId = accessPointerId;
+            const button = accessPressedButton;
+            if (pointerId === null && button === null) {
+                accessDragging = false;
+                return;
+            }
+            // Clear state before releasing capture: lostpointercapture can be
+            // emitted synchronously and must not send a duplicate mouseup.
+            accessPointerId = null;
+            accessPressedButton = null;
+            accessDragging = false;
+            const img = A('access-image');
+            if (img && pointerId !== null) {
+                try {
+                    if (img.hasPointerCapture && img.hasPointerCapture(pointerId)) img.releasePointerCapture(pointerId);
+                } catch (_) {}
+            }
+            if (sendRemote && button !== null) {
+                const p = event && Number.isFinite(event.clientX) ? accessPosition(event) : accessLastPointerPosition;
+                accessSend({type:'mouseup', x:p.x, y:p.y, button});
+            }
+        }
+        function accessPointerDown(event) {
+            if (event.pointerType === 'mouse' && ![0,1,2].includes(event.button)) return;
+            if (accessPointerId !== null) accessReleasePointer(true, event);
+            const img = A('access-image');
+            if (!img) return;
+            const button = accessDomButton(event.button);
+            const p = accessPosition(event);
+            accessPointerId = event.pointerId;
+            accessPressedButton = button;
+            accessLastPointerPosition = p;
+            accessDragging = true;
+            try { img.focus({preventScroll:true}); } catch (_) { try { img.focus(); } catch (__) {} }
+            try { if (img.setPointerCapture) img.setPointerCapture(event.pointerId); } catch (_) {}
+            accessSend({type:'mousedown', x:p.x, y:p.y, button});
+            if (event.cancelable) event.preventDefault();
+        }
+        function accessPointerUp(event) {
+            if (accessPointerId === null || (event.pointerId != null && event.pointerId !== accessPointerId)) return;
+            accessReleasePointer(true, event);
+            if (event.cancelable) event.preventDefault();
+        }
+        function accessPointerCancel(event) {
+            if (accessPointerId !== null && event.pointerId != null && event.pointerId !== accessPointerId) return;
+            accessReleasePointer(true, event);
+            if (event.cancelable) event.preventDefault();
+        }
+        function accessDetachSocket() {
+            // Send the final mouseup before detaching where possible. The
+            // backend also releases buttons during websocket cleanup, which
+            // covers network loss or a pointer that left the browser viewport.
+            accessReleasePointer(true);
+            const current = accessSessions.get(accessId);
+            if (current) current.ws = null;
+            if (accessWs) {
+                try { accessWs.onclose = null; accessWs.close(); } catch (_) {}
+            }
+            accessWs = null;
+            if (current && current.blobUrl) {
+                try { URL.revokeObjectURL(current.blobUrl); } catch (_) {}
+                current.blobUrl = null;
+            }
+            accessBlobUrl = null;
+            accessDragging = false;
+        }
+        function accessActivate(id) {
+            const key = String(id || '').trim();
+            const entry = accessSessions.get(key);
+            if (!entry) return;
+            if (accessId !== key) accessDetachSocket();
+            accessId = key;
+            accessUser = entry.user_id || key;
+            const select = A('access-user-select');
+            if (select && accessUser) {
+                const option = Array.from(select.options).find(o => o.value === accessUser);
+                if (option) select.value = option.value;
+            }
+            const input = A('access-url-input');
+            if (input) input.value = entry.url || 'https://www.google.com';
+            const frame = A('access-frame'), ph = A('access-placeholder');
+            if (frame) frame.style.display = 'none';
+            if (ph) ph.style.display = 'flex';
+            accessManualClose = false;
+            accessRenderTabs();
+            if (!accessWs || accessWs.readyState !== WebSocket.OPEN) {
+                accessStatus('Connecting to ' + accessUser + '…');
+                accessOpenSocket();
+            } else {
+                accessStatus('Live Access · ' + accessUser);
+            }
         }
         function accessSend(payload) {
             if (accessWs && accessWs.readyState === WebSocket.OPEN) {
@@ -17493,100 +17738,262 @@
             }
             return false;
         }
-        function accessRender(data) {
+        function accessQueueNavigate(url) {
+            const entry = accessSessions.get(accessId);
+            if (!entry || !url) return false;
+            entry.pendingNavigate = url;
+            if (accessSend({type:'navigate', url})) {
+                delete entry.pendingNavigate;
+                return true;
+            }
+            if (!accessWs || accessWs.readyState === WebSocket.CLOSED || accessWs.readyState === WebSocket.CLOSING) {
+                accessOpenSocket();
+            }
+            return false;
+        }
+        function accessRender(data, forId) {
+            const id = String(forId || accessId || '').trim();
+            if (!id || id !== accessId) return;
+            const entry = accessSessions.get(id);
             const frame = A('access-frame'), img = A('access-image'), ph = A('access-placeholder');
             if (!frame || !img) return;
-            if (accessBlobUrl) { try { URL.revokeObjectURL(accessBlobUrl); } catch (_) {} }
-            const head = new Uint8Array(data.slice ? data.slice(0,4) : data);
-            const mime = head[0] === 0x89 && head[1] === 0x50 ? 'image/png' : 'image/jpeg';
-            accessBlobUrl = URL.createObjectURL(new Blob([data], {type:mime}));
+            if (entry && entry.blobUrl) { try { URL.revokeObjectURL(entry.blobUrl); } catch (_) {} }
+            // Access emits only lossless PNG screencast frames; keep the
+            // browser-facing blob in that format without recompression.
+            const blobUrl = URL.createObjectURL(new Blob([data], {type:'image/png'}));
+            if (entry) entry.blobUrl = blobUrl;
+            accessBlobUrl = blobUrl;
             img.onload = () => {
+                if (id !== accessId) return;
                 const w = img.naturalWidth || 1280, h = img.naturalHeight || 800;
                 frame.style.width = w + 'px'; frame.style.height = h + 'px';
                 frame.style.display = 'block'; if (ph) ph.style.display = 'none';
             };
-            img.src = accessBlobUrl;
+            img.src = blobUrl;
         }
         function accessPosition(ev) {
             const img = A('access-image'), r = img && img.getBoundingClientRect();
-            if (!r) return {x:0,y:0};
-            const sx = (img.naturalWidth || r.width) / r.width;
-            const sy = (img.naturalHeight || r.height) / r.height;
-            return {x: Math.max(0, (ev.clientX-r.left)*sx), y: Math.max(0, (ev.clientY-r.top)*sy)};
+            if (!r || !r.width || !r.height) return {x:0,y:0};
+            const width = img.naturalWidth || r.width;
+            const height = img.naturalHeight || r.height;
+            const sx = width / r.width;
+            const sy = height / r.height;
+            const x = Number(ev && ev.clientX);
+            const y = Number(ev && ev.clientY);
+            const cssX = Math.max(0, Math.min(r.width, (Number.isFinite(x) ? x : r.left) - r.left));
+            const cssY = Math.max(0, Math.min(r.height, (Number.isFinite(y) ? y : r.top) - r.top));
+            return {x: cssX * sx, y: cssY * sy};
         }
         function accessOpenSocket() {
-            if (!accessId) return;
+            const sessionId = String(accessId || '').trim();
+            const entry = accessSessions.get(sessionId);
+            if (!sessionId || !entry) return;
             if (accessWs) { try { accessWs.onclose = null; accessWs.close(); } catch (_) {} }
-            accessWs = new WebSocket(accessWsUrl(accessId));
-            accessWs.binaryType = 'arraybuffer';
-            accessWs.onopen = () => { accessStatus('Live Access · ' + accessUser); accessSend({type:'get_info'}); };
-            accessWs.onclose = () => { if (!accessManualClose) accessStatus('Access browser disconnected', true); };
-            accessWs.onerror = () => accessStatus('Access WebSocket error', true);
-            accessWs.onmessage = (ev) => {
-                if (ev.data instanceof ArrayBuffer) { accessRender(ev.data); return; }
+            const socket = new WebSocket(accessWsUrl(sessionId));
+            socket.binaryType = 'arraybuffer';
+            accessWs = socket;
+            entry.ws = socket;
+            socket.onopen = () => {
+                if (socket !== accessWs || accessId !== sessionId) return;
+                entry.connected = true;
+                accessRenderTabs();
+                accessStatus('Live Access · ' + (entry.user_id || sessionId));
+                try {
+                    if (entry.pendingNavigate) {
+                        const pending = entry.pendingNavigate;
+                        delete entry.pendingNavigate;
+                        socket.send(JSON.stringify({type:'navigate', url:pending}));
+                    }
+                    socket.send(JSON.stringify({type:'get_info'}));
+                } catch (_) {}
+            };
+            socket.onclose = () => {
+                entry.ws = null;
+                if (socket !== accessWs || accessId !== sessionId) return;
+                accessReleasePointer(false);
+                accessWs = null;
+                accessRenderTabs();
+                if (!accessManualClose) accessStatus('Access browser disconnected', true);
+            };
+            socket.onerror = () => {
+                if (socket === accessWs && accessId === sessionId) accessStatus('Access WebSocket error', true);
+            };
+            socket.onmessage = (ev) => {
+                if (socket !== accessWs || accessId !== sessionId) return;
+                if (ev.data instanceof ArrayBuffer) { accessRender(ev.data, sessionId); return; }
                 try {
                     const m = JSON.parse(ev.data);
                     if (m.type === 'access_ready' || m.type === 'access_info' || m.type === 'access_navigated') {
-                        if (m.url && A('access-url-input')) A('access-url-input').value = m.url;
-                        accessStatus('Live Access · ' + (accessUser || 'profile'));
+                        if (m.url) {
+                            entry.url = m.url;
+                            if (A('access-url-input')) A('access-url-input').value = m.url;
+                        }
+                        accessRenderTabs();
+                        accessStatus('Live Access · ' + (entry.user_id || 'profile'));
                     } else if (m.type === 'access_replaced') {
-                        accessStatus('Access tab was replaced by another tab', true);
+                        const wasActive = accessId === sessionId;
+                        if (wasActive) {
+                            accessManualClose = true;
+                            accessDetachSocket();
+                            accessId = null;
+                            accessUser = null;
+                        }
+                        accessSessions.delete(sessionId);
+                        accessRenderTabs();
+                        if (wasActive) accessResetSurface('Access tab was replaced by another tab', true);
                     } else if (m.type === 'clipboard_text') {
                         if (m.available && navigator.clipboard && navigator.clipboard.writeText) {
                             navigator.clipboard.writeText(m.text || '').then(() => accessStatus('Copied remote text to local clipboard')).catch(() => accessStatus('Remote text ready; clipboard permission denied', true));
                         } else accessStatus('Remote page denied clipboard read', true);
-                    } else if (m.type === 'heartbeat') accessSend({type:'heartbeat'});
+                    } else if (m.type === 'heartbeat') {
+                        try { socket.send(JSON.stringify({type:'heartbeat'})); } catch (_) {}
+                    }
                 } catch (_) {}
             };
         }
+        function accessResetSurface(message, error) {
+            accessReleasePointer(false);
+            const frame = A('access-frame'), ph = A('access-placeholder'), sel = A('access-user-select');
+            if (frame) frame.style.display = 'none';
+            if (ph) ph.style.display = 'flex';
+            if (sel) sel.value = '';
+            accessDragging = false;
+            accessStatus(message || 'Choose a profile to start Access', error);
+        }
         async function accessOpen(userId) {
             const sel = A('access-user-select');
-            const uid = userId || (sel && sel.value);
+            const uid = String(userId || (sel && sel.value) || '').trim();
             if (!uid) { accessStatus('Select a user profile first', true); return; }
             const url = (A('access-url-input') && A('access-url-input').value.trim()) || 'https://www.google.com';
+            // Opening a profile that already has a local Access tab switches
+            // to it instead of trying to take the same persistent directory
+            // twice. The browser remains alive; only the viewer changes.
+            let existing = null;
+            accessSessions.forEach(entry => {
+                if (!existing && entry.user_id === uid) existing = entry;
+            });
+            if (existing) {
+                accessActivate(existing.access_id);
+                if (url && url !== existing.url) {
+                    existing.url = url;
+                    accessQueueNavigate(url);
+                    accessStatus('Navigating ' + existing.user_id + '…');
+                }
+                return;
+            }
             accessStatus('Releasing client and opening persistent profile…');
             try {
-                const r = await serverFetch('/api/access/open', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({user_id:uid, url, access_id:accessId || undefined})});
+                // No access_id is supplied for a new tab. The server assigns
+                // a unique id, so other profile tabs stay independent.
+                const r = await serverFetch('/api/access/open', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({user_id:uid, url})});
                 const j = await r.json(); if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status));
-                accessId = j.access_id; accessUser = j.user_id;
+                const entry = accessUpsertSession({
+                    access_id: j.access_id,
+                    user_id: j.user_id,
+                    url: j.url || url,
+                    connected: true,
+                });
                 if (sel) {
-                    const opt = Array.from(sel.options).find(o => o.value === accessUser) || Array.from(sel.options).find(o => o.value.endsWith('_' + accessUser));
+                    const opt = Array.from(sel.options).find(o => o.value === entry.user_id) || Array.from(sel.options).find(o => o.value.endsWith('_' + entry.user_id));
                     if (opt) sel.value = opt.value;
                 }
-                accessManualClose = false; accessOpenSocket();
+                accessManualClose = false;
+                accessRenderTabs();
+                accessActivate(entry.access_id);
             } catch (e) { accessStatus('Access launch failed: ' + (e.message || e), true); }
         }
         async function accessGo() {
+            const select = A('access-user-select');
+            if (select && select.value && select.value !== accessUser) return accessOpen(select.value);
             if (!accessId) return accessOpen();
             const url = (A('access-url-input') && A('access-url-input').value.trim());
             if (!url) return;
-            accessSend({type:'navigate', url});
-            accessStatus('Navigating…');
+            const entry = accessSessions.get(accessId);
+            if (entry) entry.url = url;
+            if (accessQueueNavigate(url)) accessStatus('Navigating…');
+            else accessStatus('Access tab is disconnected — reconnecting…', true);
+        }
+        async function accessCloseSession(id) {
+            const sessionId = String(id || '').trim();
+            if (!sessionId) return;
+            const wasActive = accessId === sessionId;
+            if (wasActive) {
+                accessManualClose = true;
+                accessDetachSocket();
+            }
+            try {
+                await serverFetch('/api/access/close', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({access_id:sessionId})});
+            } catch (_) {}
+            const closedEntry = accessSessions.get(sessionId);
+            if (closedEntry && closedEntry.blobUrl) {
+                try { URL.revokeObjectURL(closedEntry.blobUrl); } catch (_) {}
+                closedEntry.blobUrl = null;
+            }
+            accessSessions.delete(sessionId);
+            if (wasActive) {
+                accessId = null; accessUser = null;
+                const next = accessSessions.values().next().value;
+                if (next) accessActivate(next.access_id);
+                else accessResetSurface();
+            }
+            accessRenderTabs();
         }
         async function accessClose() {
+            await accessCloseSession(accessId);
+        }
+        function accessNewTab() {
             accessManualClose = true;
-            if (accessWs) { try { accessWs.onclose = null; accessWs.close(); } catch (_) {} accessWs = null; }
-            if (accessId) { try { await serverFetch('/api/access/close', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({access_id:accessId})}); } catch (_) {} }
+            accessDetachSocket();
             accessId = null; accessUser = null;
-            const frame = A('access-frame'), ph = A('access-placeholder');
-            if (frame) frame.style.display = 'none'; if (ph) ph.style.display = 'flex';
-            accessStatus('Choose a profile to start Access');
+            const input = A('access-url-input');
+            if (input) input.value = 'https://www.google.com';
+            accessResetSurface('Choose a profile to open a new Access tab');
+            accessRenderTabs();
+            const sel = A('access-user-select');
+            if (sel) sel.focus();
         }
         function accessWire() {
             document.querySelectorAll('[data-pcm-area]').forEach(btn => { if (!btn._accessWired) { btn._accessWired = true; btn.addEventListener('click', () => accessShowArea(btn.dataset.pcmArea)); } });
-            const open = A('access-open-btn'), go = A('access-go-btn'), close = A('access-close-btn'), inp = A('access-url-input'), sel = A('access-user-select');
+            const open = A('access-open-btn'), go = A('access-go-btn'), close = A('access-close-btn'), fresh = A('access-new-tab-btn'), inp = A('access-url-input'), sel = A('access-user-select');
             if (open && !open._wired) { open._wired = true; open.addEventListener('click', () => accessOpen()); }
             if (go && !go._wired) { go._wired = true; go.addEventListener('click', accessGo); }
             if (close && !close._wired) { close._wired = true; close.addEventListener('click', accessClose); }
+            if (fresh && !fresh._wired) { fresh._wired = true; fresh.addEventListener('click', accessNewTab); }
             if (inp && !inp._wired) { inp._wired = true; inp.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); accessGo(); } }); }
-            if (sel && !sel._wired) { sel._wired = true; sel.addEventListener('change', () => { if (sel.value) accessStatus('Ready to open ' + sel.value); }); }
+            if (sel && !sel._wired) { sel._wired = true; sel.addEventListener('change', () => {
+                const selected = accessSessionsForUser(sel.value);
+                if (selected) {
+                    accessActivate(selected.access_id);
+                    accessStatus('Selected Access tab · ' + (selected.user_id || sel.value));
+                } else if (sel.value) {
+                    accessStatus('Ready to open ' + sel.value);
+                }
+            }); }
             const high = A('access-highlight-btn');
             if (high && !high._wired) { high._wired = true; high.addEventListener('click', () => { accessHighlight = !accessHighlight; high.classList.toggle('active', accessHighlight); }); }
             const img = A('access-image');
             if (!img || img._wired) return;
-            img._wired = true; img.addEventListener('mousedown', e => { accessDragging = true; img.focus(); const p=accessPosition(e); accessSend({type:'mousedown',x:p.x,y:p.y,button:e.button||0}); e.preventDefault(); });
-            img.addEventListener('mousemove', e => { const p=accessPosition(e); accessSend({type:'mousemove',x:p.x,y:p.y}); if (accessHighlight && Date.now()-accessHighlightTimer>100) { accessHighlightTimer=Date.now(); accessSend({type:'highlight',x:p.x,y:p.y}); } });
-            img.addEventListener('mouseup', e => { accessDragging = false; const p=accessPosition(e); accessSend({type:'mouseup',x:p.x,y:p.y,button:e.button||0}); e.preventDefault(); });
+            img._wired = true;
+            img.addEventListener('pointerdown', accessPointerDown, {passive:false});
+            img.addEventListener('pointermove', accessPointerMove, {passive:false});
+            img.addEventListener('pointerup', accessPointerUp, {passive:false});
+            img.addEventListener('pointercancel', accessPointerCancel, {passive:false});
+            img.addEventListener('lostpointercapture', accessPointerCancel, {passive:false});
+            // A document fallback catches release outside the image when a
+            // browser declines pointer capture (and also handles viewport
+            // boundaries during a held drag). Do not duplicate events that
+            // already bubbled from the image.
+            document.addEventListener('pointermove', event => {
+                if (!accessImageContains(event.target)) accessPointerMove(event);
+            }, {passive:false});
+            document.addEventListener('pointerup', accessPointerUp, {passive:false});
+            document.addEventListener('pointercancel', accessPointerCancel, {passive:false});
+            window.addEventListener('blur', () => accessReleasePointer(true));
+            window.addEventListener('pagehide', () => accessReleasePointer(true));
+            document.addEventListener('visibilitychange', () => {
+                if (document.visibilityState === 'hidden') accessReleasePointer(true);
+            });
+            img.addEventListener('contextmenu', e => e.preventDefault());
             img.addEventListener('wheel', e => { const p=accessPosition(e); accessSend({type:'wheel',x:p.x,y:p.y,deltaX:e.deltaX,deltaY:e.deltaY}); e.preventDefault(); }, {passive:false});
             img.addEventListener('keydown', e => {
                 const mods=[]; if(e.ctrlKey)mods.push('Control'); if(e.shiftKey)mods.push('Shift'); if(e.altKey)mods.push('Alt'); if(e.metaKey)mods.push('Meta');
