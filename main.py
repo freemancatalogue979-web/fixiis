@@ -134,7 +134,7 @@ for mod in ["httpx", "httpcore", "uvicorn", "uvicorn.access", "uvicorn.error",
             "asyncio", "websockets", "playwright",
             "api", "cdp_screencast_stream", "session", "session_manager",
             "browser_manager", "dom_capture", "telegram_bot", "memory_manager",
-            "gpu_manager", "pcm_manager", "webrtc_stream", "frame_crop",
+            "gpu_manager", "pcm_manager", "webrtc_stream",
             "lpv_store", "archiver", "aioice_patch"]:
     logging.getLogger(mod).setLevel(_LOG_LEVEL)
 

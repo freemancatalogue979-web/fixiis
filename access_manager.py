@@ -446,7 +446,7 @@ class AccessSession:
             )
             await cdp.send("Page.startScreencast", {
                 "format": "jpeg",
-                "quality": 75,
+                "quality": 100,
                 "maxWidth": self._cast_width,
                 "maxHeight": self._cast_height,
                 "everyNthFrame": 1,

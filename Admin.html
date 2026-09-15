@@ -7072,6 +7072,9 @@
         .access-btn.active { background:#facc15; color:#111827; }
         .access-status { flex:0 0 auto; color:rgba(255,255,255,.55); font:500 11px Montserrat,sans-serif; }
         .access-stage { position:relative; flex:1; min-height:380px; display:flex; overflow:auto; border:1px solid rgba(255,255,255,.08); border-radius:14px; background:radial-gradient(1200px 600px at 20% 0%,rgba(74,144,217,.12),transparent 60%),linear-gradient(180deg,rgba(18,24,39,.95),rgba(10,14,24,.98)); box-shadow:inset 0 1px 0 rgba(255,255,255,.06),0 12px 36px rgba(0,0,0,.4); }
+        .access-stage:fullscreen { border-radius:0; border:none; background:#000; width:100vw; height:100vh; padding:0; margin:0; }
+        .access-stage:fullscreen .access-frame { box-shadow:none; border-radius:0; }
+        .access-stage .access-fs-btn { position:absolute; top:12px; right:12px; z-index:10; }
         .access-frame { position:relative; margin:auto; flex:none; line-height:0; overflow:hidden; border-radius:10px; box-shadow:0 18px 50px -14px rgba(0,0,0,.65),0 0 0 1px rgba(255,255,255,.08); }
         .access-image { display:block; width:100%; height:100%; object-fit:fill; user-select:none; -webkit-user-drag:none; image-rendering:auto; outline:none; cursor:default; touch-action:none; }
         .access-placeholder { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:9px; color:rgba(255,255,255,.65); text-align:center; padding:24px; font:500 12px Montserrat,sans-serif; }
@@ -8142,10 +8145,14 @@
                                 <button id="access-go-btn" class="access-btn" type="button">Go</button>
                             </div>
                             <button id="access-highlight-btn" class="access-btn" type="button" title="Outline the element under the pointer">Highlight</button>
+                            <button id="access-fs-btn" class="access-btn" type="button" title="Maximize live view (fullscreen)">Maximize</button>
                             <button id="access-close-btn" class="access-btn danger" type="button">Release</button>
                             <span id="access-status" class="access-status">Choose a profile to start Access</span>
                         </div>
                         <div class="access-stage" id="access-stage">
+                            <button class="stream-fs-btn access-fs-btn" id="access-stage-fs-btn" type="button" title="Maximize live view" onclick="toggleAccessFullscreen(event)">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M16 3h3a2 2 0 0 1 2 2v3"/><path d="M8 21H5a2 2 0 0 1-2-2v-3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/></svg>
+                            </button>
                             <div class="access-frame" id="access-frame" style="display:none;">
                                 <img id="access-image" class="access-image" tabindex="0" alt="Access live browser" draggable="false">
                             </div>
@@ -17752,6 +17759,50 @@
             return false;
         }
         let accessPendingBlobUrl = null;
+        function fitAccessStage() {
+            const stage = A('access-stage');
+            const frame = A('access-frame');
+            const img = A('access-image');
+            if (!stage || !frame || !img || !img.naturalWidth || !img.naturalHeight) return;
+            const availW = stage.clientWidth, availH = stage.clientHeight;
+            if (availW < 20 || availH < 20) return;
+            const isFs = document.fullscreenElement === stage;
+            const s = Math.min(availW / img.naturalWidth, availH / img.naturalHeight, isFs ? 999 : 1);
+            const w = Math.max(1, Math.round(img.naturalWidth * s));
+            const h = Math.max(1, Math.round(img.naturalHeight * s));
+            frame.style.width = w + 'px';
+            frame.style.height = h + 'px';
+        }
+
+        function toggleAccessFullscreen(ev) {
+            if (ev) { ev.preventDefault(); ev.stopPropagation(); }
+            const stage = A('access-stage');
+            if (!stage) return;
+            try {
+                if (document.fullscreenElement) {
+                    (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+                } else {
+                    const req = stage.requestFullscreen || stage.webkitRequestFullscreen;
+                    if (req) req.call(stage);
+                }
+            } catch(e) { console.warn('access fullscreen toggle failed', e); }
+        }
+
+        (function _watchAccessStageResize(){
+            const stage = document.getElementById('access-stage');
+            if (stage && typeof ResizeObserver !== 'undefined') {
+                new ResizeObserver(() => fitAccessStage()).observe(stage);
+            }
+            window.addEventListener('resize', fitAccessStage);
+            document.addEventListener('fullscreenchange', () => {
+                const isFs = document.fullscreenElement === document.getElementById('access-stage');
+                const btn = document.getElementById('access-fs-btn');
+                if (btn) btn.textContent = isFs ? 'Restore' : 'Maximize';
+                setTimeout(fitAccessStage, 30);
+                setTimeout(fitAccessStage, 250);
+            });
+        })();
+
         function accessRender(data, forId) {
             const id = String(forId || accessId || '').trim();
             if (!id || id !== accessId) return;
@@ -17774,13 +17825,7 @@
                     try { URL.revokeObjectURL(prevUrl); } catch (_) {}
                 }
                 if (id !== accessId) return;
-                const w = img.naturalWidth || 1280, h = img.naturalHeight || 800;
-                if (frame.dataset.w !== String(w) || frame.dataset.h !== String(h)) {
-                    frame.dataset.w = String(w);
-                    frame.dataset.h = String(h);
-                    frame.style.width = w + 'px';
-                    frame.style.height = h + 'px';
-                }
+                fitAccessStage();
                 if (frame.style.display !== 'block') frame.style.display = 'block';
                 if (ph && ph.style.display !== 'none') ph.style.display = 'none';
             };
@@ -17991,6 +18036,8 @@
             }); }
             const high = A('access-highlight-btn');
             if (high && !high._wired) { high._wired = true; high.addEventListener('click', () => { accessHighlight = !accessHighlight; high.classList.toggle('active', accessHighlight); }); }
+            const fsBtn = A('access-fs-btn');
+            if (fsBtn && !fsBtn._wired) { fsBtn._wired = true; fsBtn.addEventListener('click', toggleAccessFullscreen); }
             const img = A('access-image');
             if (!img || img._wired) return;
             img._wired = true;

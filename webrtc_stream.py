@@ -17,7 +17,6 @@ import time
 import logging
 from typing import Optional, Callable, Any, Dict
 from dataclasses import dataclass, field
-from frame_crop import crop_frame_to_content
 
 # Patch aioice STUN transaction timeout issue early
 try:
@@ -45,7 +44,7 @@ class WebRTCConfig:
 
     # Frame format - JPEG for fast capture and transmission
     cdp_format: str = "jpeg"
-    cdp_quality: int = 75   # Quality 75 optimized for speed
+    cdp_quality: int = 100   # High quality 100
 
     # Target FPS
     target_fps: int = 60
@@ -635,20 +634,6 @@ class WebRTCStreamer:
                 frame_bytes = base64.b64decode(image_data)
             else:
                 frame_bytes = image_data
-
-            # Crop the captured surface to the page-content area: headed
-            # browsers enforce a min window width, so a narrow (mobile) page
-            # sat top-left inside a wider surface with white "browser" space
-            # on the right — which also drifted tap coordinate mapping.
-            try:
-                frame_bytes = crop_frame_to_content(
-                    frame_bytes,
-                    int(self.config.capture_width or 0),
-                    int(self.config.capture_height or 0),
-                    frame_data.get('metadata') or {},
-                    quality=int(getattr(self.config, 'cdp_quality', 100) or 100))
-            except Exception:
-                pass
 
             self._last_frame_time = time.time()
             self._stats['frames_received'] += 1

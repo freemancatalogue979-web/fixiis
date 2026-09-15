@@ -27,7 +27,7 @@ class UltraConfig:
     # Performance
     target_fps: int = 60  # 60 FPS for maximum performance
     frame_interval: float = 0.01667  # 60 FPS (1/60)
-    quality: int = 75  # Speed-optimized JPEG quality
+    quality: int = 100  # High quality
     bitrate: int = 10000  # 50 Mbps - maximum quality
     keyframe_interval: int = 30
 
@@ -300,7 +300,7 @@ class UltraConfig:
             self.target_fps = 60
 
         if not 10 <= self.quality <= 100:
-            self.quality = 75
+            self.quality = 100
 
         if not 0.1 <= self.min_scale <= 1.0:
             self.min_scale = 0.5

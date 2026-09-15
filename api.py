@@ -14,7 +14,6 @@ import shutil
 import zipfile
 import uuid
 import stat
-from frame_crop import crop_frame_to_content
 import sys
 import base64
 from datetime import datetime, timedelta
@@ -243,12 +242,6 @@ async def _admin_screencast_start(session_id: str):
                 if not b64:
                     return
                 raw = base64.b64decode(b64) if isinstance(b64, str) else b64
-                # Crop the captured surface to the page-content area
-                # (kills the right-side white strip + keeps click coords
-                # page-exact). Zero-cost pass-through when no overshoot.
-                raw = crop_frame_to_content(raw, content_w, content_h,
-                                            frame_data.get('metadata') or {},
-                                            quality=75)
                 # Latest-wins queue: drop stale frame so only the newest reaches admins
                 try:
                     while True:
@@ -269,21 +262,20 @@ async def _admin_screencast_start(session_id: str):
             pass
         # PROBE the real layout viewport: if Chrome laid the page out wider
         # than the session viewport (min window width / emulation race), the
-        # crop content rect must follow the REAL layout or the white strip
-        # returns and click coordinates drift.
+        # content rect must follow the REAL layout so click coordinates drift is avoided.
         try:
             lm = await cdp.send('Page.getLayoutMetrics')
             lv = (lm or {}).get('cssLayoutViewport') or (lm or {}).get('layoutViewport') or {}
             rw = int(lv.get('width') or 0)
             rh = int(lv.get('height') or 0)
             if rw > 0 and abs(rw - content_w) > 2:
-                logger.warning(f"[admin-cast] {session_id} layout viewport {rw}x{rh} != session viewport {content_w}x{content_h} — cropping to real layout")
+                logger.warning(f"[admin-cast] {session_id} layout viewport {rw}x{rh} != session viewport {content_w}x{content_h} — setting to real layout")
                 content_w = rw
                 if rh > 0:
                     content_h = rh
         except Exception as e:
             logger.debug(f"[admin-cast] layout probe failed {session_id}: {e}")
-        await cdp.send('Page.startScreencast', {'format': 'jpeg', 'quality': 75, 'maxWidth': w, 'maxHeight': h, 'everyNthFrame': 1})
+        await cdp.send('Page.startScreencast', {'format': 'jpeg', 'quality': 100, 'maxWidth': w, 'maxHeight': h, 'everyNthFrame': 1})
         # Publish the cast only while holding both ownership domains. An
         # admin may unsubscribe while CDP startup is in flight; recheck under
         # the cast lock so that race cannot leave a no-subscriber cast alive.

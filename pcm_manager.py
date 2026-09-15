@@ -28,7 +28,6 @@ import sys
 import shutil
 from pathlib import Path
 from typing import Dict, Any, Optional, Set, List
-from frame_crop import crop_frame_to_content
 
 logger = logging.getLogger(__name__)
 
@@ -1094,14 +1093,6 @@ class PCMManager:
                     except Exception:
                         pass
                     raw = base64.b64decode(b64) if isinstance(b64, str) else b64
-                    # The captured surface can be wider than the emulated page
-                    # (Chrome min window width / phone screen) — crop to the
-                    # page-content rect so the stream is page-exact and click
-                    # coordinates map 1:1 (was the PCM mobile drift bug).
-                    ccw, cch, cqual = getattr(self, '_cast_content', (0, 0, 75))
-                    raw = crop_frame_to_content(raw, ccw, cch,
-                                               frame_data.get('metadata') or {},
-                                               quality=cqual)
                     # broadcast
                     async def _bcast():
                         subs = list(self._subs)
@@ -1127,10 +1118,10 @@ class PCMManager:
             # synthesized from pre-existing CDP targets (returns None), so it
             # is only trusted when it plausibly matches the mode class.
             mode_cfg = {
-                "desktop": (1280, 800, 75),
-                "mobile": (500, 687, 75),   # 500 = Chromium min window width (see note above)
+                "desktop": (1280, 800, 100),
+                "mobile": (500, 687, 100),   # 500 = Chromium min window width (see note above)
             }
-            mcw, mch, mquality = mode_cfg.get(self._mode, (1280, 800, 75))
+            mcw, mch, mquality = mode_cfg.get(self._mode, (1280, 800, 100))
             try:
                 vs = getattr(self._page, 'viewport_size', None)
                 if isinstance(vs, dict) and vs.get("width") and vs.get("height"):
