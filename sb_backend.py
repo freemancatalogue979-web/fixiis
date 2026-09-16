@@ -1644,6 +1644,8 @@ class SBHandle:
         args = [
             "--remote-allow-origins=*",
             "--force-device-scale-factor=1",
+            "--password-store=basic",
+            "--enable-features=PasswordManager,CredentialManager",
         ]
         if sys.platform.startswith("linux"):
             args.append("--disable-dev-shm-usage")

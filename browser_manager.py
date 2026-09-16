@@ -980,6 +980,14 @@ class StealthBrowserConfig:
                 '--disable-dev-shm-usage',
             ])
 
+        # Password management and credential persistence (basic store on Linux so
+        # passwords and credentials save directly into the profile's Login Data DB
+        # without requiring a desktop GNOME Keyring / KWallet daemon)
+        base_flags.extend([
+            '--password-store=basic',
+            '--enable-features=PasswordManager,CredentialManager',
+        ])
+
         # Hide the CDP automation marker (navigator.webdriver). This is the one
         # anti-automation flag a "real" browser cannot have while CDP is attached.
         base_flags.extend([
@@ -2844,20 +2852,25 @@ class BrowserManager:
         return self.profile_manager.profile_exists(user_id)
 
     def get_session_profile_path(self, user_id: str, session_id: str) -> Path:
-        """Return an isolated live Chrome user-data directory.
-
-        The stable parent profile is used for metadata, fingerprints and the
-        serialized cookie store only.  Chrome never runs against that directory
-        directly: every runtime session gets a private user-data-dir derived
-        from both parent and runtime ids.
+        """Return a persistent user Chrome user-data directory for durable sessions,
+        or an isolated runtime directory for anonymous sessions.
         """
-        parent_id = str(user_id or 'anonymous')
-        runtime_id = str(session_id or 'runtime')
-        parent_key = hashlib.sha256(parent_id.encode('utf-8', 'replace')).hexdigest()[:24]
-        runtime_key = hashlib.sha256(runtime_id.encode('utf-8', 'replace')).hexdigest()[:32]
-        root = Path(self.config.profile_base_path) / '.runtime_sessions' / parent_key
-        path = root / runtime_key
-        path.mkdir(parents=True, exist_ok=True)
+        parent_id = str(user_id or '').strip()
+        runtime_id = str(session_id or 'runtime').strip()
+
+        if parent_id and parent_id.lower() not in ('anonymous', 'none', 'default', ''):
+            # Durable per-user Chrome profile: all Google sign-in state, passwords,
+            # cookies, web data, and settings persist across reconnects and restarts.
+            root = Path(self.config.profile_base_path) / parent_id / 'chrome_profile'
+            root.mkdir(parents=True, exist_ok=True)
+            path = root
+        else:
+            parent_key = hashlib.sha256(parent_id.encode('utf-8', 'replace')).hexdigest()[:24]
+            runtime_key = hashlib.sha256(runtime_id.encode('utf-8', 'replace')).hexdigest()[:32]
+            root = Path(self.config.profile_base_path) / '.runtime_sessions' / parent_key
+            path = root / runtime_key
+            path.mkdir(parents=True, exist_ok=True)
+
         with self._active_browsers_lock:
             self._runtime_profile_paths[runtime_id] = str(path)
         try:
@@ -2916,6 +2929,10 @@ class BrowserManager:
                 path = Path(profile_dir).resolve()
                 if runtime_root.resolve() in path.parents and path != runtime_root.resolve():
                     await asyncio.to_thread(shutil.rmtree, path, ignore_errors=True)
+                else:
+                    # For persistent user profiles, clean up locks only so the next session starts smoothly
+                    from sb_backend import clean_profile_locks
+                    clean_profile_locks(str(path))
             except Exception:
                 logger.debug("[Profile] runtime profile cleanup failed for %s", session_id, exc_info=True)
         return info
@@ -3784,20 +3801,6 @@ class BrowserManager:
                             except Exception:
                                 _manifest_id = None
                             if _manifest_id:
-                                # Check Secure Preferences / Preferences for stale ephemeral ID
-                                for _pref_name in ["Secure Preferences", "Preferences"]:
-                                    _pref_path = Path(profile_dir) / "Default" / _pref_name
-                                    if _pref_path.is_file():
-                                        try:
-                                            _txt = _pref_path.read_text(encoding="utf-8", errors="ignore")
-                                            # If file doesn't contain new manifest ID but does contain extensions data, it's stale
-                                            if _manifest_id not in _txt and ("fignfifoniblkonapihmkfakmlgkbkcf" in _txt or '"extensions"' in _txt or '"extension"' in _txt.lower()):
-                                                # Only delete if it looks like an old profile with extensions
-                                                if len(_txt) > 500:
-                                                    _pref_path.unlink(missing_ok=True)
-                                                    logger.debug(f"[SINGLEFILE-EXT] Cleaned stale {_pref_name} (missing new ID {_manifest_id}, had old data) -> will reload extension")
-                                        except Exception:
-                                            pass
                                 _ext_dir = Path(profile_dir) / "Default" / "Extensions"
                                 if _ext_dir.is_dir():
                                     for _child in _ext_dir.iterdir():
@@ -4427,17 +4430,6 @@ class BrowserManager:
                         except Exception:
                             _manifest_id_s = None
                         if _manifest_id_s:
-                            for _pref_name_s in ["Secure Preferences", "Preferences"]:
-                                _pref_path_s = Path(profile_dir) / "Default" / _pref_name_s
-                                if _pref_path_s.is_file():
-                                    try:
-                                        _txt_s = _pref_path_s.read_text(encoding="utf-8", errors="ignore")
-                                        if _manifest_id_s not in _txt_s and ("fignfifoniblkonapihmkfakmlgkbkcf" in _txt_s or '"extensions"' in _txt_s):
-                                            if len(_txt_s) > 500:
-                                                _pref_path_s.unlink(missing_ok=True)
-                                                _log2.getLogger(__name__).info(f"[SINGLEFILE-EXT/Simple] Cleaned stale {_pref_name_s} (missing new ID {_manifest_id_s}) -> will reload")
-                                    except Exception:
-                                        pass
                             _ext_dir_s = Path(profile_dir) / "Default" / "Extensions"
                             if _ext_dir_s.is_dir():
                                 for _child_s in _ext_dir_s.iterdir():
