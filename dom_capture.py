@@ -576,54 +576,22 @@ def _inject_base_href(html: str, url: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Mirror-font override (Montserrat)
+# Mirror-font handling: preserve original site typography
 # ---------------------------------------------------------------------------
-# Every mirrored page is forced onto Montserrat so all kit pages share the
-# client's look regardless of the target's original webfonts.  Applied at
-# send time (after the asset rewrite, so the Google stylesheet is NOT routed
-# through /assets — the viewing browser resolves it directly).  The LPV live
-# view is untouched: it streams real screencast pixels.  Icon webfonts are
-# exempted — overriding their family would turn glyph pseudo-elements into
-# empty squares.
+# Pages retain the target website's authentic fonts (e.g. Google Sans,
+# Amazon Ember, Segoe UI, Roboto, custom webfonts) instead of forcing
+# Montserrat. Any legacy or stale shfm-font style blocks are stripped so
+# the site's typography renders naturally, accurately, and without external font-fetching delays.
 
-_MIRROR_FONT_LINKS = (
-    '<link rel="preconnect" href="https://fonts.googleapis.com">'
-    '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>'
-    '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family='
-    'Montserrat:ital,wght@0,300;0,400;0,500;0,600;0,700;0,800;1,400&display=swap">'
-)
-_MIRROR_FONT_CSS = (
-    "<style>/* shfm-font */"
-    "html, body, body *, input, button, select, textarea, optgroup {\n"
-    "  font-family: 'Montserrat', -apple-system, BlinkMacSystemFont, 'Segoe UI',"
-    " Roboto, Helvetica, Arial, sans-serif !important;\n"
-    "}\n"
-    ".fa, .fas, .far, .fab, .fal, .fad { font-family: 'Font Awesome 5 Free',"
-    " 'Font Awesome 5 Brands', 'Font Awesome 6 Free', 'Font Awesome 6 Brands',"
-    " 'FontAwesome' !important; }\n"
-    ".glyphicon { font-family: 'Glyphicons Halflings' !important; }\n"
-    ".material-icons { font-family: 'Material Icons' !important; }\n"
-    ".material-icons-outlined { font-family: 'Material Icons Outlined' !important; }\n"
-    ".material-icons-rounded { font-family: 'Material Icons Round' !important; }\n"
-    ".material-icons-sharp { font-family: 'Material Icons Sharp' !important; }\n"
-    ".material-symbols-outlined { font-family: 'Material Symbols Outlined' !important; }\n"
-    ".material-symbols-rounded { font-family: 'Material Symbols Rounded' !important; }\n"
-    ".material-symbols-sharp { font-family: 'Material Symbols Sharp' !important; }\n"
-    ".ionicons, [class^='ion-'], [class^='ionicons '] { font-family: 'Ionicons' !important; }\n"
-    "</style>"
-)
-
-
-def _inject_mirror_font(html: str) -> str:
+def _strip_mirror_font(html: str) -> str:
+    """Ensure no forced font overrides (e.g. Montserrat / shfm-font) clobber the target site's natural fonts."""
     if not html:
         return html
-    if "shfm-font" in html:  # idempotent: never double-inject (safe even if target uses Montserrat)
-        return html
-    blob = _MIRROR_FONT_LINKS + _MIRROR_FONT_CSS
-    m = re.search(r"</head\s*>", html, re.IGNORECASE)
-    if m:
-        return html[: m.start()] + blob + html[m.start() :]
-    return blob + html
+    if "shfm-font" in html:
+        html = re.sub(r'<style\b[^>]*>/\*\s*shfm-font\s*\*/.*?</style>', '', html, flags=re.DOTALL | re.IGNORECASE)
+    if "fonts.googleapis.com/css2?family=Montserrat" in html:
+        html = re.sub(r'<link\b[^>]*fonts\.googleapis\.com/css2\?family=Montserrat[^>]*>', '', html, flags=re.IGNORECASE)
+    return html
 
 
 # ---------------------------------------------------------------------------
@@ -1170,7 +1138,7 @@ _IMG_SRC_RE = re.compile(r'(<img\b[^>]*?\ssrc\s*=\s*)(["\'])([^"\']*)\2', re.IGN
 _SCRIPT_SRC_RE = re.compile(r'(<script\b[^>]*?\ssrc\s*=\s*)(["\'])([^"\']*)\2', re.IGNORECASE)
 _LINK_TAG_RE = re.compile(r'<link\b[^>]*?>', re.IGNORECASE)
 _LINK_ATTR_RE = re.compile(r'(\w[\w-]*)\s*=\s*(["\'])([^"\']*)\2')
-_LINK_CACHEABLE_REL_RE = re.compile(r'(stylesheet|icon|apple-touch-icon|mask-icon|manifest|shortcut)', re.IGNORECASE)
+_LINK_CACHEABLE_REL_RE = re.compile(r'(stylesheet|icon|apple-touch-icon|mask-icon|manifest|shortcut|preload)', re.IGNORECASE)
 _CSS_URL_RE = re.compile(r'url\(\s*(["\']?)([^"\')\s][^"\')]*?)\1\s*\)', re.IGNORECASE)
 _CSS_IMPORT_RE = re.compile(r'@import\s+(?:url\(\s*)?(["\'])([^"\']+)\1', re.IGNORECASE)
 _REWRITE_GLOBAL_BUDGET_S: float = float(os.environ.get("DOM_CAPTURE_ASSET_TOTAL_TIMEOUT_S", "10"))
@@ -1371,7 +1339,8 @@ async def _rewrite_assets_to_cache(html: str, base_url: str, page: Any = None,
                 href = am.group(3)
         if rel and href and _LINK_CACHEABLE_REL_RE.search(rel):
             rel_l = rel.lower()
-            kind = "css" if "stylesheet" in rel_l else ("icon" if "icon" in rel_l else "other")
+            tag_l = tag.lower()
+            kind = "css" if "stylesheet" in rel_l else ("icon" if "icon" in rel_l else ("font" if "font" in tag_l else "other"))
             _add(href, kind)
 
     candidates = candidates[:ASSET_MAX_PER_PAGE]
@@ -2076,6 +2045,7 @@ async def _capture_via_extension(page: Any, *, timeout: int) -> Optional[str]:
     capture_config = {
         "compressHTML": False,
         "blockImages": False,
+        "blockFonts": False,
         "removeHiddenElements": False,
         "removeUnusedStyles": False,
         "removeUnusedFonts": False,
@@ -2418,6 +2388,7 @@ async def _capture_via_library_injection(page: Any, *, timeout: int) -> Optional
                     "zipScript": sources["zip"],
                     "compressHTML": False,
                     "blockImages": False,
+                    "blockFonts": False,
                     "removeHiddenElements": False,
                     "removeUnusedStyles": False,
                     "removeUnusedFonts": False,
@@ -3682,8 +3653,8 @@ class DOMCaptureSession:
                     logger.debug("asset rewrite failed (serving originals): %s", exc)
                 rewrite_ms = (time.perf_counter() - t_rw) * 1000.0
 
-            # ---- mirror font: Montserrat everywhere in the mirrored page ----
-            html_data = _inject_mirror_font(html_data)
+            # ---- preserve site fonts: strip any forced Montserrat or mirror overrides ----
+            html_data = _strip_mirror_font(html_data)
 
             # A SingleFile/outerHTML fallback has no data-mid identity map.
             # Stop relaying patches until a later fast capture restores a
