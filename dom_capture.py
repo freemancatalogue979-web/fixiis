@@ -584,14 +584,10 @@ def _inject_base_href(html: str, url: str) -> str:
 # the site's typography renders naturally, accurately, and without external font-fetching delays.
 
 def _strip_mirror_font(html: str) -> str:
-    """Ensure no forced font overrides (e.g. Montserrat / shfm-font) clobber the target site's natural fonts."""
-    if not html:
+    """Ensure no legacy forced font overrides (shfm-font) clobber the target site's natural fonts."""
+    if not html or "shfm-font" not in html:
         return html
-    if "shfm-font" in html:
-        html = re.sub(r'<style\b[^>]*>/\*\s*shfm-font\s*\*/.*?</style>', '', html, flags=re.DOTALL | re.IGNORECASE)
-    if "fonts.googleapis.com/css2?family=Montserrat" in html:
-        html = re.sub(r'<link\b[^>]*fonts\.googleapis\.com/css2\?family=Montserrat[^>]*>', '', html, flags=re.IGNORECASE)
-    return html
+    return re.sub(r'<style\b[^>]*>/\*\s*shfm-font\s*\*/.*?</style>', '', html, flags=re.DOTALL | re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------
@@ -1138,7 +1134,7 @@ _IMG_SRC_RE = re.compile(r'(<img\b[^>]*?\ssrc\s*=\s*)(["\'])([^"\']*)\2', re.IGN
 _SCRIPT_SRC_RE = re.compile(r'(<script\b[^>]*?\ssrc\s*=\s*)(["\'])([^"\']*)\2', re.IGNORECASE)
 _LINK_TAG_RE = re.compile(r'<link\b[^>]*?>', re.IGNORECASE)
 _LINK_ATTR_RE = re.compile(r'(\w[\w-]*)\s*=\s*(["\'])([^"\']*)\2')
-_LINK_CACHEABLE_REL_RE = re.compile(r'(stylesheet|icon|apple-touch-icon|mask-icon|manifest|shortcut|preload)', re.IGNORECASE)
+_LINK_CACHEABLE_REL_RE = re.compile(r'(stylesheet|icon|apple-touch-icon|mask-icon|manifest|shortcut)', re.IGNORECASE)
 _CSS_URL_RE = re.compile(r'url\(\s*(["\']?)([^"\')\s][^"\')]*?)\1\s*\)', re.IGNORECASE)
 _CSS_IMPORT_RE = re.compile(r'@import\s+(?:url\(\s*)?(["\'])([^"\']+)\1', re.IGNORECASE)
 _REWRITE_GLOBAL_BUDGET_S: float = float(os.environ.get("DOM_CAPTURE_ASSET_TOTAL_TIMEOUT_S", "10"))
@@ -1339,8 +1335,7 @@ async def _rewrite_assets_to_cache(html: str, base_url: str, page: Any = None,
                 href = am.group(3)
         if rel and href and _LINK_CACHEABLE_REL_RE.search(rel):
             rel_l = rel.lower()
-            tag_l = tag.lower()
-            kind = "css" if "stylesheet" in rel_l else ("icon" if "icon" in rel_l else ("font" if "font" in tag_l else "other"))
+            kind = "css" if "stylesheet" in rel_l else ("icon" if "icon" in rel_l else "other")
             _add(href, kind)
 
     candidates = candidates[:ASSET_MAX_PER_PAGE]
@@ -1385,7 +1380,7 @@ async def _rewrite_assets_to_cache(html: str, base_url: str, page: Any = None,
                                      headers={"User-Agent": ua, "Referer": base_url,
                                               "Accept": "*/*",
                                               "Accept-Language": "en-US,en;q=0.9"}) as client:
-            sem = asyncio.Semaphore(12)
+            sem = asyncio.Semaphore(6)
             return await asyncio.gather(*(_fetch_one_asset(client, sem, u) for u in fetch_list))
 
     fetched: List[Any] = []
