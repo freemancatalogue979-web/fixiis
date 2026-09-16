@@ -164,6 +164,92 @@ def kill_profile_processes(profile_dir: Optional[str]) -> None:
         logger.debug("[SB] kill_profile_processes error: %s", exc)
 
 
+def clean_all_profile_locks(profile_base_path: Optional[str] = None) -> None:
+    """Walk profile_base_path and remove all stale lock files and DevToolsActivePort."""
+    if not profile_base_path:
+        return
+    try:
+        base = Path(profile_base_path).resolve()
+        if not base.exists() or not base.is_dir():
+            return
+        for pattern in ("Singleton*", "*lock*", "DevToolsActivePort"):
+            for f in base.glob(f"**/{pattern}"):
+                try:
+                    if f.is_file() or f.is_symlink():
+                        f.unlink(missing_ok=True)
+                except Exception:
+                    pass
+    except Exception as exc:
+        logger.debug("[SB] clean_all_profile_locks error: %s", exc)
+
+
+def kill_all_browsers(profile_base_path: Optional[str] = None) -> int:
+    """Synchronously terminate all Chrome, Chromium, and chromedriver processes
+    spawned by this application or holding user-data-dirs under profile_base_path.
+    Guarantees that closing Python terminates all browser processes.
+    """
+    killed = 0
+    target_base = str(Path(profile_base_path).resolve()) if profile_base_path else None
+    current_pid = os.getpid()
+
+    try:
+        import psutil
+        for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+            try:
+                pid = proc.info.get("pid")
+                if pid == current_pid:
+                    continue
+                name = (proc.info.get("name") or "").lower()
+                cmdline = proc.info.get("cmdline") or []
+                cmd_str = " ".join(cmdline)
+
+                # Match chromedriver
+                if "chromedriver" in name or "chromedriver" in cmd_str.lower():
+                    proc.kill()
+                    killed += 1
+                    continue
+
+                # Match Chrome/Chromium processes with profile under profile_base_path
+                if target_base and target_base in cmd_str:
+                    proc.kill()
+                    killed += 1
+                    continue
+
+                # Match child processes of this python process
+                try:
+                    parent = proc.parent()
+                    if parent and parent.pid == current_pid:
+                        if any(x in name for x in ("chrome", "chromium", "chromedriver", "xvfb")):
+                            proc.kill()
+                            killed += 1
+                except Exception:
+                    pass
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            except Exception:
+                pass
+    except Exception:
+        # Fallback for Linux proc filesystem if psutil fails
+        if sys.platform.startswith("linux"):
+            import signal
+            for entry in os.listdir("/proc"):
+                if not entry.isdigit():
+                    continue
+                pid = int(entry)
+                if pid == current_pid:
+                    continue
+                try:
+                    raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+                    cmdline = raw.decode(errors="replace")
+                    if (target_base and target_base in cmdline) or "chromedriver" in cmdline.lower():
+                        os.kill(pid, signal.SIGKILL)
+                        killed += 1
+                except Exception:
+                    pass
+
+    return killed
+
+
 
 # ---------------------------------------------------------------------------
 # Backend / flag resolution

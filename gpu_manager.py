@@ -242,29 +242,21 @@ class GPUManager:
         return True, "Resources available"
 
     def cleanup_orphaned_chrome_processes(self) -> int:
-        """Kill only stale browsers in this app's private runtime tree.
+        """Kill stale or orphaned browsers associated with this app's profile_base_path.
 
-        A process named Chrome is not evidence that this service owns it.  The
-        old implementation scanned every Chrome process and killed anything
-        whose parent looked orphaned, which could terminate a user's personal
-        browser or another tenant's session.  Runtime browsers use
-        ``<profile_base_path>/.runtime_sessions/...``; exact profile matching
-        plus the in-process ownership registry keeps cleanup scoped.
+        Scoped strictly to profiles located inside this application's
+        configured profile_base_path (including user chrome_profile directories
+        and .runtime_sessions), sparing active in-use sessions and unrelated processes.
         """
         if not is_linux() and not is_windows():
             return 0
         try:
-            root = (
-                os.path.realpath(
-                    os.path.join(
-                        str(getattr(self.config, 'profile_base_path', '')),
-                        '.runtime_sessions',
-                    )
-                )
+            base_path = (
+                os.path.realpath(str(getattr(self.config, 'profile_base_path', '')))
                 if getattr(self.config, 'profile_base_path', None)
                 else ''
             )
-            if not root or not os.path.isdir(root):
+            if not base_path or not os.path.isdir(base_path):
                 return 0
             active_profiles = self.get_active_runtime_profiles()
             killed = 0
@@ -277,17 +269,28 @@ class GPUManager:
                         return arg.split('=', 1)[1]
                 return None
 
-            for proc in psutil.process_iter(['pid', 'cmdline']):
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
                 try:
+                    name = (proc.info.get('name') or '').lower()
                     args = [str(part) for part in (proc.info.get('cmdline') or [])]
+                    
+                    # Clean orphaned chromedriver instances when no active sessions are running
+                    if 'chromedriver' in name:
+                        if not active_profiles:
+                            try:
+                                proc.kill()
+                                killed += 1
+                            except Exception:
+                                pass
+                            continue
+
                     profile = profile_arg(args)
                     if not profile:
                         continue
                     profile = os.path.realpath(profile)
-                    # Only descendants of our private runtime root are
-                    # eligible.  Stable user profiles and personal Chrome are
-                    # never touched.
-                    if not (profile == root or profile.startswith(root + os.sep)):
+                    
+                    # Match any profile within our application's profile_base_path
+                    if not (profile == base_path or profile.startswith(base_path + os.sep)):
                         continue
                     if profile in active_profiles:
                         continue

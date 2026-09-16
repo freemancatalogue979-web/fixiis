@@ -973,7 +973,7 @@ class SessionManager:
                 logger.warning("[Session Remove] GPU unregister failed for %s",
                                session_id, exc_info=True)
             try:
-                await session.cleanup(force=force)
+                await session.cleanup(force=True)
             except Exception:
                 logger.warning("[Session Remove] browser cleanup failed for %s",
                                session_id, exc_info=True)
@@ -1093,7 +1093,7 @@ class SessionManager:
                 logger.error(f"[Cleanup Loop Error] {e}")
 
     async def _cleanup_stale_sessions(self):
-        """Find stale sessions from a snapshot, then remove them safely."""
+        """Find stale or abandoned sessions from a snapshot, then remove them safely."""
         current_time = time.time()
         async with self._sessions_lock:
             snapshot = list(self.sessions.items())
@@ -1104,17 +1104,24 @@ class SessionManager:
                 page_closed = bool(page and page.is_closed())
             except Exception:
                 page_closed = False
+
+            ws = getattr(session, 'websocket', None)
+            disconnected_at = getattr(session, 'disconnected_at', None)
+            is_disconnected = ws is None and disconnected_at is not None and (current_time - disconnected_at > 60)
+            inactive_too_long = (current_time - getattr(session, 'last_activity', current_time)) > 1800
+
             if (not getattr(session, 'is_active', True)
                     or page_closed
-                    or current_time - getattr(session, 'last_activity', current_time) > 3600):
+                    or is_disconnected
+                    or inactive_too_long):
                 stale_sessions.append((
                     session_id,
-                    getattr(session, "websocket", None),
+                    ws,
                     getattr(session, "websocket_generation", None),
                 ))
         await asyncio.gather(
             *(self.remove_session(
-                session_id, expected_websocket=expected_websocket,
+                session_id, force=True, expected_websocket=expected_websocket,
                 expected_generation=expected_generation,
             ) for session_id, expected_websocket, expected_generation in stale_sessions),
             return_exceptions=True,

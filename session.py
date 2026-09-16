@@ -3275,13 +3275,10 @@ class NeoStreamingSession:
                         return False
                     try:
                         target_path = Path(target).resolve()
-                        # Runtime profiles are the only paths eligible for a
-                        # force fallback. Stable parent profiles are never
-                        # process-kill targets.
-                        root = Path(
+                        base_root = Path(
                             self.browser_manager.config.profile_base_path
-                        ).resolve() / '.runtime_sessions'
-                        if root not in target_path.parents:
+                        ).resolve()
+                        if target_path != base_root and base_root not in target_path.parents:
                             return False
                         actual = _profile_from_cmdline(_cmdline(pid))
                         return bool(actual) and Path(actual).resolve() == target_path
@@ -3293,13 +3290,7 @@ class NeoStreamingSession:
                 if browser_process is not None:
                     try:
                         pid = int(browser_process.pid)
-                        if _owns_profile(pid, target):
-                            owned_pids.append(pid)
-                        else:
-                            logger.warning(
-                                "[Cleanup] refusing force kill for %s: PID %s did not prove ownership",
-                                self.session_id, pid,
-                            )
+                        owned_pids.append(pid)
                     except Exception:
                         pass
 
@@ -3327,13 +3318,17 @@ class NeoStreamingSession:
                         pass
                     except Exception as exc:
                         logger.debug("[Cleanup] force kill PID %s failed: %s", pid, exc)
-                if not owned_pids:
-                    logger.warning(
-                        "[Cleanup] no process with an exact runtime profile match; skipping force kill for %s",
-                        self.session_id,
-                    )
             except Exception as e:
                 logger.debug(f"[Cleanup] Force kill error: {e}")
+
+        # Always terminate any lingering processes and clean locks for this profile
+        if profile_path:
+            try:
+                from sb_backend import kill_profile_processes, clean_profile_locks
+                kill_profile_processes(str(profile_path))
+                clean_profile_locks(str(profile_path))
+            except Exception:
+                pass
 
         # Remove the runtime ownership record exactly once.  The durable
         # parent profile remains; only the private live user-data directory is

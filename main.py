@@ -199,13 +199,20 @@ class Server:
         logger.debug(f"  - Disk Free: {gpu_status.get('disk_free_gb', '?'):.1f}GB")
         logger.debug(f"  - System Healthy: {gpu_status.get('system_healthy', '?')}")
         
-        # Cleanup orphaned Chrome processes at startup
-        logger.debug("[Startup] Cleaning up orphaned Chrome processes...")
-        killed = await asyncio.to_thread(
-            self.gpu_manager.cleanup_orphaned_chrome_processes
-        )
-        if killed > 0:
-            logger.debug(f"[Startup] Cleaned up {killed} orphaned Chrome processes")
+        # Cleanup orphaned Chrome processes and locks at startup for a fresh desk
+        logger.debug("[Startup] Cleaning up orphaned Chrome processes and stale locks...")
+        try:
+            killed = await asyncio.to_thread(
+                self.gpu_manager.cleanup_orphaned_chrome_processes
+            )
+            from sb_backend import kill_all_browsers, clean_all_profile_locks
+            killed_extra = await asyncio.to_thread(kill_all_browsers, self.config.profile_base_path)
+            await asyncio.to_thread(clean_all_profile_locks, self.config.profile_base_path)
+            total_cleaned = killed + killed_extra
+            if total_cleaned > 0:
+                logger.debug(f"[Startup] Cleaned up {total_cleaned} leftover browser processes")
+        except Exception as e:
+            logger.debug(f"[Startup] Initial cleanup error: {e}")
 
         # Set session manager in API
         set_session_manager(self.session_manager)
@@ -245,26 +252,58 @@ class Server:
 
     async def shutdown(self):
         """Graceful shutdown"""
-        pass
+        logger.info("[Shutdown] Initiating graceful server shutdown...")
 
         # Stop Telegram bot
         if self.telegram_bot:
-            await self.telegram_bot.stop_polling()
+            try:
+                await self.telegram_bot.stop_polling()
+            except Exception:
+                pass
 
-        if hasattr(self, 'server'):
+        if hasattr(self, 'server') and self.server:
             self.server.should_exit = True
 
-        await self.session_manager.close_all_sessions()
-        await self.session_manager.stop()
+        try:
+            await self.session_manager.close_all_sessions(force=True)
+            await self.session_manager.stop()
+        except Exception as e:
+            logger.error(f"[Shutdown] Error closing sessions: {e}")
 
-        await self.stop_cloudflare_tunnel()
+        try:
+            from access_manager import access_manager
+            await access_manager.shutdown()
+        except Exception:
+            pass
+
+        try:
+            from pcm_manager import pcm_manager
+            await pcm_manager.shutdown()
+        except Exception:
+            pass
+
+        try:
+            await self.stop_cloudflare_tunnel()
+        except Exception:
+            pass
         
         # Clean up cgroups (Linux only)
         if is_linux():
             cgroup_mgr = get_cgroup_manager()
             if cgroup_mgr:
                 logger.debug("Cleaning up session cgroups...")
-                cgroup_mgr.cleanup_all()
+                try:
+                    cgroup_mgr.cleanup_all()
+                except Exception:
+                    pass
+
+        # Force synchronous kill of any lingering browsers and clean locks
+        try:
+            from sb_backend import kill_all_browsers, clean_all_profile_locks
+            kill_all_browsers(self.config.profile_base_path)
+            clean_all_profile_locks(self.config.profile_base_path)
+        except Exception:
+            pass
 
         self.shutdown_event.set()
 

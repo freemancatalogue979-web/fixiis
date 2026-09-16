@@ -37,11 +37,34 @@ import subprocess
 import urllib.request
 import threading
 import tempfile
+import atexit
 from typing import Dict, Optional, Any, List
 from pathlib import Path
 import logging
 
 logger = logging.getLogger(__name__)
+
+_EXIT_CLEANUP_DONE = False
+
+def cleanup_all_browsers_sync():
+    """Synchronously terminate all Chrome, Chromium, and chromedriver processes
+    associated with this application's profiles on process exit.
+    Guarantees no orphaned browsers remain when Python closes.
+    """
+    global _EXIT_CLEANUP_DONE
+    if _EXIT_CLEANUP_DONE:
+        return
+    _EXIT_CLEANUP_DONE = True
+    try:
+        from config import CONFIG
+        from sb_backend import kill_all_browsers, clean_all_profile_locks
+        base_path = getattr(CONFIG, 'profile_base_path', './profiles')
+        kill_all_browsers(base_path)
+        clean_all_profile_locks(base_path)
+    except Exception:
+        pass
+
+atexit.register(cleanup_all_browsers_sync)
 
 # Profile metadata/cookie files are shared by BrowserManager instances even
 # though each runtime browser is isolated.  Key the short synchronous file
@@ -6099,37 +6122,15 @@ class BrowserManager:
         try:
             info = self.get_active_browser(session_id)
             profile_dir = (info or {}).get('profile_dir')
-            if not profile_dir or not sys.platform.startswith('linux'):
+            if not profile_dir:
                 return
             target = Path(profile_dir).resolve()
-            root = (Path(self.config.profile_base_path) / '.runtime_sessions').resolve()
-            if root not in target.parents:
+            base_root = Path(self.config.profile_base_path).resolve()
+            if target != base_root and base_root not in target.parents:
                 return
-            for entry in os.listdir('/proc'):
-                if not entry.isdigit():
-                    continue
-                pid = int(entry)
-                try:
-                    raw = Path(f"/proc/{pid}/cmdline").read_bytes()
-                    args = [part.decode(errors='replace') for part in raw.split(b'\0') if part]
-                    actual = None
-                    for index, arg in enumerate(args):
-                        if arg == '--user-data-dir' and index + 1 < len(args):
-                            actual = args[index + 1]
-                            break
-                        if arg.startswith('--user-data-dir='):
-                            actual = arg.split('=', 1)[1]
-                            break
-                    if actual and Path(actual).resolve() == target:
-                        os.kill(pid, 9)
-                        logger.warning(
-                            "Killed owned zombie Chrome process %s for session %s",
-                            pid, session_id,
-                        )
-                except (FileNotFoundError, ProcessLookupError, PermissionError):
-                    pass
-                except Exception:
-                    logger.debug("[Zombie] exact profile check failed for %s", pid, exc_info=True)
+            from sb_backend import kill_profile_processes, clean_profile_locks
+            kill_profile_processes(str(target))
+            clean_profile_locks(str(target))
         except Exception:
             logger.debug("[Zombie] scoped cleanup failed for %s", session_id, exc_info=True)
 

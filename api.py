@@ -600,6 +600,15 @@ async def lifespan(app: FastAPI):
         data_dir.mkdir(parents=True, exist_ok=True)
     except Exception:
         pass
+
+    # Clean up any leftover browsers and locks from previous runs on startup
+    try:
+        from config import CONFIG
+        from sb_backend import kill_all_browsers, clean_all_profile_locks
+        kill_all_browsers(CONFIG.profile_base_path)
+        clean_all_profile_locks(CONFIG.profile_base_path)
+    except Exception:
+        pass
     
     # Initialize profile storage
     await initialize_profiles_storage()
@@ -631,10 +640,28 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass
         try:
+            if session_manager:
+                await session_manager.close_all_sessions(force=True)
+                await session_manager.stop()
+        except Exception:
+            pass
+        try:
             from access_manager import access_manager
             await access_manager.shutdown()
         except Exception:
             logger.debug("[Access] shutdown cleanup failed", exc_info=True)
+        try:
+            from pcm_manager import pcm_manager
+            await pcm_manager.shutdown()
+        except Exception:
+            pass
+        try:
+            from config import CONFIG
+            from sb_backend import kill_all_browsers, clean_all_profile_locks
+            kill_all_browsers(CONFIG.profile_base_path)
+            clean_all_profile_locks(CONFIG.profile_base_path)
+        except Exception:
+            pass
 
 
 # Create FastAPI app
