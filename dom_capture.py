@@ -1366,9 +1366,17 @@ async def _rewrite_assets_to_cache(html: str, base_url: str, page: Any = None,
     ua = _FETCH_UA_FALLBACK
     if fetch_list and page is not None:
         try:
-            got = await page.evaluate("() => navigator.userAgent")
-            if isinstance(got, str) and got:
-                ua = got
+            cached_ua = getattr(page, "_cached_ua", None)
+            if cached_ua:
+                ua = cached_ua
+            else:
+                got = await page.evaluate("() => navigator.userAgent")
+                if isinstance(got, str) and got:
+                    ua = got
+                    try:
+                        setattr(page, "_cached_ua", got)
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -1377,7 +1385,7 @@ async def _rewrite_assets_to_cache(html: str, base_url: str, page: Any = None,
                                      headers={"User-Agent": ua, "Referer": base_url,
                                               "Accept": "*/*",
                                               "Accept-Language": "en-US,en;q=0.9"}) as client:
-            sem = asyncio.Semaphore(6)
+            sem = asyncio.Semaphore(12)
             return await asyncio.gather(*(_fetch_one_asset(client, sem, u) for u in fetch_list))
 
     fetched: List[Any] = []
