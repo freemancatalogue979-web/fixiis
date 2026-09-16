@@ -68,7 +68,7 @@ logger = logging.getLogger(__name__)
 # Configuration (env-overridable)
 # ---------------------------------------------------------------------------
 
-PRE_CAPTURE_WAIT: float = float(os.environ.get("DOM_CAPTURE_PRE_CAPTURE_WAIT", "0.05"))
+PRE_CAPTURE_WAIT: float = float(os.environ.get("DOM_CAPTURE_PRE_CAPTURE_WAIT", "0.0"))
 SINGLEFILE_TIMEOUT_S: int = int(os.environ.get("DOM_CAPTURE_SINGLEFILE_TIMEOUT_S", "60"))
 
 # Minimum interval between interaction-triggered recaptures.  This is
@@ -168,18 +168,16 @@ FULL_SETTLE: bool = os.environ.get("DOM_CAPTURE_FULL_SETTLE", "").strip().lower(
 # (yahoo: half the stylesheets just never got fetched — the mirror lost
 # "some of the CSS").  256 covers real-world pages; env to tune down.
 ASSET_MAX_PER_PAGE: int = int(os.environ.get("DOM_CAPTURE_ASSET_MAX_PER_PAGE", "256"))
-ASSET_FETCH_TIMEOUT_S: float = float(os.environ.get("DOM_CAPTURE_ASSET_TIMEOUT_S", "6"))
+ASSET_CONCURRENCY: int = int(os.environ.get("DOM_CAPTURE_ASSET_CONCURRENCY", "24"))
+ASSET_FETCH_TIMEOUT_S: float = float(os.environ.get("DOM_CAPTURE_ASSET_TIMEOUT_S", "3.0"))
 ASSET_MAX_BYTES: int = int(os.environ.get("DOM_CAPTURE_ASSET_MAX_BYTES", str(12 * 1024 * 1024)))
 CACHE_MAX_ITEMS: int = int(os.environ.get("DOM_CAPTURE_CACHE_MAX_ITEMS", "4000"))
 CACHE_MAX_BYTES: int = int(os.environ.get("DOM_CAPTURE_CACHE_MAX_BYTES", str(192 * 1024 * 1024)))
 
-# Images this size or smaller are EMBEDDED as data: URIs in the captured
-# HTML (logos, icons, SVGs, GIFs) instead of pointing at /assets/<hash> —
-# the mirror renders them even when the client can't reach the /assets
-# route (reverse proxies that only forward /ws, offline viewers, copied
-# HTML artifacts).  Larger images keep the cache path so recaptures don't
-# re-ship megabytes.  0 disables embedding entirely.
-EMBED_MAX_BYTES: int = int(os.environ.get("DOM_CAPTURE_EMBED_MAX_BYTES", str(1024 * 1024)))
+# Small logos, icons, SVGs (up to 64 KB) are EMBEDDED as data: URIs in
+# captured HTML for instant zero-roundtrip rendering. Larger media is routed
+# through the /assets cache so recaptures don't re-ship megabytes over WS.
+EMBED_MAX_BYTES: int = int(os.environ.get("DOM_CAPTURE_EMBED_MAX_BYTES", str(64 * 1024)))
 
 # Stylesheets this size or smaller are INLINED as <style> blocks in the
 # captured HTML (after their inner url()/@import refs are rewritten) instead
@@ -994,8 +992,12 @@ _FAST_SERIALIZE_JS = r"""
     if (tag === 'script' || tag === 'style') {
       let raw;
       if (tag === 'style') {
-        // CSSOM wins over stale DOM text (script-mutated sheets).
-        raw = liveSheetCss(el.sheet) || el.textContent || '';
+        // Fast-path: use el.textContent directly if present (99% of styles).
+        // Only query liveSheetCss if textContent is empty (e.g. CSSOM runtime injection).
+        raw = el.textContent || '';
+        if (!raw.trim() && el.sheet) {
+          raw = liveSheetCss(el.sheet) || '';
+        }
         raw = styleSafe(raw);
       } else {
         raw = (el.textContent || '').replace(/<\/script/gi, '<\\/script');
@@ -1085,16 +1087,17 @@ async def _capture_fast(page: Any) -> Optional[str]:
 
 # Cheap DOM checksum for the unchanged-skip.  Deliberately NOT computed
 # from the serialized HTML (that would defeat the point — serialization
-# is the expensive part we are trying to skip).  Node count + text length
-# + scroll height catches every user-visible class of change on mirrored
-# pages (element churn, text updates, reflow) at O(1)-ish cost.
+# is the expensive part we are trying to skip).  Node count + title length
+# + scroll height + sample text catches user-visible changes at O(1) cost
+# without allocating a giant textContent string across the whole document.
 _DOM_CHECKSUM_JS = r"""
 () => {
   const de = document.documentElement;
   if (!de) return '';
   const els = de.getElementsByTagName('*').length;
-  const tl = de.textContent ? de.textContent.length : 0;
   const sh = de.scrollHeight | 0;
+  const b = document.body;
+  const tl = b ? (b.innerText ? b.innerText.slice(0, 500).length : 0) : 0;
   return els + ':' + tl + ':' + sh;
 }
 """
@@ -1366,39 +1369,74 @@ async def _rewrite_assets_to_cache(html: str, base_url: str, page: Any = None,
     ua = _FETCH_UA_FALLBACK
     if fetch_list and page is not None:
         try:
-            got = await page.evaluate("() => navigator.userAgent")
-            if isinstance(got, str) and got:
-                ua = got
+            cached_ua = getattr(page, "_cached_ua", None)
+            if cached_ua:
+                ua = cached_ua
+            else:
+                got = await page.evaluate("() => navigator.userAgent")
+                if isinstance(got, str) and got:
+                    ua = got
+                    try:
+                        setattr(page, "_cached_ua", got)
+                    except Exception:
+                        pass
         except Exception:
             pass
 
-    async def _run_fetches() -> List[Any]:
-        async with httpx.AsyncClient(follow_redirects=True,
-                                     headers={"User-Agent": ua, "Referer": base_url,
-                                              "Accept": "*/*",
-                                              "Accept-Language": "en-US,en;q=0.9"}) as client:
-            sem = asyncio.Semaphore(6)
-            return await asyncio.gather(*(_fetch_one_asset(client, sem, u) for u in fetch_list))
+    limits = httpx.Limits(max_connections=64, max_keepalive_connections=32)
+    sem = asyncio.Semaphore(ASSET_CONCURRENCY)
 
-    fetched: List[Any] = []
-    if fetch_list:
-        try:
-            fetched = await asyncio.wait_for(_run_fetches(), timeout=_REWRITE_GLOBAL_BUDGET_S)
-        except Exception as exc:
-            logger.debug("asset rewrite: global fetch budget hit (%s) — partial reuse only", exc)
-            fetched = []
-    for abs_u, res in zip(fetch_list, fetched):
-        if not res:
-            continue
-        data, ctype = res
-        hits[abs_u] = (data, ctype)
-        # Stylesheets are registered only AFTER their inner urls are
-        # rewritten (step 4) — memoizing raw CSS would both skip the inner
-        # rewrite forever and cache the wrong bytes.
-        if kind_by_url.get(abs_u) != "css":
-            manager.register(data, ctype, url=abs_u, owner_id=owner_id)
+    async with httpx.AsyncClient(
+        follow_redirects=True,
+        limits=limits,
+        headers={"User-Agent": ua, "Referer": base_url,
+                 "Accept": "*/*",
+                 "Accept-Language": "en-US,en;q=0.9"}
+    ) as client:
+        fetched: List[Any] = []
+        if fetch_list:
+            try:
+                fetched = await asyncio.wait_for(
+                    asyncio.gather(*(_fetch_one_asset(client, sem, u) for u in fetch_list)),
+                    timeout=_REWRITE_GLOBAL_BUDGET_S
+                )
+            except Exception as exc:
+                logger.debug("asset rewrite: global fetch budget hit (%s) — partial reuse only", exc)
+                fetched = []
+            for abs_u, res in zip(fetch_list, fetched):
+                if not res:
+                    continue
+                data, ctype = res
+                hits[abs_u] = (data, ctype)
+                # Stylesheets are registered only AFTER their inner urls are
+                # rewritten (step 4) — memoizing raw CSS would both skip the inner
+                # rewrite forever and cache the wrong bytes.
+                if kind_by_url.get(abs_u) != "css":
+                    manager.register(data, ctype, url=abs_u, owner_id=owner_id)
 
-    # -- 4. Decision per ref: embed / cache / leave -------------------------
+        # -- 4. Concurrent CSS inner-asset rewriting reusing the same client pool --
+        css_targets = [
+            abs_u for abs_u in candidates
+            if kind_by_url.get(abs_u) == "css"
+            and abs_u in hits
+            and manager.get_by_url(abs_u, owner_id=owner_id) is None
+        ]
+        if css_targets:
+            async def _rewrite_single_css(abs_u: str) -> None:
+                try:
+                    cdata, _ = hits[abs_u]
+                    sub_text = cdata.decode("utf-8", errors="ignore")
+                    rewritten = await _cache_css_text(
+                        sub_text, abs_u, client, sem, manager, depth=0, owner_id=owner_id
+                    )
+                    hits[abs_u] = (rewritten, "text/css")
+                    manager.register(rewritten, "text/css", url=abs_u, owner_id=owner_id)
+                except Exception as exc:
+                    logger.debug("css inner rewrite failed for %s: %s", abs_u[:120], exc)
+
+            await asyncio.gather(*(_rewrite_single_css(u) for u in css_targets))
+
+    # -- 5. Decision per ref: embed / cache / leave -------------------------
     repl: Dict[str, str] = {}
     inline_css: Dict[str, str] = {}
     meta_by_digest: Dict[str, Dict[str, Any]] = {}
@@ -1412,24 +1450,6 @@ async def _rewrite_assets_to_cache(html: str, base_url: str, page: Any = None,
         kind = kind_by_url.get(abs_u, "other")
         try:
             if kind == "css":
-                if manager.get_by_url(abs_u, owner_id=owner_id) is None:
-                    # Fresh CSS: rewrite its inner url()/@import refs (small
-                    # images embed below threshold, fonts/nested css via
-                    # cache/data-uri), then memoize the rewritten bytes.
-                    try:
-                        async with httpx.AsyncClient(follow_redirects=True,
-                                                     headers={"User-Agent": ua, "Referer": abs_u,
-                                                              "Accept": "*/*",
-                                                              "Accept-Language": "en-US,en;q=0.9"}) as client:
-                            sem = asyncio.Semaphore(6)
-                            sub_text = data.decode("utf-8", errors="ignore")
-                            data = await _cache_css_text(
-                                sub_text, abs_u, client, sem, manager, depth=0, owner_id=owner_id
-                            )
-                        ctype = "text/css"
-                        manager.register(data, ctype, url=abs_u, owner_id=owner_id)
-                    except Exception as exc:
-                        logger.debug("css inner rewrite failed for %s: %s", abs_u[:120], exc)
                 # Small stylesheets INLINE as <style> (client needs no
                 # /assets route to render styled pages — the yahoo case);
                 # larger ones keep the cache path below.

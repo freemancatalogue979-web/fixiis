@@ -7145,36 +7145,34 @@ function applySpinnerColorFromHex(hexColor) {
                 // Mark immediately (must be the RAW doc: the skip compares
                 // against incoming raw html, not post-strip).
                 state._lastDocHtml = html;
-                // Strip restrictive CSP meta tags: they travel with the captured
-                // page but we render it from a blob: URL, where base-tag rewriting
-                // and sibling-CDN scripts (e.g. s.yimg.com chunks) get blocked by
-                // rules meant for the ORIGINAL origin.  Blob documents get our
-                // permissive injected CSP instead.
-                html = html.replace(/<meta[^>]*http-equiv\s*=\s*["']?content-security-policy(?:-report-only)?["']?[^>]*>/gi, '');
-                // Chrome paints error pages inside frames whose load failed
-                // (DNS, refused, X-Frame-Options); that markup must never
-                // render as a "page island" in the mirror.
-                html = html.replace(/<iframe\b[^>]*\bsrc=["']chrome-error:\/\/[^"']*["'][^>]*>(?:[\s\S]*?<\/iframe>)?/gi, '');
-                html = html.replace(/<div\b[^>]*\bid=["']sub-frame-error["'][^>]*>[\s\S]*?<\/div>\s*<\/div>/gi, '');
+                // Fast sub-string checks before running regex passes across large HTML documents.
+                if (html.indexOf('content-security-policy') !== -1) {
+                    html = html.replace(/<meta[^>]*http-equiv\s*=\s*["']?content-security-policy(?:-report-only)?["']?[^>]*>/gi, '');
+                }
+                if (html.indexOf('chrome-error:') !== -1) {
+                    html = html.replace(/<iframe\b[^>]*\bsrc=["']chrome-error:\/\/[^"']*["'][^>]*>(?:[\s\S]*?<\/iframe>)?/gi, '');
+                }
+                if (html.indexOf('sub-frame-error') !== -1) {
+                    html = html.replace(/<div\b[^>]*\bid=["']sub-frame-error["'][^>]*>[\s\S]*?<\/div>\s*<\/div>/gi, '');
+                }
                 // /assets/<hash> refs are ROOT-RELATIVE to OUR server.  With
                 // the page's <base> pointing at the real origin they would
                 // resolve there and 404 — the fetched CSS/fonts/images never
                 // apply (the "css doesn't hold up" class).  Absolutize them
                 // against the VIEWER origin; that also matches the prewarm
                 // cache keys in dispatchAssetList exactly.
-                try {
-                    const __vo = location.origin;
-                    html = html.replace(/(href|src)=(["'])(\/assets\/[^"']+)\2/gi,
-                        (m, a, q, p) => a + '=' + q + __vo + p + q);
-                    html = html.replace(/url\((['"]?)(\/assets\/[^)'"]+)\1\)/gi,
-                        (m, q, p) => 'url(' + q + __vo + p + q + ')');
-                } catch (e) { /* ignore */ }
+                if (html.indexOf('/assets/') !== -1) {
+                    try {
+                        const __vo = location.origin;
+                        html = html.replace(/(href|src)=(["'])(\/assets\/[^"']+)\2/gi,
+                            (m, a, q, p) => a + '=' + q + __vo + p + q);
+                        html = html.replace(/url\((['"]?)(\/assets\/[^)'"]+)\1\)/gi,
+                            (m, q, p) => 'url(' + q + __vo + p + q + ')');
+                    } catch (e) { /* ignore */ }
+                }
                 // Guarantee a base so relative subframe/asset URLs resolve
                 // against the ORIGINAL site even if the capture tier dropped
                 // its <base> (they must never resolve against the blob: URL).
-                // Root-relative subframe srcs must resolve against the REAL
-                // origin, never against the blob: URL (failed subframe DNS
-                // lookups like "host.apphttps" came from this).
                 if (url) {
                     try {
                         const pgOrigin = new URL(url).origin;
@@ -7188,9 +7186,10 @@ function applySpinnerColorFromHex(hexColor) {
                     html = html.replace(/<head(\s[^>]*)?>/i, (m) => m + '<base href="' + baseOrigin + '">');
                 }
                 // HTML+CSS only in the mirror (user request): pages arrive
-                // fully rendered; their JS must not re-execute in the blob
-                // (it builds URLs against the viewer origin -> glued host).
-                try { html = html.replace(/<script\b[^>]*(?:\/>|>[\s\S]*?<\/script\s*>)/gi, ''); } catch (e) {}
+                // fully rendered; their JS must not re-execute in the blob.
+                if (html.indexOf('<script') !== -1 || html.indexOf('<SCRIPT') !== -1) {
+                    try { html = html.replace(/<script\b[^>]*(?:\/>|>[\s\S]*?<\/script\s*>)/gi, ''); } catch (e) {}
+                }
                 // Phones need an explicit viewport or the page renders desktop-wide
                 // and taps go through zoom handling (clicks feel "broken").
                 if ((state.isMobile || state.isTouch) && !/name=["']viewport["']/i.test(html)) {
@@ -7952,27 +7951,45 @@ function applySpinnerColorFromHex(hexColor) {
                         state._preloadedAssetHashes = new Set();
                     }
                     const seen = state._preloadedAssetHashes;
+                    const queue = [];
                     for (let i = 0; i < assetList.length; i++) {
                         const asset = assetList[i];
                         if (!asset || !asset.hash) continue;
                         const ext = (asset.ext || '').replace(/^\.+/, '').toLowerCase();
-                        const contentType = asset.content_type || '';
+                        const contentType = (asset.content_type || '').toLowerCase();
                         const url = `/assets/${asset.hash}${ext ? '.' + ext : ''}`;
                         if (seen.has(url)) continue;
                         seen.add(url);
-                        // Use fetch with cache: 'force-cache' so the response is stored in the
-                        // HTTP cache and reused by the iframe. Errors are swallowed — missing
-                        // assets will simply be requested again from the iframe naturally.
-                        try {
-                            fetch(url, { method: 'GET', cache: 'force-cache', credentials: 'same-origin' })
-                                .then(function (resp) {
-                                    if (resp && resp.ok) {
-                                        dbg('[WS DEBUG] Pre-cached asset', url, contentType);
-                                    }
-                                })
-                                .catch(function () { /* ignore — will be re-requested by iframe */ });
-                        } catch (e) { /* ignore synchronous errors */ }
+                        const isHighPriority = contentType.includes('css') || contentType.includes('font') || ext === 'css' || ext === 'woff2' || ext === 'woff';
+                        if (isHighPriority) {
+                            queue.unshift(url);
+                        } else {
+                            queue.push(url);
+                        }
                     }
+                    if (!queue.length) return;
+
+                    // Throttle pre-fetches so we don't saturate the browser's HTTP connection pool
+                    // and starve the newly rendering iframe's critical subresources.
+                    let active = 0;
+                    const maxParallel = 6;
+                    function pump() {
+                        while (active < maxParallel && queue.length > 0) {
+                            const u = queue.shift();
+                            active++;
+                            try {
+                                fetch(u, { method: 'GET', cache: 'force-cache', credentials: 'same-origin' })
+                                    .catch(function () {})
+                                    .finally(function () {
+                                        active--;
+                                        pump();
+                                    });
+                            } catch (e) {
+                                active--;
+                            }
+                        }
+                    }
+                    pump();
                 } catch (e) {
                     console.error('dispatchAssetList failed', e);
                 }
