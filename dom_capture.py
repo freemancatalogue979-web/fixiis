@@ -68,7 +68,7 @@ logger = logging.getLogger(__name__)
 # Configuration (env-overridable)
 # ---------------------------------------------------------------------------
 
-PRE_CAPTURE_WAIT: float = float(os.environ.get("DOM_CAPTURE_PRE_CAPTURE_WAIT", "0.05"))
+PRE_CAPTURE_WAIT: float = float(os.environ.get("DOM_CAPTURE_PRE_CAPTURE_WAIT", "0.0"))
 SINGLEFILE_TIMEOUT_S: int = int(os.environ.get("DOM_CAPTURE_SINGLEFILE_TIMEOUT_S", "60"))
 
 # Minimum interval between interaction-triggered recaptures.  This is
@@ -1112,9 +1112,9 @@ def _settle_for_reason(reason: Optional[str]) -> str:
     if FULL_SETTLE:
         return "full"
     if not reason:
-        return "light"
+        return "none"
     r = reason.lower()
-    if r.startswith(("interaction:", "coalesce:")) or r in _COLD_REASONS:
+    if r.startswith(("interaction:", "coalesce:", "click", "input", "tap")) or r in _COLD_REASONS:
         return "none"
     return "light"
 
@@ -2832,7 +2832,7 @@ _DELTA_OBSERVER_JS = r"""
   const coalesced = new Map();  // logical op key -> index in ops
   let scheduled = false;
   let overflowed = false;
-  const OP_CAP = 1500;
+  const OP_CAP = 5000;
   const schedule = () => {
     if (scheduled) return;
     scheduled = true;
@@ -3474,14 +3474,14 @@ class DOMCaptureSession:
         try:
             if settle != "none":
                 try:
-                    await self.page.wait_for_load_state("domcontentloaded", timeout=10000)
+                    await self.page.wait_for_load_state("domcontentloaded", timeout=5000)
                 except Exception:
                     pass
                 if settle == "full":
                     await _ensure_page_stable(self.page)
                 else:
                     try:
-                        await self.page.wait_for_function("document.readyState === 'complete'", timeout=1500)
+                        await self.page.wait_for_function("document.readyState !== 'loading'", timeout=500)
                     except Exception:
                         pass
                     if PRE_CAPTURE_WAIT > 0:
@@ -3489,31 +3489,14 @@ class DOMCaptureSession:
             self._last_capture_was_singlefile = False
             self._last_capture_supports_delta = True
             self._last_capture_supports_assets = True
-            if DOM_CAPTURE_MODE == "singlefile":
-                self._last_capture_was_singlefile = True
-                self._last_capture_supports_delta = False
-                self._last_capture_supports_assets = False
-                return await _capture_with_single_file(self.page)
             html = await _capture_fast(self.page)
             if html is not None and len(html) < 400 and "<html" not in html.lower():
                 html = None  # degenerate output — fall back
             fast_err = _LAST_FAST_CAPTURE_ERROR
             if html is None:
-                # Tier 2: SingleFile (requires the MV3 extension — absent on
-                # SeleniumBase UC Chrome, so this is a no-op there).
-                logger.debug("dc fast capture degenerate/unavailable (%s) — SingleFile fallback", fast_err)
-                html = await _capture_with_single_file(self.page)
-                if html is not None:
-                    self._last_capture_was_singlefile = True
-                    self._last_capture_supports_delta = False
-                    self._last_capture_supports_assets = False
-                    return html
-            if html is None:
-                # Tier 3: outerHTML — always works if evaluate works at all.
-                # No data-mid (delta off) but asset rewrite applies so CSS
-                # still lands inline.
+                # Fast outerHTML fallback with data-mid preservation — zero SingleFile stalls
                 try:
-                    html = await self.page.evaluate("document.documentElement.outerHTML")
+                    html = await self.page.evaluate("document.documentElement ? document.documentElement.outerHTML : ''")
                     if isinstance(html, str) and html:
                         html = "<!DOCTYPE html>\n" + html
                         self._last_capture_supports_delta = False
@@ -3523,8 +3506,7 @@ class DOMCaptureSession:
                 except Exception as exc:
                     logger.debug("dc outerHTML fallback failed: %s", exc)
                 logger.error(
-                    "[CAPTURE] all capture tiers failed: fast=%s; singlefile=extension-unavailable/failed; "
-                    "outerHTML=failed — check the page/backend (SB evaluate path)",
+                    "[CAPTURE] fast capture failed: %s; outerHTML=failed",
                     fast_err or "unknown")
                 return None
             return html

@@ -3749,7 +3749,7 @@ class BrowserManager:
                 #
                 # Disable by setting SINGLEFILE_EXT_MODE=0.
                 # ============================================================
-                _sf_ext_mode = os.environ.get("SINGLEFILE_EXT_MODE", "1").strip() not in (
+                _sf_ext_mode = os.environ.get("SINGLEFILE_EXT_MODE", "0").strip() not in (
                     "0", "false", "no", "off"
                 )
                 if _sf_ext_mode:
@@ -4399,7 +4399,7 @@ class BrowserManager:
 
             # SingleFile extension for system Chrome (also for Chromium) - ensure visible in Chrome
             # This path previously missed extension loading, so system Chrome never showed it
-            _sf_ext_mode = __import__('os').environ.get("SINGLEFILE_EXT_MODE", "1").strip() not in ("0", "false", "no", "off")
+            _sf_ext_mode = __import__('os').environ.get("SINGLEFILE_EXT_MODE", "0").strip() not in ("0", "false", "no", "off")
             if _sf_ext_mode:
                 try:
                     from singlefile_ext import _ensure_extracted

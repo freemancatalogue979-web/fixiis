@@ -18,7 +18,7 @@ _EXT_SWITCH_FEATURE = "DisableLoadExtensionCommandLineSwitch"
 
 
 def singlefile_ext_enabled() -> bool:
-    return os.environ.get("SINGLEFILE_EXT_MODE", "1").strip() not in (
+    return os.environ.get("SINGLEFILE_EXT_MODE", "0").strip() not in (
         "0", "false", "no", "off")
 
 
