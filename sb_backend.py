@@ -1025,6 +1025,12 @@ class SBPage:
                     const el = document.querySelector(sel);
                     if (!el || !el.isConnected) return null;
                     if (el.disabled || el.getAttribute('aria-disabled') === 'true') return null;
+
+                    // If sel pointed to an inline label / span / icon inside a button or link,
+                    // resolve to the enclosing button/link for both actionability and hit testing.
+                    const enclosingControl = el.closest('button, [role="button"], a, input[type="button"], input[type="submit"]');
+                    const actionableEl = enclosingControl || el;
+
                     // Iframes: CDP input on the parent document does not
                     // cross an <iframe> boundary — Input.dispatchMouseEvent
                     // is delivered to the parent's main frame, and the
@@ -1032,22 +1038,34 @@ class SBPage:
                     // coordinate.  Detect iframe ancestry and short-circuit
                     // to the element.click() fallback path, which executes
                     // inside the iframe's own JS context (same-origin).
-                    for (let n = el; n && n !== document; n = n.parentElement || (n.parentNode && n.parentNode.host ? n.parentNode.host : null)) {
+                    for (let n = actionableEl; n && n !== document; n = n.parentElement || (n.parentNode && n.parentNode.host ? n.parentNode.host : null)) {
                         if (n.tagName === 'IFRAME') return { iframe: true };
                     }
-                    el.scrollIntoView({block: 'center', inline: 'center'});
-                    const r = el.getBoundingClientRect();
+                    actionableEl.scrollIntoView({block: 'center', inline: 'center'});
+                    const r = actionableEl.getBoundingClientRect();
                     if (!(r.width > 0 && r.height > 0)) return null;
-                    const style = getComputedStyle(el);
+                    const style = getComputedStyle(actionableEl);
                     if (style.visibility === 'hidden' || style.display === 'none' ||
                         style.pointerEvents === 'none') return null;
                     const x = r.left + r.width / 2;
                     const y = r.top + r.height / 2;
                     const hit = document.elementFromPoint(x, y);
-                    // Match Playwright's actionability check: do not click
-                    // through an overlay or another element. Descendants of
-                    // the requested element are valid hit targets.
-                    if (!hit || (hit !== el && !el.contains(hit))) return null;
+
+                    // Valid hit targets: the element itself, the enclosing control,
+                    // any descendant of either, any ancestor of either, or sibling overlays
+                    // within the same component (such as Google Material's ripple overlay).
+                    const isHitValid = hit && (
+                        hit === el ||
+                        hit === actionableEl ||
+                        el.contains(hit) ||
+                        actionableEl.contains(hit) ||
+                        hit.contains(el) ||
+                        hit.contains(actionableEl) ||
+                        (hit.closest && (
+                            hit.closest('button, [role="button"], a, [jsaction]') === actionableEl.closest('button, [role="button"], a, [jsaction]')
+                        ))
+                    );
+                    if (!isHitValid) return null;
                     return {x, y, iframe: false};
                 }""",
                 selector,
@@ -2031,6 +2049,23 @@ class SBHandle:
             return False
         try:
             element = self.driver.find_element("css selector", selector)
+            # If the resolved element is a text node / span / icon inside an
+            # interactive button or link (e.g. Google Material's <span ...>Next</span>),
+            # resolve to the enclosing button/link control that owns the activation.
+            try:
+                interactive_parent = self.driver.execute_script(
+                    """const el = arguments[0];
+                    if (!el) return null;
+                    const tag = (el.tagName || '').toUpperCase();
+                    if (tag === 'BUTTON' || tag === 'A' || tag === 'INPUT') return el;
+                    if (el.getAttribute && el.getAttribute('role') === 'button') return el;
+                    return el.closest('button, [role="button"], a, input[type="button"], input[type="submit"]') || el;""",
+                    element,
+                )
+                if interactive_parent is not None:
+                    element = interactive_parent
+            except Exception:
+                pass
             # Apple-style controls are often a custom host around the native
             # button that actually owns the pointer activation:
             # <ui-button ...><button type="button">Sign in</button></ui-button>.
@@ -2057,8 +2092,16 @@ class SBHandle:
                 )
             except Exception:
                 pass
-            element.click()
-            return True
+            try:
+                element.click()
+                return True
+            except Exception:
+                try:
+                    from selenium.webdriver.common.action_chains import ActionChains
+                    ActionChains(self.driver).move_to_element(element).click().perform()
+                    return True
+                except Exception:
+                    return False
         except Exception as exc:
             logger.debug("[SB][W3C-CLICK] selector %s failed: %s", selector, exc)
             return False

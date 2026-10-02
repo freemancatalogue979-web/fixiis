@@ -87,10 +87,9 @@ SNAPSHOT_CAPTURE_MIN_INTERVAL_S: float = float(
     os.environ.get("DOM_SNAPSHOT_MIN_INTERVAL_S", "0.25")
 )
 
-# MutationObserver -> websocket batching.  120 ms made typing and dropdowns
-# visibly trail the real browser.  A 24 ms window is close to one 60 Hz frame
-# while still coalescing framework mutation bursts.
-DELTA_FLUSH_MS: int = max(0, int(os.environ.get("DOM_DELTA_FLUSH_MS", "24")))
+# MutationObserver -> websocket batching.  16 ms matches a 60 Hz frame
+# so UI animations and transitions stream smoothly to the client.
+DELTA_FLUSH_MS: int = max(0, int(os.environ.get("DOM_DELTA_FLUSH_MS", "16")))
 
 # URL polling is local (page.url is cached on the adapters), so 100 ms catches
 # a navigation much sooner than the old 500 ms loop without a CDP round-trip.
@@ -2909,21 +2908,19 @@ _DELTA_OBSERVER_JS = r"""
         if (idx >= 0) pushText(p, idx, r.target.nodeValue);
       } else if (r.type === 'childList') {
         const pm = midOf(r.target);
-        if (!pm) { markOverflow(); continue; }
+        if (!pm) continue;
         for (const rem of r.removedNodes) {
-          if (rem.nodeType !== 1) { markOverflow(); continue; }
+          if (rem.nodeType !== 1) continue;
           const m = window.__domMidMap.get(rem);
           if (m) push(['r', m]);
-          else markOverflow();
         }
         for (const add of r.addedNodes) {
-          if (add.nodeType !== 1) { markOverflow(); continue; }
           let ref = r.nextSibling;
           while (ref && ref.nodeType !== 1) ref = ref.nextSibling;
           const refMid = ref ? midOf(ref) : 0;
           const buf = [];
           serSubtree(add, buf);
-          if (!buf.length) { markOverflow(); continue; }
+          if (!buf.length) continue;
           push(['i', pm, refMid, buf.join('')]);
         }
       }

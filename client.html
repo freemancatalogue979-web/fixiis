@@ -9017,10 +9017,7 @@ function applySpinnerColorFromHex(hexColor) {
                         }
                     }
 
-                    const interactive = findInteractiveElement(target);
-                    if (!interactive) {
-                        return false;
-                    }
+                    const interactive = findInteractiveElement(target) || target;
 
                     // FIX: Always send a real "click" (never bypass with navigate)
                     // for elements that have a visible href.
@@ -9052,12 +9049,14 @@ function applySpinnerColorFromHex(hexColor) {
                     // the CSS selector, and clicks it.
                     const interactiveSelector = getSelector(interactive);
                     const interactiveMid = interactive.getAttribute && interactive.getAttribute('data-mid');
+                    const targetMid = target.getAttribute && target.getAttribute('data-mid');
+                    const midToSend = interactiveMid || targetMid;
                     const clickPayload = {
                         type: 'input',
                         subtype: 'click',
                         selector: interactiveSelector
                     };
-                    if (interactiveMid) clickPayload.mid = interactiveMid;
+                    if (midToSend) clickPayload.mid = midToSend;
                     try {
                         if (interactive.tagName === 'A' && interactive.href) {
                             clickPayload.href = interactive.href;
