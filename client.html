@@ -353,32 +353,9 @@
             height: -webkit-fill-available;
         }
     }
-
-    .top-progress-bar {
-        position: fixed;
-        top: 0;
-        left: 0;
-        width: 0;
-        height: 2.5px;
-        background: linear-gradient(90deg, #3b82f6, #60a5fa);
-        z-index: 999999;
-        pointer-events: none;
-        transition: width 0.25s cubic-bezier(0.1, 0.9, 0.2, 1), opacity 0.2s ease;
-        opacity: 0;
-        box-shadow: 0 0 8px rgba(59, 130, 246, 0.5);
-    }
-    .top-progress-bar.active {
-        opacity: 1;
-        width: 75%;
-    }
-    .top-progress-bar.complete {
-        width: 100%;
-        opacity: 0;
-    }
     </style>
 </head>
 <body>
-    <div id="topProgressBar" class="top-progress-bar"></div>
     <div class="loading-screen" id="loadingScreen">
         <div class="loading-logo" id="loadingLogo"></div>
         <div class="loading-spinner" id="loadingSpinner"></div>
@@ -402,30 +379,6 @@
 
             const dbg = () => {};
 let currentBrandColor = '#888';
-
-function showProgressBar() {
-    try {
-        const pb = document.getElementById('topProgressBar');
-        if (!pb) return;
-        pb.classList.remove('complete');
-        pb.classList.add('active');
-    } catch (e) {}
-}
-
-function finishProgressBar() {
-    try {
-        const pb = document.getElementById('topProgressBar');
-        if (!pb) return;
-        pb.classList.remove('active');
-        pb.classList.add('complete');
-        setTimeout(() => {
-            try {
-                pb.classList.remove('complete');
-                pb.style.width = '0';
-            } catch (e) {}
-        }, 350);
-    } catch (e) {}
-}
 
 function parseRgbColor(color) {
     if (!color) return null;
@@ -7039,7 +6992,6 @@ function applySpinnerColorFromHex(hexColor) {
                 if (newUrl) {
                     try { send({ type: 'url_ack', url: newUrl }); } catch (e) { /* ignore */ }
                 }
-                finishProgressBar();
 
                 dbg(`[BODY-SWAP] applied body=${newBody.length}b scripts=${scripts.length} inputs=${stateToRestore ? stateToRestore.length : 0}`);
             }
@@ -7614,7 +7566,6 @@ function applySpinnerColorFromHex(hexColor) {
                             reapplyTypedValues(d);
                             rebuildMirrorIdMap();
                             hideTransitionOverlay();
-                            finishProgressBar();
                         }
                     } catch (e) {
                         console.error('Cannot access iframe document:', e);
@@ -9069,11 +9020,6 @@ function applySpinnerColorFromHex(hexColor) {
                     const interactive = findInteractiveElement(target);
                     if (!interactive) {
                         return false;
-                    }
-
-                    // Optimistic visual progress bar for navigation links
-                    if (interactive.tagName === 'A' || isNavigationTarget(interactive)) {
-                        try { showProgressBar(); } catch (e) {}
                     }
 
                     // FIX: Always send a real "click" (never bypass with navigate)
