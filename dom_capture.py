@@ -77,20 +77,19 @@ SINGLEFILE_TIMEOUT_S: int = int(os.environ.get("DOM_CAPTURE_SINGLEFILE_TIMEOUT_S
 # The delta observer carries the first visual update; this only throttles
 # the slower full-document safety capture.
 INTERACTION_CAPTURE_MIN_INTERVAL_S: float = float(
-    os.environ.get("DOM_CAPTURE_INTERACTION_MIN_INTERVAL_S", "0.08")
+    os.environ.get("DOM_CAPTURE_INTERACTION_MIN_INTERVAL_S", "0.03")
 )
 
 # Snapshot-mode interaction cadence when the delta channel is unavailable.
 # Healthy snapshot-preferred pages patch in place and do not use this full
 # capture throttle for ordinary interactions.
 SNAPSHOT_CAPTURE_MIN_INTERVAL_S: float = float(
-    os.environ.get("DOM_SNAPSHOT_MIN_INTERVAL_S", "0.25")
+    os.environ.get("DOM_SNAPSHOT_MIN_INTERVAL_S", "0.15")
 )
 
-# MutationObserver -> websocket batching.  120 ms made typing and dropdowns
-# visibly trail the real browser.  A 24 ms window is close to one 60 Hz frame
-# while still coalescing framework mutation bursts.
-DELTA_FLUSH_MS: int = max(0, int(os.environ.get("DOM_DELTA_FLUSH_MS", "24")))
+# MutationObserver -> websocket batching. 8 ms matches 120 Hz displays
+# so mutations stream to the client instantly without skipped frames.
+DELTA_FLUSH_MS: int = max(0, int(os.environ.get("DOM_DELTA_FLUSH_MS", "8")))
 
 # URL polling is local (page.url is cached on the adapters), so 100 ms catches
 # a navigation much sooner than the old 500 ms loop without a CDP round-trip.
@@ -3775,17 +3774,37 @@ class DOMCaptureSession:
                 candidates.append(selector)
             if not candidates:
                 return False
+
+            # FAST-PATH: Direct CDP evaluation click in renderer (sub-3ms execution)
             for sel in candidates:
                 try:
-                    # Independent budget per candidate.  Sharing one
-                    # 1200ms budget across all candidates means the
-                    # second one (usually the CSS selector) gets only
-                    # whatever's left after the first one's actionability
-                    # loop times out — typically zero.  This was the
-                    # root cause of "click does nothing on the second
-                    # attempt" on the SB backend: data-mid matched a
-                    # stale node, actionability loop ate the budget,
-                    # CSS selector was never tried.
+                    fast_clicked = await self.page.evaluate(
+                        """(sel) => {
+                            try {
+                                const el = document.querySelector(sel);
+                                if (!el) return false;
+                                const rect = el.getBoundingClientRect();
+                                const cx = rect.left + rect.width / 2;
+                                const cy = rect.top + rect.height / 2;
+                                const opts = { bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy, button: 0 };
+                                el.dispatchEvent(new PointerEvent('pointerdown', opts));
+                                el.dispatchEvent(new MouseEvent('mousedown', opts));
+                                el.dispatchEvent(new PointerEvent('pointerup', opts));
+                                el.dispatchEvent(new MouseEvent('mouseup', opts));
+                                if (typeof el.click === 'function') el.click();
+                                return true;
+                            } catch (e) { return false; }
+                        }""",
+                        sel,
+                    )
+                    if fast_clicked:
+                        logger.debug("handle_click: fast-path succeeded for sel=%s mid=%s", sel, mid)
+                        return True
+                except Exception:
+                    pass
+
+            for sel in candidates:
+                try:
                     await self.page.click(sel, timeout=1500)
                     logger.debug(
                         "handle_click: dispatched selector=%s mid=%s backend=%s",

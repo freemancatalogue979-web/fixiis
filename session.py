@@ -739,11 +739,16 @@ class NeoStreamingSession:
                 'User-Agent': self.user_agent
             })
             
-            # Load user's profile if it exists
-            if self.browser_manager.profile_exists(self.user_id):
-                cookies = await self.browser_manager.load_cookies(self.user_id)
-                if cookies:
-                    await self.context.add_cookies(cookies)
+            # Load cookies from storage only for ephemeral profiles (chrome_profile loads natively)
+            _profile_dir = getattr(self.browser, "profile_dir", None)
+            if not _profile_dir or "chrome_profile" not in str(_profile_dir):
+                if self.browser_manager.profile_exists(self.user_id):
+                    try:
+                        cookies = await self.browser_manager.load_cookies(self.user_id)
+                        if cookies:
+                            await self.context.add_cookies(cookies)
+                    except Exception:
+                        pass
 
             try:
                 # Ensure URL has https:// prefix
@@ -2553,7 +2558,7 @@ class NeoStreamingSession:
                 except Exception:
                     pass
             if key and len(key) == 1:
-                await self.page.keyboard.type(key, delay=10)
+                await self.page.keyboard.type(key, delay=0)
             elif key:
                 key_map = {
                     'Enter': 'Enter',

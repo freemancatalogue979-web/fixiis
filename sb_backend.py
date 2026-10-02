@@ -1131,12 +1131,8 @@ class SBPage:
         except Exception:
             probe_installed = False
         await self.mouse.click(point["x"], point["y"])
-        # Give the renderer a beat to dispatch the events.  80ms is
-        # empirically the right window for synthetic CDP events on
-        # system Chrome (the renderer queues pointerdown -> mousedown ->
-        # mouseup -> click in the same frame, but the JS ``click``
-        # listener is queued microtask-later).
-        await asyncio.sleep(0.08)
+        # Brief tick for synthetic CDP events to queue in the renderer microtask
+        await asyncio.sleep(0.005)
         # Probe whether the click had an effect by checking the
         # counter.  If it did NOT increment, the CDP click landed in
         # the renderer but no JS handler fired.  Retry via W3C Actions
