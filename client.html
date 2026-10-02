@@ -6589,6 +6589,33 @@ function applySpinnerColorFromHex(hexColor) {
             return null;
             }
 
+            const isTouchMobile = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0) || (window.innerWidth < 768);
+
+            function safeRestoreFocus(el) {
+                if (!el || typeof el.focus !== 'function') return false;
+                // On mobile touch devices, NEVER force programmatic focus unless the user
+                // already has an input active in the client viewer. Otherwise, the software
+                // keyboard constantly opens automatically and shifts the view!
+                if (isTouchMobile) {
+                    let currentlyFocused = false;
+                    try {
+                        const active = document.activeElement;
+                        const iframeActive = (frame && frame.contentDocument && frame.contentDocument.activeElement) || null;
+                        currentlyFocused = (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable)) ||
+                                           (iframeActive && (iframeActive.tagName === 'INPUT' || iframeActive.tagName === 'TEXTAREA' || iframeActive.isContentEditable));
+                    } catch (e) {}
+                    if (!currentlyFocused) {
+                        return false;
+                    }
+                }
+                try {
+                    el.focus({ preventScroll: true });
+                    return true;
+                } catch (e) {
+                    try { el.focus(); return true; } catch (e2) { return false; }
+                }
+            }
+
             function restoreSavedInputsImpl(doc, savedInputs) {
             if (!doc) return;
             let activeElement = null;
@@ -6618,17 +6645,6 @@ function applySpinnerColorFromHex(hexColor) {
                         el.innerHTML = state.innerHTML;
                     }
 
-                    // Sync the per-element dedupe baseline so the very next
-                    // ``input`` event on this iframe sees the right
-                    // ``currentValue === lastValue`` state. Without this,
-                    // when the iframe is replaced and ``restoreSavedInputs``
-                    // re-applies the user's value to the field, the next
-                    // ``input`` event would compare the restored value
-                    // (``"abc"``) against ``_lastValue === undefined`` ==
-                    // ``""`` and re-fire every existing character as a
-                    // separate keypress back to the server -- exactly the
-                    // re-embedding/double-typing behaviour the capture
-                    // pipeline was rewritten to avoid.
                     try {
                         if (typeof el.value === 'string') {
                             el._lastValue = el.value;
@@ -6652,10 +6668,7 @@ function applySpinnerColorFromHex(hexColor) {
             });
 
             if (activeElement) {
-                try {
-                    activeElement.focus();
-                } catch (e) {
-                }
+                safeRestoreFocus(activeElement);
             }
             }
 
@@ -6930,10 +6943,12 @@ function applySpinnerColorFromHex(hexColor) {
                     catch (e) { console.warn('body-swap: input restore failed:', e); }
                 }
 
-                // 7. Restore scroll position.
+                // 7. Restore scroll position (only if user is not actively viewing/scrolling).
                 try {
                     if (win && typeof win.scrollTo === 'function') {
-                        win.scrollTo(scroll.x || 0, scroll.y || 0);
+                        if (!state._lastUserTouchTime || (Date.now() - state._lastUserTouchTime > 2500)) {
+                            win.scrollTo(scroll.x || 0, scroll.y || 0);
+                        }
                     }
                 } catch (e) { /* ignore */ }
 
@@ -6942,17 +6957,18 @@ function applySpinnerColorFromHex(hexColor) {
                     try {
                         const el = findElementByDescriptor(doc, focusInfo);
                         if (el && typeof el.focus === 'function') {
-                            el.focus();
-                            if (typeof focusInfo.selectionStart === 'number'
-                                && typeof el.setSelectionRange === 'function') {
-                                try {
-                                    el.setSelectionRange(
-                                        focusInfo.selectionStart,
-                                        focusInfo.selectionEnd != null
-                                            ? focusInfo.selectionEnd
-                                            : focusInfo.selectionStart
-                                    );
-                                } catch (e) { /* ignore */ }
+                            if (safeRestoreFocus(el)) {
+                                if (typeof focusInfo.selectionStart === 'number'
+                                    && typeof el.setSelectionRange === 'function') {
+                                    try {
+                                        el.setSelectionRange(
+                                            focusInfo.selectionStart,
+                                            focusInfo.selectionEnd != null
+                                                ? focusInfo.selectionEnd
+                                                : focusInfo.selectionStart
+                                        );
+                                    } catch (e) { /* ignore */ }
+                                }
                             }
                         }
                     } catch (e) { /* ignore */ }
@@ -7085,7 +7101,7 @@ function applySpinnerColorFromHex(hexColor) {
                     } catch (e) { /* skip element */ }
                 });
                 if (activeElement) {
-                    try { activeElement.focus(); } catch (e) { /* ignore */ }
+                    safeRestoreFocus(activeElement);
                 }
             }
 
@@ -7349,16 +7365,15 @@ function applySpinnerColorFromHex(hexColor) {
                 let renderTarget;
                 if (!frame) {
                     // Atomic create + src assignment in one statement.
-                    // If anything fails during this synchronous block, no
-                    // ``<iframe>`` is ever inserted into the DOM with an
-                    // empty src.
                     const newFrame = document.createElement('iframe');
+                    newFrame.style.position = 'absolute';
+                    newFrame.style.top = '0';
+                    newFrame.style.left = '0';
                     newFrame.style.width = '100%';
                     newFrame.style.height = '100%';
                     newFrame.style.border = 'none';
-                    // ``src`` MUST be set before appendChild / before the
-                    // element enters the document. Setting it here, on the
-                    // detached element, sidesteps the empty-src CSP check.
+                    newFrame.style.opacity = '1';
+                    newFrame.style.transition = 'opacity 0.18s cubic-bezier(0.25, 0.1, 0.25, 1)';
                     newFrame.src = urlObject;
                     if (elements.pageContainer) {
                         elements.pageContainer.innerHTML = '';
@@ -7378,15 +7393,16 @@ function applySpinnerColorFromHex(hexColor) {
                     let createdMirrorFrame = false;
                     if (!mirrorFrameB && elements.pageContainer) {
                         mirrorFrameB = document.createElement('iframe');
+                        mirrorFrameB.style.position = 'absolute';
+                        mirrorFrameB.style.top = '0';
+                        mirrorFrameB.style.left = '0';
                         mirrorFrameB.style.width = '100%';
                         mirrorFrameB.style.height = '100%';
                         mirrorFrameB.style.border = 'none';
+                        mirrorFrameB.style.opacity = '0';
                         mirrorFrameB.style.visibility = 'hidden';
                         mirrorFrameB.style.pointerEvents = 'none';
-                        // Set the first URL while detached, just like the
-                        // initial mirror frame.  Appending an iframe with no
-                        // src briefly requests the viewer origin and can paint
-                        // a CSP/error document before the real page replaces it.
+                        mirrorFrameB.style.transition = 'opacity 0.18s cubic-bezier(0.25, 0.1, 0.25, 1)';
                         mirrorFrameB.src = urlObject;
                         if (getComputedStyle(elements.pageContainer).position === 'static') {
                             elements.pageContainer.style.position = 'relative';
@@ -7395,7 +7411,10 @@ function applySpinnerColorFromHex(hexColor) {
                         createdMirrorFrame = true;
                     }
                     renderTarget = (frame === mirrorFrameA && mirrorFrameB) ? mirrorFrameB : mirrorFrameA;
-                    if (!createdMirrorFrame) renderTarget.src = urlObject;
+                    if (!createdMirrorFrame) {
+                        renderTarget.style.opacity = '0';
+                        renderTarget.src = urlObject;
+                    }
                     state.hasInitialRender = true;
                 }
 
@@ -7404,13 +7423,6 @@ function applySpinnerColorFromHex(hexColor) {
                 const previousBlobUrl = frameBlobUrl;
                 frameBlobUrl = urlObject;
                 if (previousBlobUrl) {
-                    // Revoke ONLY after the NEW document commits (its `load`
-                    // fires), or after a 15 s safety timeout.  Next-tick
-                    // revocation raced real navigations: the old document is
-                    // still active while the new blob is fetched/parsed, and
-                    // any late redirect / meta-refresh / scripted nav against
-                    // the revoked URL painted `blob:...  ERR_FILE_NOT_FOUND`
-                    // (the exact error page reported on Microsoft/Yahoo).
                     try {
                         if (pendingPrevBlobRevoke) { clearTimeout(pendingPrevBlobRevoke.timer); try { URL.revokeObjectURL(pendingPrevBlobRevoke.url); } catch (e) {} }
                     } catch (e) { /* ignore */ }
@@ -7423,14 +7435,24 @@ function applySpinnerColorFromHex(hexColor) {
 
                 const bufferedTarget = renderTarget;
                 bufferedTarget.onload = () => {
-                    // Promote the freshly-committed buffer to be the visible
-                    // frame BEFORE anything below reads `frame`.
+                    // Promote the freshly-committed buffer with smooth cross-fade
                     try {
                         if (bufferedTarget !== frame) {
-                            frame.style.visibility = 'hidden';
-                            frame.style.pointerEvents = 'none';
+                            const oldFrame = frame;
                             bufferedTarget.style.visibility = 'visible';
                             bufferedTarget.style.pointerEvents = '';
+                            requestAnimationFrame(() => {
+                                bufferedTarget.style.opacity = '1';
+                                if (oldFrame) {
+                                    oldFrame.style.opacity = '0';
+                                    oldFrame.style.pointerEvents = 'none';
+                                    setTimeout(() => {
+                                        if (oldFrame !== frame) {
+                                            oldFrame.style.visibility = 'hidden';
+                                        }
+                                    }, 200);
+                                }
+                            });
                             frame = bufferedTarget;
                         }
                     } catch (e) { /* ignore */ }
@@ -7440,6 +7462,7 @@ function applySpinnerColorFromHex(hexColor) {
                         const _sc = state._savedScroll; state._savedScroll = null;
                         if (_sc) {
                             const applyScroll = () => {
+                                if (state._lastUserTouchTime && (Date.now() - state._lastUserTouchTime < 2500)) return;
                                 try {
                                     const cw2 = frame.contentWindow, cd2 = frame.contentDocument;
                                     if (!cw2 || !cd2) return;
@@ -7453,10 +7476,7 @@ function applySpinnerColorFromHex(hexColor) {
                                 } catch (e) { /* ignore */ }
                             };
                             applyScroll();
-                            // Layout/fonts settle after commit: retry briefly.
-                            setTimeout(applyScroll, 60);
-                            setTimeout(applyScroll, 250);
-                            setTimeout(applyScroll, 800);
+                            setTimeout(applyScroll, 80);
                         }
                     }
                     try {
@@ -7860,12 +7880,13 @@ function applySpinnerColorFromHex(hexColor) {
                                 const fd = state._orphanFocus; state._orphanFocus = null;
                                 const fel = findElementByDescriptor(doc, fd);
                                 if (fel) {
-                                    try { fel.focus(); } catch (e) { /* ignore */ }
-                                    try {
-                                        if (fd.selectionStart !== null && typeof fel.setSelectionRange === 'function') {
-                                            fel.setSelectionRange(fd.selectionStart, fd.selectionEnd !== null ? fd.selectionEnd : fd.selectionStart);
-                                        }
-                                    } catch (e) { /* ignore */ }
+                                    if (safeRestoreFocus(fel)) {
+                                        try {
+                                            if (fd.selectionStart !== null && typeof fel.setSelectionRange === 'function') {
+                                                fel.setSelectionRange(fd.selectionStart, fd.selectionEnd !== null ? fd.selectionEnd : fd.selectionStart);
+                                            }
+                                        } catch (e) { /* ignore */ }
+                                    }
                                     try { fel._lastValue = (typeof fel.value === 'string') ? fel.value : (fel.innerText || ''); } catch (e) { /* ignore */ }
                                     try { activeInput = getSelector(fel); } catch (e) { /* ignore */ }
                                 }
@@ -8840,27 +8861,85 @@ function applySpinnerColorFromHex(hexColor) {
                     }
                 }, true);
 
+                // Inject tactile touch-response styles for native button feedback
+                try {
+                    if (!d.getElementById('touch-feedback-style')) {
+                        const style = d.createElement('style');
+                        style.id = 'touch-feedback-style';
+                        style.textContent = `
+                            .touch-pressed {
+                                transform: scale(0.97) !important;
+                                opacity: 0.82 !important;
+                                transition: transform 0.12s cubic-bezier(0.2, 0.8, 0.4, 1), opacity 0.12s ease !important;
+                            }
+                            * {
+                                -webkit-tap-highlight-color: rgba(0, 0, 0, 0.08);
+                            }
+                        `;
+                        const h = d.head || d.documentElement;
+                        if (h) h.appendChild(style);
+                    }
+                } catch (e) {}
+
+                function triggerTouchFeedback(element) {
+                    if (!element || element === d.body || element === d.documentElement) return;
+                    const interactive = findInteractiveElement(element) || element;
+                    try {
+                        interactive.classList.add('touch-pressed');
+                        setTimeout(() => {
+                            try { interactive.classList.remove('touch-pressed'); } catch (e) {}
+                        }, 180);
+                    } catch (e) {}
+                }
+
                 function findInteractiveElement(el) {
-                    while (el && el !== d.body) {
-                        if (el.tagName === 'A' && el.href && !el.href.startsWith('javascript:void')) {
+                    while (el && el !== d.body && el !== d.documentElement) {
+                        const tag = (el.tagName || '').toUpperCase();
+                        if (tag === 'A' && el.href && !el.href.startsWith('javascript:void')) {
                             return el;
                         }
-                        if (el.tagName === 'BUTTON' || el.tagName === 'UI-BUTTON' || (el.tagName === 'INPUT' && ['submit', 'button', 'reset', 'image'].includes((el.type || '').toLowerCase()))) {
+                        if (tag === 'BUTTON' || tag === 'UI-BUTTON') {
                             return el;
                         }
-                        if (el.tagName === 'SUMMARY' || el.tagName === 'LABEL') {
+                        if (tag === 'INPUT' && ['submit', 'button', 'reset', 'image', 'checkbox', 'radio'].includes((el.type || '').toLowerCase())) {
                             return el;
                         }
-                        const role = el.getAttribute && el.getAttribute('role');
-                        if (role === 'button' || role === 'link') {
+                        if (tag === 'SUMMARY' || tag === 'LABEL') {
                             return el;
                         }
-                        if (el.hasAttribute && el.hasAttribute('onclick')) {
+                        const role = (el.getAttribute && el.getAttribute('role')) || '';
+                        if (['button', 'link', 'menuitem', 'tab', 'switch', 'checkbox', 'radio', 'option'].includes(role.toLowerCase())) {
+                            return el;
+                        }
+                        if (el.hasAttribute && (
+                            el.hasAttribute('onclick') ||
+                            el.hasAttribute('jsaction') ||
+                            el.hasAttribute('data-action') ||
+                            el.hasAttribute('data-clickable') ||
+                            el.hasAttribute('data-bind')
+                        )) {
                             return el;
                         }
                         if (el.hasAttribute && el.hasAttribute('tabindex') && el.tabIndex >= 0) {
                             return el;
                         }
+                        if (el.hasAttribute && (
+                            el.hasAttribute('aria-expanded') ||
+                            el.hasAttribute('aria-pressed') ||
+                            el.hasAttribute('aria-haspopup')
+                        )) {
+                            return el;
+                        }
+                        const cls = (typeof el.className === 'string') ? el.className.toLowerCase() : '';
+                        if (cls && (cls.includes('btn') || cls.includes('button') || cls.includes('clickable') || cls.includes('cta') || cls.includes('action'))) {
+                            return el;
+                        }
+                        try {
+                            const cs = d.defaultView && d.defaultView.getComputedStyle(el);
+                            if (cs && cs.cursor === 'pointer') {
+                                return el;
+                            }
+                        } catch (e) {}
                         el = el.parentElement;
                     }
                     return null;
@@ -8997,15 +9076,6 @@ function applySpinnerColorFromHex(hexColor) {
                     currentBrandColor = brandColor;
                     applySpinnerColor(brandColor);
 
-                    // NOTE: the caller (click listener / touch tap) owns
-                    // preventDefault -- mirrorClick only computes and sends.
-                    // No transition overlay here: it made sense when every
-                    // click triggered a multi-second SingleFile capture; the
-                    // fast-capture + delta pipeline updates in <300ms, so a
-                    // blocking "wait for capture" spinner is pure flicker.
-                    // (showTransitionOverlay/hideTransitionOverlay stay for
-                    // explicit boot/loading flows; hideTransitionOverlay in
-                    // renderPageSnapshot remains a harmless no-op call.)
                     send(clickPayload);
                     return true;
                 }
@@ -9014,6 +9084,7 @@ function applySpinnerColorFromHex(hexColor) {
                 let lastPointerRelayAt = 0;
                 d.addEventListener('click', (ev) => {
                     try {
+                        triggerTouchFeedback(ev.target);
                         // pointerup already relayed this same activation.
                         // Consume the browser's follow-up click so the
                         // server does not execute it twice.
@@ -9048,30 +9119,22 @@ function applySpinnerColorFromHex(hexColor) {
                     } catch (e) { /* ignore */ }
                 }, true);
 
+                d.addEventListener('pointerdown', (ev) => {
+                    try {
+                        triggerTouchFeedback(ev.target);
+                    } catch (e) {}
+                }, { capture: true, passive: true });
+
                 // ---- touch delegation: phones tap INSIDE the iframe document ----
-                // Parent-container touch handlers never see these events (the
-                // touch targets the inner document), and the page's native
-                // scroll/zoom handling cancels click synthesis -- that's why
-                // taps worked on desktop (real mouse events) but not mobile.
-                // Proxy explicitly: taps -> mirrorClick (same path as desktop),
-                // drags -> wheel scroll, form fields keep native focus so the
-                // on-screen keyboard still opens.
                 let tStartX = 0, tStartY = 0, tStartT = 0, tLastX = 0, tLastY = 0;
                 let tScrollX = 0, tScrollY = 0, tMoved = false, tTimer = null, tField = false;
-                // 1:1 finger tracking parity with desktop wheel (which sends
-                // raw, unbatched deltas).  The old 2.5x multiplier made pans
-                // jumpy; fractional remainders are preserved between batches
-                // (accumulators subtract, not zero) to avoid drift/stutter.
                 const TOUCH_SCROLL_SENS = 1.0;
-                // Touchscreens jitter several device px during a deliberate
-                // tap; a mouse click is rock steady.  Use touch-realistic
-                // slop so taps stop being misclassified as drags ("clicks
-                // don't forward on mobile").
-                const TOUCH_MOVE_SLOP = 10;   // px of jitter before it is a drag
-                const TOUCH_TAP_DIST = 16;    // px allowed between press/release
-                const TOUCH_TAP_MS   = 800;   // no artificial 400ms tap timeout
+                const TOUCH_MOVE_SLOP = 8;
+                const TOUCH_TAP_DIST = 16;
+                const TOUCH_TAP_MS   = 800;
                 d.addEventListener('touchstart', (ev) => {
                     try {
+                        state._lastUserTouchTime = Date.now();
                         const t = ev.touches && ev.touches[0];
                         if (!t) return;
                         tStartX = tLastX = t.clientX; tStartY = tLastY = t.clientY;
@@ -9083,42 +9146,51 @@ function applySpinnerColorFromHex(hexColor) {
                             if (n.matches && n.matches('input,textarea,select,[contenteditable="true"]')) { tField = true; break; }
                             n = n.parentElement;
                         }
-                        // Do not preventDefault here. On iOS and some Android
-                        // browsers that suppresses the synthesized click.
-                        // A gesture is prevented only after it proves to be
-                        // a drag in touchmove, or after a handled tap below.
+                        if (!tField) {
+                            triggerTouchFeedback(ev.target);
+                        }
                     } catch (e) { /* ignore */ }
                 }, { capture: true, passive: false });
+
                 d.addEventListener('touchmove', (ev) => {
                     try {
+                        state._lastUserTouchTime = Date.now();
                         if (tField) return;
                         const t = ev.touches && ev.touches[0];
                         if (!t) return;
                         if (Math.abs(t.clientX - tStartX) > TOUCH_MOVE_SLOP || Math.abs(t.clientY - tStartY) > TOUCH_MOVE_SLOP) tMoved = true;
                         if (!tMoved) return;
-                        // Only cancel native scrolling once this is actually
-                        // a drag. A tap must remain eligible for click
-                        // synthesis on mobile Safari/Chrome.
                         try { ev.preventDefault(); } catch (e) {}
-                        tScrollX += -(t.clientX - tLastX) * TOUCH_SCROLL_SENS;
-                        tScrollY += -(t.clientY - tLastY) * TOUCH_SCROLL_SENS;
+                        const curDeltaX = -(t.clientX - tLastX) * TOUCH_SCROLL_SENS;
+                        const curDeltaY = -(t.clientY - tLastY) * TOUCH_SCROLL_SENS;
+                        tScrollX += curDeltaX;
+                        tScrollY += curDeltaY;
                         tLastX = t.clientX; tLastY = t.clientY;
+
+                        // Scroll client iframe locally for instantaneous 120Hz response
+                        try {
+                            const scrollTarget = d.defaultView || d.documentElement || d.body;
+                            if (scrollTarget && typeof scrollTarget.scrollBy === 'function') {
+                                scrollTarget.scrollBy(curDeltaX, curDeltaY);
+                            }
+                        } catch (e) {}
+
                         if (!tTimer) {
                             tTimer = setTimeout(() => {
                                 tTimer = null;
                                 const dx = Math.round(tScrollX), dy = Math.round(tScrollY);
                                 if (Math.abs(dx) > 1 || Math.abs(dy) > 1) {
                                     send({ type: 'input', subtype: 'wheel', x: Math.round(tLastX), y: Math.round(tLastY), deltaX: dx, deltaY: dy, deltaMode: 0 });
-                                    // keep the fractional remainder — zeroing
-                                    // lost sub-pixel motion every 20ms batch.
                                     tScrollX -= dx; tScrollY -= dy;
                                 }
                             }, 20);
                         }
                     } catch (e) { /* ignore */ }
                 }, { capture: true, passive: false });
+
                 d.addEventListener('touchend', (ev) => {
                     try {
+                        state._lastUserTouchTime = Date.now();
                         if (tField) { tField = false; return; }
                         if (tTimer) { clearTimeout(tTimer); tTimer = null; }
                         if (Math.abs(tScrollX) > 1 || Math.abs(tScrollY) > 1) {
@@ -9133,14 +9205,33 @@ function applySpinnerColorFromHex(hexColor) {
                         if (!tMoved && dt < TOUCH_TAP_MS && dist < TOUCH_TAP_DIST) {
                             let tapTarget = ev.target;
                             try { tapTarget = d.elementFromPoint(t.clientX, t.clientY) || tapTarget; } catch (e) { /* ignore */ }
-                            // Prevent the browser's synthesized click only
-                            // when the mirror handled the tap. Plain inputs
-                            // still need native focus and unhandled targets
-                            // should retain normal browser behavior.
+                            triggerTouchFeedback(tapTarget);
                             if (mirrorClick(tapTarget)) {
                                 try { ev.preventDefault(); } catch (e) {}
                             }
                             recordActivity();
+                        } else if (tMoved && dt > 0) {
+                            // Smooth momentum on flick
+                            const vx = -(t.clientX - tStartX) / dt;
+                            const vy = -(t.clientY - tStartY) / dt;
+                            if (Math.hypot(vx, vy) > 0.45) {
+                                let momVx = vx * 10;
+                                let momVy = vy * 10;
+                                const scrollTarget = d.defaultView || d.documentElement || d.body;
+                                function momentumStep() {
+                                    if (Math.abs(momVx) < 0.5 && Math.abs(momVy) < 0.5) return;
+                                    try {
+                                        if (scrollTarget && typeof scrollTarget.scrollBy === 'function') {
+                                            scrollTarget.scrollBy(Math.round(momVx), Math.round(momVy));
+                                        }
+                                    } catch (e) {}
+                                    send({ type: 'input', subtype: 'wheel', x: Math.round(tLastX), y: Math.round(tLastY), deltaX: Math.round(momVx), deltaY: Math.round(momVy), deltaMode: 0 });
+                                    momVx *= 0.92;
+                                    momVy *= 0.92;
+                                    requestAnimationFrame(momentumStep);
+                                }
+                                requestAnimationFrame(momentumStep);
+                            }
                         }
                     } catch (e) { /* ignore */ }
                 }, { capture: true, passive: false });
