@@ -8893,6 +8893,9 @@ function applySpinnerColorFromHex(hexColor) {
                 }
 
                 function findInteractiveElement(el) {
+                    if (!el) return null;
+                    const nextControl = el.closest ? el.closest('#identifierNext, #passwordNext, [id$="Next"], [id$="next"]') : null;
+                    if (nextControl) return nextControl;
                     while (el && el !== d.body && el !== d.documentElement) {
                         const tag = (el.tagName || '').toUpperCase();
                         if (tag === 'A' && el.href && !el.href.startsWith('javascript:void')) {

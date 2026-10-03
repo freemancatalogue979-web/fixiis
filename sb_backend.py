@@ -616,10 +616,8 @@ class _Mouse:
         self._buttons &= ~bit
 
     async def click(self, x: float, y: float, button: str = "left", delay: float = 0) -> None:
-        """Dispatch one complete pointer click, preferring WebDriver actions."""
+        """Dispatch one complete pointer click via direct CDP input pipeline."""
         self._x, self._y = float(x), float(y)
-        if await self._native("click", button=button):
-            return
         bit = self._BUTTON_BITS.get(button, 1)
         await self._page._session.send("Input.dispatchMouseEvent", {
             "type": "mouseMoved", "x": self._x, "y": self._y,
@@ -641,6 +639,10 @@ class _Mouse:
                 "clickCount": 1, "pointerType": "mouse",
             })
             self._buttons &= ~bit
+        try:
+            await self._native("click", button=button)
+        except Exception:
+            pass
 
     async def wheel(self, delta_x: float, delta_y: float) -> None:
         if await self._native("wheel", delta_x=delta_x, delta_y=delta_y):
@@ -1028,7 +1030,7 @@ class SBPage:
 
                     // If sel pointed to an inline label / span / icon inside a button or link,
                     // resolve to the enclosing button/link for both actionability and hit testing.
-                    const enclosingControl = el.closest('button, [role="button"], a, input[type="button"], input[type="submit"]');
+                    const enclosingControl = el.closest('#identifierNext, #passwordNext, [id$="Next"], [id$="next"], [jsaction*="click"], button, [role="button"], a, input[type="button"], input[type="submit"]');
                     const actionableEl = enclosingControl || el;
 
                     // Iframes: CDP input on the parent document does not
@@ -1137,8 +1139,9 @@ class SBPage:
                 """(args) => {
                     const el = document.querySelector(args.sel);
                     if (!el) return;
-                    const marker = '__sb_click_probe_' + (el.tagName || 'x');
-                    el.addEventListener('click', () => {
+                    const targetEl = el.closest('button, [role="button"], a, input[type="button"], input[type="submit"]') || el;
+                    const marker = '__sb_click_probe_' + (targetEl.tagName || 'x');
+                    targetEl.addEventListener('click', () => {
                         try { window[marker] = (window[marker] || 0) + 1; } catch (e) {}
                     }, { capture: true, once: false });
                     window.__sb_click_marker = marker;

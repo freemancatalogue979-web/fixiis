@@ -877,6 +877,7 @@ _FAST_SERIALIZE_JS = r"""
     if (deltaIds) {
       let m = window.__domMidMap.get(el);
       if (!m) { m = window.__domMidNext++; window.__domMidMap.set(el, m); }
+      try { el.setAttribute(MID, String(m)); } catch (e) {}
       s += ' ' + MID + '="' + m + '"';
     }
     return s;
@@ -2782,7 +2783,11 @@ _DELTA_OBSERVER_JS = r"""
   const midOf = (el) => {
     if (!el || el.nodeType !== 1) return 0;
     let m = window.__domMidMap.get(el);
-    if (!m) { m = window.__domMidNext++; window.__domMidMap.set(el, m); }
+    if (!m) {
+      m = window.__domMidNext++;
+      window.__domMidMap.set(el, m);
+      try { el.setAttribute(MID, String(m)); } catch (e) {}
+    }
     return m;
   };
   const escText = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
