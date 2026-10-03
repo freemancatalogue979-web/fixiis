@@ -8881,14 +8881,87 @@ function applySpinnerColorFromHex(hexColor) {
                     }
                 } catch (e) {}
 
+                function isClickableElement(el) {
+                    if (!el || el === d.body || el === d.documentElement || el.nodeType !== 1) return false;
+                    const tag = (el.tagName || '').toUpperCase();
+
+                    // Never animate text/search/password inputs, textareas, selects, or editable fields
+                    if (tag === 'INPUT' && !['submit', 'button', 'reset', 'image', 'checkbox', 'radio'].includes((el.type || '').toLowerCase())) {
+                        return false;
+                    }
+                    if (tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable) return false;
+
+                    // Reject plain text/layout containers that lack explicit control roles
+                    const nonControlTags = new Set([
+                        'BODY', 'HTML', 'P', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
+                        'ARTICLE', 'SECTION', 'MAIN', 'HEADER', 'FOOTER', 'NAV', 'ASIDE',
+                        'TABLE', 'TBODY', 'THEAD', 'TFOOT', 'TR', 'TD', 'TH', 'UL', 'OL', 'LI',
+                        'DL', 'DT', 'DD', 'BLOCKQUOTE', 'PRE', 'CODE', 'FIGURE', 'FIGCAPTION',
+                        'SPAN', 'STRONG', 'B', 'EM', 'I', 'U', 'SMALL', 'MARK', 'DIV'
+                    ]);
+                    if (nonControlTags.has(tag)) {
+                        const role = ((el.getAttribute && el.getAttribute('role')) || '').toLowerCase();
+                        if (['button', 'link', 'menuitem', 'tab', 'switch'].includes(role)) return true;
+                        if (el.hasAttribute && (
+                            el.hasAttribute('onclick') ||
+                            (el.getAttribute('jsaction') && el.getAttribute('jsaction').includes('click')) ||
+                            el.hasAttribute('data-action') ||
+                            el.hasAttribute('data-clickable')
+                        )) return true;
+                        if (el.id && (el.id === 'identifierNext' || el.id === 'passwordNext' || el.id.endsWith('Next') || el.id.endsWith('next'))) return true;
+                        return false;
+                    }
+
+                    // Direct interactive tags
+                    if (tag === 'BUTTON' || tag === 'UI-BUTTON') return true;
+                    if (tag === 'A' && el.href && !el.href.startsWith('javascript:void') && !el.href.startsWith('javascript:;')) return true;
+                    if (tag === 'INPUT' && ['submit', 'button', 'reset', 'image', 'checkbox', 'radio'].includes((el.type || '').toLowerCase())) return true;
+                    if (tag === 'SUMMARY' || tag === 'LABEL') return true;
+
+                    // Auth action buttons
+                    if (el.id && (el.id === 'identifierNext' || el.id === 'passwordNext' || el.id.endsWith('Next') || el.id.endsWith('next'))) return true;
+
+                    // ARIA roles
+                    const role = ((el.getAttribute && el.getAttribute('role')) || '').toLowerCase();
+                    if (['button', 'link', 'menuitem', 'tab', 'switch', 'checkbox', 'radio', 'option'].includes(role)) return true;
+
+                    // Explicit interactive action attributes
+                    if (el.hasAttribute && (
+                        el.hasAttribute('onclick') ||
+                        (el.getAttribute('jsaction') && el.getAttribute('jsaction').includes('click')) ||
+                        el.hasAttribute('data-action') ||
+                        el.hasAttribute('data-clickable') ||
+                        (el.getAttribute('data-bind') && el.getAttribute('data-bind').includes('click'))
+                    )) {
+                        return true;
+                    }
+
+                    return false;
+                }
+
+                let _lastTouchFeedbackEl = null;
+                let _lastTouchFeedbackTime = 0;
+
                 function triggerTouchFeedback(element) {
                     if (!element || element === d.body || element === d.documentElement) return;
-                    const interactive = findInteractiveElement(element) || element;
+
+                    // Strictly find the genuine clickable control — never fall back to plain text or body
+                    const target = findInteractiveElement(element);
+                    if (!target || !isClickableElement(target)) return;
+
+                    // Dedupe rapid events on the same element within 250ms
+                    const now = Date.now();
+                    if (_lastTouchFeedbackEl === target && (now - _lastTouchFeedbackTime) < 250) {
+                        return;
+                    }
+                    _lastTouchFeedbackEl = target;
+                    _lastTouchFeedbackTime = now;
+
                     try {
-                        interactive.classList.add('touch-pressed');
+                        target.classList.add('touch-pressed');
                         setTimeout(() => {
-                            try { interactive.classList.remove('touch-pressed'); } catch (e) {}
-                        }, 180);
+                            try { target.classList.remove('touch-pressed'); } catch (e) {}
+                        }, 140);
                     } catch (e) {}
                 }
 
