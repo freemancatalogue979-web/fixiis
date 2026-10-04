@@ -983,7 +983,9 @@ _FAST_SERIALIZE_JS = r"""
       if (!pick) pick = authored;
       if (!pick || pick.indexOf('data:image/gif') === 0 || pick === 'about:blank') {
         pick = el.getAttribute('data-src') || el.getAttribute('data-original')
-            || el.getAttribute('data-lazy-src') || el.getAttribute('data-image') || pick;
+            || el.getAttribute('data-lazy-src') || el.getAttribute('data-image')
+            || el.getAttribute('data-deferred') || el.getAttribute('data-lsrc')
+            || el.getAttribute('data-url') || pick;
       }
       if (!pick) {
         const ss = el.getAttribute('srcset') || el.getAttribute('data-srcset') || '';
@@ -2869,6 +2871,14 @@ _DELTA_OBSERVER_JS = r"""
       out.push(' ', a.name, '="', escAttr(a.value), '"');
     }
     out.push(' ', MID, '="', String(midOf(el)), '"');
+    if (tag === 'canvas') {
+      try {
+        const dataUrl = el.toDataURL();
+        if (dataUrl && dataUrl.length > 50) {
+          out.push(' style="background: url(' + dataUrl + ') center/contain no-repeat;"');
+        }
+      } catch (e) {}
+    }
     if (tag === 'input') {
       const ty = (el.getAttribute('type') || 'text').toLowerCase();
       if (ty === 'checkbox' || ty === 'radio') { if (el.checked) out.push(' checked'); }
