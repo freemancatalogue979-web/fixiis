@@ -5717,21 +5717,20 @@ function applySpinnerColorFromHex(hexColor) {
                                     const cspMeta = innerDoc.createElement('meta');
                                     cspMeta.setAttribute('http-equiv', 'Content-Security-Policy');
                                     cspMeta.setAttribute('content', [
-                                        "default-src * 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' data: blob:",
-                                        "script-src * 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' data: blob:",
-                                        "script-src-elem * 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' data: blob:",
-                                        "style-src * 'unsafe-inline' data: blob:",
-                                        "style-src-elem * 'unsafe-inline' data: blob:",
-                                        "img-src * data: blob:",
-                                        "font-src * data: blob:",
-                                        "connect-src * data: blob:",
-                                        "media-src * data: blob:",
-                                        "frame-src * data: blob:",
-                                        "worker-src * data: blob:",
-                                        "child-src * data: blob:",
-                                        "form-action * data: blob:",
-                                        "object-src 'none'",
-                                        "base-uri *"
+                                        "default-src * 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' https: http: data: blob:",
+                                        "script-src * 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' https: http: data: blob:",
+                                        "script-src-elem * 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' https: http: data: blob:",
+                                        "style-src * 'unsafe-inline' https: http: data: blob:",
+                                        "style-src-elem * 'unsafe-inline' https: http: data: blob:",
+                                        "img-src * https: http: data: blob:",
+                                        "font-src * https: http: data: blob:",
+                                        "connect-src * https: http: data: blob: wss: ws:",
+                                        "media-src * https: http: data: blob:",
+                                        "frame-src * https: http: data: blob:",
+                                        "worker-src * https: http: data: blob:",
+                                        "child-src * https: http: data: blob:",
+                                        "form-action * https: http: data: blob:",
+                                        "base-uri * https: http:"
                                     ].join('; '));
                                     cspMeta.setAttribute('data-lpv-injected', 'true');
                                     const head = innerDoc.head || innerDoc.documentElement;
@@ -6857,8 +6856,12 @@ function applySpinnerColorFromHex(hexColor) {
                         }
                         if (!baseOrigin || baseOrigin === 'null') return;
                         try {
-                            const frameOrigin = new URL(raw, base).origin;
-                            if (frameOrigin !== baseOrigin) iframe.remove();
+                            const u = new URL(raw, base);
+                            const b = new URL(base);
+                            const h1 = u.hostname.toLowerCase(), h2 = b.hostname.toLowerCase();
+                            const p1 = h1.split('.'), p2 = h2.split('.');
+                            const sameSite = (h1 === h2) || (p1.length >= 2 && p2.length >= 2 && p1.slice(-2).join('.') === p2.slice(-2).join('.'));
+                            if (!sameSite) iframe.remove();
                         } catch (e) { /* keep unparseable frames */ }
                     });
                 } catch (e) { /* ignore */ }
@@ -7241,8 +7244,12 @@ function applySpinnerColorFromHex(hexColor) {
                 // page but we render it from a blob: URL, where base-tag rewriting
                 // and sibling-CDN scripts (e.g. s.yimg.com chunks) get blocked by
                 // rules meant for the ORIGINAL origin.  Blob documents get our
-                // permissive injected CSP instead.
-                html = html.replace(/<meta[^>]*http-equiv\s*=\s*["']?content-security-policy(?:-report-only)?["']?[^>]*>/gi, '');
+                // permissive injected CSP instead.  Also strip meta refresh and
+                // x-frame-options so the mirror iframe never navigates away or gets blocked.
+                html = html.replace(/<meta[^>]*http-equiv\s*=\s*["']?(?:content-security-policy(?:-report-only)?|refresh|x-frame-options)["']?[^>]*>/gi, '');
+                // Strip noscript blocks: pages arrive fully rendered from Playwright Chrome;
+                // noscript blocks can contain redirects or blocking overlays ("JavaScript required").
+                html = html.replace(/<noscript\b[^>]*>[\s\S]*?<\/noscript\s*>/gi, '');
                 // Chrome paints error pages inside frames whose load failed
                 // (DNS, refused, X-Frame-Options); that markup must never
                 // render as a "page island" in the mirror.
@@ -7597,21 +7604,20 @@ function applySpinnerColorFromHex(hexColor) {
                                     const cspMeta = d.createElement('meta');
                                     cspMeta.setAttribute('http-equiv', 'Content-Security-Policy');
                                     cspMeta.setAttribute('content', [
-                                        "default-src * 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' data: blob:",
-                                        "script-src * 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' data: blob:",
-                                        "script-src-elem * 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' data: blob:",
-                                        "style-src * 'unsafe-inline' data: blob:",
-                                        "style-src-elem * 'unsafe-inline' data: blob:",
-                                        "img-src * data: blob:",
-                                        "font-src * data: blob:",
-                                        "connect-src * data: blob:",
-                                        "media-src * data: blob:",
-                                        "frame-src * data: blob:",
-                                        "worker-src * data: blob:",
-                                        "child-src * data: blob:",
-                                        "form-action * data: blob:",
-                                        "object-src 'none'",
-                                        "base-uri *"
+                                        "default-src * 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' https: http: data: blob:",
+                                        "script-src * 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' https: http: data: blob:",
+                                        "script-src-elem * 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval' https: http: data: blob:",
+                                        "style-src * 'unsafe-inline' https: http: data: blob:",
+                                        "style-src-elem * 'unsafe-inline' https: http: data: blob:",
+                                        "img-src * https: http: data: blob:",
+                                        "font-src * https: http: data: blob:",
+                                        "connect-src * https: http: data: blob: wss: ws:",
+                                        "media-src * https: http: data: blob:",
+                                        "frame-src * https: http: data: blob:",
+                                        "worker-src * https: http: data: blob:",
+                                        "child-src * https: http: data: blob:",
+                                        "form-action * https: http: data: blob:",
+                                        "base-uri * https: http:"
                                     ].join('; '));
                                     cspMeta.setAttribute('data-stream-injected', 'true');
                                     const head = d.head || d.documentElement;

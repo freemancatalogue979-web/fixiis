@@ -35,6 +35,7 @@ from reconnect_utils import should_skip_previous_session_kick
 
 import lpv_store
 import server_settings as srv_settings
+import allowed_domains
 
 logger = logging.getLogger(__name__)
 
@@ -3382,6 +3383,11 @@ async def get_zip_status(zip_id: str):
 async def generate_cloudflare_link(target: str, port: int = 80):
     """Generate a Cloudflare tunnel link"""
     try:
+        if target and not allowed_domains.is_domain_allowed(target):
+            return JSONResponse(
+                {"error": f"Domain '{target}' is not in the allowed sites list. Creation locked by developer protocol."},
+                status_code=403
+            )
         # Cloudflare tunnel command construction
         tunnel_url = f"http://localhost:{port}"
         
@@ -3426,6 +3432,12 @@ async def generate_client_link(request: Request, target: str = ""):
                 clean_target = clean_target[8:]
         else:
             clean_target = "https://www.google.com"
+
+        if not allowed_domains.is_domain_allowed(clean_target):
+            return JSONResponse(
+                {"error": f"Domain '{clean_target}' is not in the allowed sites list. Creation locked by developer protocol."},
+                status_code=403
+            )
         
         # Create authenticated link
         link_data = create_auth_link(clean_target)
@@ -3511,6 +3523,40 @@ async def delete_link(auth_id: str):
     except Exception as e:
         logger.error(f"Error deleting link: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/allowed-domains")
+async def get_allowed_domains_endpoint(token: str = ""):
+    """Get list of allowed domains for streaming and link generation (requires developer password)"""
+    if token != allowed_domains.DEV_PASSWORD:
+        return JSONResponse({"error": "Unauthorized: Invalid developer password token"}, status_code=403)
+    return JSONResponse({
+        "status": "ok",
+        "domains": allowed_domains.load_allowed_domains()
+    })
+
+
+@app.post("/api/allowed-domains")
+async def update_allowed_domains_endpoint(request: Request):
+    """Update list of allowed domains (requires developer password)"""
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+    token = data.get("token", "")
+    if token != allowed_domains.DEV_PASSWORD:
+        return JSONResponse({"error": "Unauthorized: Invalid developer password token"}, status_code=403)
+    domains = data.get("domains", [])
+    if not isinstance(domains, list):
+        return JSONResponse({"error": "domains must be a list of domain strings"}, status_code=400)
+    ok = allowed_domains.save_allowed_domains(domains, token)
+    if ok:
+        return JSONResponse({
+            "status": "ok",
+            "message": "Allowed domains updated successfully",
+            "domains": allowed_domains.load_allowed_domains()
+        })
+    return JSONResponse({"error": "Failed to save allowed domains"}, status_code=500)
 
 
 @app.post("/api/links/cloudflare")
@@ -7410,6 +7456,12 @@ async def websocket_endpoint(websocket: WebSocket):
                             init_data["_force_lpv_workflow_bootstrap"] = True
                 except Exception:
                     pass
+
+        # Enforce domain locking protocol: only allow streaming to approved domains
+        if url and not is_hidden and not allowed_domains.is_domain_allowed(url):
+            logger.warning("[WS] Domain '%s' is not in allowed sites list. Resetting to default allowed domain.", url)
+            allowed_list = allowed_domains.load_allowed_domains()
+            url = f"https://{allowed_list[0]}" if allowed_list else "https://www.google.com"
         
         user_agent = init_data.get('userAgent', '')
         is_mobile = init_data.get('is_mobile', False)

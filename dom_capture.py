@@ -519,6 +519,22 @@ def _strip_dead_subframes(html: str, base_url: Optional[str] = None) -> str:
     # cross-origin frames, not only this host.
     out = _remove_known_dead_frame_tags(out)
 
+    # Strip meta refresh, x-frame-options, and noscript blocks so they don't break/redirect the mirror
+    out = _rewrite_html_outside_protected(
+        out,
+        lambda part: re.sub(
+            r"<meta\b[^>]*http-equiv=[\"\'](?:refresh|x-frame-options|content-security-policy(?:-report-only)?)[\"\'][^>]*>",
+            "", part, flags=re.IGNORECASE,
+        ),
+    )
+    out = _rewrite_html_outside_protected(
+        out,
+        lambda part: re.sub(
+            r"<noscript\b[^>]*>[\s\S]*?</noscript\s*>",
+            "", part, flags=re.IGNORECASE,
+        ),
+    )
+
     if not base_url:
         return out
     try:
@@ -547,7 +563,15 @@ def _strip_dead_subframes(html: str, base_url: Optional[str] = None) -> str:
                 target.scheme.lower(), target.hostname.lower() if target.hostname else "",
                 target.port or (443 if target.scheme.lower() == "https" else 80),
             )
-            if target_origin != page_origin:
+            h1 = target_origin[1]
+            h2 = page_origin[1]
+            same_site = (h1 == h2)
+            if not same_site and h1 and h2:
+                p1 = h1.split('.')
+                p2 = h2.split('.')
+                if len(p1) >= 2 and len(p2) >= 2 and p1[-2:] == p2[-2:]:
+                    same_site = True
+            if target_origin[0] != page_origin[0] or (not same_site and target_origin != page_origin):
                 return ""
         except Exception:
             return match.group(0)
@@ -928,7 +952,12 @@ _FAST_SERIALIZE_JS = r"""
       if (fsrc && fsrc.indexOf('about:') !== 0) {
         try {
           const loc = document.location;
-          if (new URL(fsrc, loc.href).origin !== loc.origin) return;
+          const u = new URL(fsrc, loc.href);
+          if (u.protocol !== loc.protocol) return;
+          const h1 = u.hostname.toLowerCase(), h2 = loc.hostname.toLowerCase();
+          const p1 = h1.split('.'), p2 = h2.split('.');
+          const sameSite = (h1 === h2) || (p1.length >= 2 && p2.length >= 2 && p1.slice(-2).join('.') === p2.slice(-2).join('.'));
+          if (!sameSite) return;
         } catch (e) { /* unparseable src -> keep */ }
       }
     }

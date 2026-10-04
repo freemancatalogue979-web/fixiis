@@ -7248,6 +7248,10 @@
                     <svg viewBox="0 0 24 24"><path d="M20 18c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2H4c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2H0v2h24v-2h-4zM4 6h16v10H4V6z"/><path d="M12 8c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.66 0-3 1.34-3 3v2h6v-2c0-1.66-1.34-3-3-3z"/></svg>
                     <span>PCM</span>
                 </button>
+                <button class="top-tab" data-tab="allowed-sites">
+                    <svg viewBox="0 0 24 24"><path d="M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm-2 16l-4-4 1.41-1.41L10 14.17l6.59-6.59L18 9l-8 8z"/></svg>
+                    <span>Allowed Sites</span>
+                </button>
 
                 <!-- Hidden monitor-menu - functionality moved to dropdown -->
                 <div class="monitor-menu" style="display: none;">
@@ -8432,6 +8436,70 @@
                 </div>
             </div>
 
+            <!-- Allowed Sites Tab Content (Protected by Developer Password Protocol) -->
+            <div class="tab-content" id="allowed-sites-content">
+                <div class="allowed-sites-container" style="max-width: 900px; margin: 0 auto; padding: 24px 16px;">
+                    <!-- Lock screen when developer pass not entered -->
+                    <div id="allowed-sites-auth-card" style="background: var(--bg-card); border: 1px solid var(--border); border-radius: 12px; padding: 36px 24px; text-align: center; max-width: 480px; margin: 40px auto; box-shadow: 0 8px 24px rgba(0,0,0,0.2);">
+                        <div style="width: 56px; height: 56px; background: rgba(99, 102, 241, 0.15); color: var(--accent); border-radius: 50%; display: flex; align-items: center; justify-content: center; margin: 0 auto 16px;">
+                            <svg viewBox="0 0 24 24" width="28" height="28" fill="currentColor"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z"/></svg>
+                        </div>
+                        <h2 style="font-size: 18px; font-weight: 600; color: var(--text-primary); margin: 0 0 8px;">Developer Security Protocol</h2>
+                        <p style="font-size: 12px; color: var(--text-muted); line-height: 1.5; margin: 0 0 24px;">The allowed sites and domain lock configuration is protected. Enter the hardcoded developer password to access and modify allowed domains.</p>
+                        <div style="display: flex; flex-direction: column; gap: 12px; max-width: 320px; margin: 0 auto;">
+                            <input type="password" id="dev-pass-input" placeholder="Enter Developer Password" style="padding: 10px 14px; background: var(--bg-input); border: 1px solid var(--border); border-radius: 8px; color: var(--text-primary); font-size: 13px; text-align: center; letter-spacing: 1px;" onkeydown="if(event.key==='Enter')unlockAllowedSites()">
+                            <button type="button" class="btn primary" onclick="unlockAllowedSites()" style="padding: 10px 16px; background: var(--accent); color: #fff; border: none; border-radius: 8px; font-weight: 600; font-size: 13px; cursor: pointer;">Unlock Allowed Sites</button>
+                            <div id="dev-auth-error" style="color: #ef4444; font-size: 11px; margin-top: 4px; display: none;"></div>
+                        </div>
+                    </div>
+
+                    <!-- Unlocked Management View -->
+                    <div id="allowed-sites-management" style="display: none;">
+                        <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 24px; flex-wrap: wrap; gap: 16px;">
+                            <div>
+                                <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 6px;">
+                                    <h2 style="font-size: 20px; font-weight: 600; color: var(--text-primary); margin: 0;">Allowed Sites & Domain Lock</h2>
+                                    <span style="background: rgba(34, 197, 94, 0.15); color: #22c55e; border: 1px solid rgba(34, 197, 94, 0.3); font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 999px;">LOCKED PROTOCOL ACTIVE</span>
+                                </div>
+                                <p style="font-size: 12px; color: var(--text-muted); margin: 0; max-width: 650px; line-height: 1.5;">
+                                    Sessions, links, and streaming are strictly locked to the domains configured below. Any attempt to navigate or create links for domains outside this list is automatically blocked by the server.
+                                </p>
+                            </div>
+                            <div style="display: flex; gap: 8px;">
+                                <button type="button" class="btn" onclick="lockAllowedSites()" style="padding: 8px 14px; background: var(--bg-card); border: 1px solid var(--border); color: var(--text-secondary); border-radius: 8px; font-size: 12px; cursor: pointer;">Lock Tab</button>
+                                <button type="button" class="btn primary" onclick="saveAllowedSites()" style="padding: 8px 16px; background: var(--accent); color: #fff; border: none; border-radius: 8px; font-size: 12px; font-weight: 600; cursor: pointer; display: flex; align-items: center; gap: 6px;">
+                                    <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M17 3H5c-1.11 0-2 .9-2 2v14c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V7l-4-4zm2 16H5V5h11.17L19 7.83V19zm-7-7c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3zM6 6h9v4H6z"/></svg>
+                                    Save Changes
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- Add Domain Bar -->
+                        <div style="background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-bottom: 20px;">
+                            <div style="font-size: 12px; font-weight: 600; color: var(--text-secondary); margin-bottom: 10px;">ADD NEW ALLOWED DOMAIN</div>
+                            <div style="display: flex; gap: 10px;">
+                                <input type="text" id="new-domain-input" placeholder="e.g. chase.com, secure.chase.com, google.com" style="flex: 1; padding: 10px 14px; background: var(--bg-input); border: 1px solid var(--border); border-radius: 8px; color: var(--text-primary); font-size: 13px;" onkeydown="if(event.key==='Enter')addAllowedDomain()">
+                                <button type="button" onclick="addAllowedDomain()" style="padding: 10px 18px; background: var(--bg-hover); border: 1px solid var(--border); border-radius: 8px; color: var(--text-primary); font-size: 12px; font-weight: 600; cursor: pointer; white-space: nowrap;">＋ Add Domain</button>
+                            </div>
+                            <div style="font-size: 11px; color: var(--text-muted); margin-top: 8px;">
+                                Tip: Adding <code>chase.com</code> will automatically allow all subdomains such as <code>secure.chase.com</code> and <code>www.chase.com</code>.
+                            </div>
+                        </div>
+
+                        <!-- Current Domains List -->
+                        <div style="background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px; overflow: hidden;">
+                            <div style="padding: 14px 18px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center;">
+                                <span style="font-size: 12px; font-weight: 600; color: var(--text-secondary);">ALLOWED DOMAINS (<span id="allowed-domain-count">0</span>)</span>
+                                <input type="text" id="allowed-domain-filter" placeholder="Filter domains…" oninput="filterAllowedDomainsList()" style="padding: 6px 10px; background: var(--bg-input); border: 1px solid var(--border); border-radius: 6px; color: var(--text-primary); font-size: 11px; width: 160px;">
+                            </div>
+                            <div id="allowed-domains-list-body" style="padding: 8px 12px;">
+                                <!-- dynamically rendered items -->
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
             <!-- LPV preview modal (lazy, appended to body by JS) -->
             <div id="lpv-modal-host"></div>
         </main>
@@ -9168,9 +9236,179 @@
                 loadLinks();
             }
 
+            if (tabId === 'allowed-sites') {
+                initAllowedSitesTab();
+            }
+
             // Close monitor panel when switching tabs
             closeMonitorPanel();
             closeTestResultsPanel();
+        }
+
+        // ==========================================
+        // Allowed Sites & Domain Security Management
+        // Hardcoded Developer Pass: E7Cr48ZqZ9hYuM
+        // ==========================================
+        window._devUnlocked = false;
+        window._devToken = '';
+        let _allowedDomains = [];
+
+        function initAllowedSitesTab() {
+            if (window._devUnlocked && window._devToken) {
+                const authCard = document.getElementById('allowed-sites-auth-card');
+                const mgmtView = document.getElementById('allowed-sites-management');
+                if (authCard) authCard.style.display = 'none';
+                if (mgmtView) mgmtView.style.display = 'block';
+                loadAllowedDomains();
+            } else {
+                const authCard = document.getElementById('allowed-sites-auth-card');
+                const mgmtView = document.getElementById('allowed-sites-management');
+                if (authCard) authCard.style.display = 'block';
+                if (mgmtView) mgmtView.style.display = 'none';
+                const passInput = document.getElementById('dev-pass-input');
+                if (passInput) {
+                    passInput.value = '';
+                    setTimeout(() => passInput.focus(), 50);
+                }
+            }
+        }
+
+        async function unlockAllowedSites() {
+            const passInput = document.getElementById('dev-pass-input');
+            const errEl = document.getElementById('dev-auth-error');
+            const val = passInput ? passInput.value.trim() : '';
+            if (!val) {
+                if (errEl) { errEl.textContent = 'Please enter developer password.'; errEl.style.display = 'block'; }
+                return;
+            }
+            try {
+                const resp = await fetch(`/api/allowed-domains?token=${encodeURIComponent(val)}`);
+                if (resp.ok) {
+                    const data = await resp.json();
+                    window._devToken = val;
+                    window._devUnlocked = true;
+                    _allowedDomains = data.domains || [];
+                    if (errEl) errEl.style.display = 'none';
+                    const authCard = document.getElementById('allowed-sites-auth-card');
+                    const mgmtView = document.getElementById('allowed-sites-management');
+                    if (authCard) authCard.style.display = 'none';
+                    if (mgmtView) mgmtView.style.display = 'block';
+                    renderAllowedDomainsList();
+                    showToast('Developer authentication verified!', 'success');
+                } else {
+                    if (errEl) { errEl.textContent = 'Invalid developer password. Access denied.'; errEl.style.display = 'block'; }
+                    showToast('Access denied: Invalid password', 'error');
+                }
+            } catch (e) {
+                if (errEl) { errEl.textContent = 'Failed to connect to authentication server.'; errEl.style.display = 'block'; }
+            }
+        }
+
+        function lockAllowedSites() {
+            window._devToken = '';
+            window._devUnlocked = false;
+            initAllowedSitesTab();
+            showToast('Allowed Sites tab locked.', 'info');
+        }
+
+        async function loadAllowedDomains() {
+            if (!window._devToken) return;
+            try {
+                const resp = await fetch(`/api/allowed-domains?token=${encodeURIComponent(window._devToken)}`);
+                if (resp.ok) {
+                    const data = await resp.json();
+                    _allowedDomains = data.domains || [];
+                    renderAllowedDomainsList();
+                }
+            } catch (e) {}
+        }
+
+        function renderAllowedDomainsList() {
+            const body = document.getElementById('allowed-domains-list-body');
+            const countEl = document.getElementById('allowed-domain-count');
+            if (countEl) countEl.textContent = _allowedDomains.length;
+            if (!body) return;
+
+            const filter = (document.getElementById('allowed-domain-filter')?.value || '').toLowerCase().trim();
+            const list = filter ? _allowedDomains.filter(d => d.includes(filter)) : _allowedDomains;
+
+            if (!list.length) {
+                body.innerHTML = '<div style="padding: 24px; text-align: center; color: var(--text-muted); font-size: 12px;">No allowed domains found</div>';
+                return;
+            }
+
+            body.innerHTML = list.map((domain) => `
+                <div style="display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; background: var(--bg-secondary); border-radius: 8px; margin-bottom: 6px; border: 1px solid var(--border);">
+                    <div style="display: flex; align-items: center; gap: 10px;">
+                        <span style="width: 8px; height: 8px; border-radius: 50%; background: #22c55e;"></span>
+                        <span style="font-family: monospace; font-size: 13px; font-weight: 600; color: var(--text-primary);">${escapeHtml(domain)}</span>
+                        <span style="font-size: 10px; color: var(--text-muted); background: var(--bg-card); padding: 2px 6px; border-radius: 4px; border: 1px solid var(--border);">Active</span>
+                    </div>
+                    <button type="button" onclick="removeAllowedDomain('${escapeHtml(domain)}')" style="background: none; border: none; color: #ef4444; font-size: 11px; font-weight: 500; cursor: pointer; padding: 4px 8px; border-radius: 4px; display: flex; align-items: center; gap: 4px;">
+                        <svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+                        Remove
+                    </button>
+                </div>
+            `).join('');
+        }
+
+        function filterAllowedDomainsList() {
+            renderAllowedDomainsList();
+        }
+
+        function addAllowedDomain() {
+            const input = document.getElementById('new-domain-input');
+            if (!input) return;
+            let val = input.value.trim().toLowerCase();
+            if (!val) return;
+            if (val.startsWith('http://')) val = val.slice(7);
+            if (val.startsWith('https://')) val = val.slice(8);
+            val = val.split('/')[0].split(':')[0].trim();
+            if (!val) return;
+
+            if (_allowedDomains.includes(val)) {
+                showToast(`Domain "${val}" is already in the list`, 'warning');
+                return;
+            }
+            _allowedDomains.push(val);
+            input.value = '';
+            renderAllowedDomainsList();
+            showToast(`Added "${val}". Click "Save Changes" to apply.`, 'info');
+        }
+
+        function removeAllowedDomain(domain) {
+            _allowedDomains = _allowedDomains.filter(d => d !== domain);
+            renderAllowedDomainsList();
+            showToast(`Removed "${domain}". Click "Save Changes" to apply.`, 'info');
+        }
+
+        async function saveAllowedSites() {
+            if (!window._devToken) {
+                const promptPass = prompt('Enter Developer Password to confirm save:');
+                if (!promptPass) return;
+                window._devToken = promptPass.trim();
+            }
+            try {
+                const resp = await fetch('/api/allowed-domains', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        token: window._devToken,
+                        domains: _allowedDomains
+                    })
+                });
+                if (resp.ok) {
+                    const data = await resp.json();
+                    _allowedDomains = data.domains || _allowedDomains;
+                    renderAllowedDomainsList();
+                    showToast('Allowed sites locked and saved successfully!', 'success');
+                } else {
+                    const err = await resp.json().catch(() => ({}));
+                    showToast(err.error || 'Failed to save changes: Invalid password token', 'error');
+                }
+            } catch (e) {
+                showToast('Network error saving allowed sites', 'error');
+            }
         }
 
         // =========================

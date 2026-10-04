@@ -2533,6 +2533,10 @@ class NeoStreamingSession:
 
     async def handle_navigation(self, url: str):
         if self.dom_capture:
+            import allowed_domains
+            if url and not allowed_domains.is_domain_allowed(url):
+                logger.warning("[NAV] Blocked navigation to unallowed domain: %s", url)
+                return
             self._apply_snapshot_preference(url)
             await self.dom_capture.handle_navigation(url)
 
