@@ -1658,8 +1658,35 @@ class SBBrowser:
                 pass
         if self._handle is not None and self._handle.user_agent:
             try:
+                ch_ver = "147"
+                m = re.search(r'Chrome/(\d+)', self._handle.user_agent)
+                if m:
+                    ch_ver = m.group(1)
+                is_mobile = bool(self._handle.mobile)
+                platform = "Android" if (is_mobile and "Android" in self._handle.user_agent) else ("iOS" if (is_mobile and ("iPhone" in self._handle.user_agent or "iPad" in self._handle.user_agent)) else ("macOS" if "Mac" in self._handle.user_agent else ("Linux" if "Linux" in self._handle.user_agent else "Windows")))
                 await page._session.send("Emulation.setUserAgentOverride", {
                     "userAgent": self._handle.user_agent,
+                    "acceptLanguage": "en-US,en;q=0.9",
+                    "platform": platform,
+                    "userAgentMetadata": {
+                        "brands": [
+                            {"brand": "Google Chrome", "version": ch_ver},
+                            {"brand": "Chromium", "version": ch_ver},
+                            {"brand": "Not_A Brand", "version": "24"}
+                        ],
+                        "fullVersionList": [
+                            {"brand": "Google Chrome", "version": f"{ch_ver}.0.0.0"},
+                            {"brand": "Chromium", "version": f"{ch_ver}.0.0.0"},
+                            {"brand": "Not_A Brand", "version": "24.0.0.0"}
+                        ],
+                        "fullVersion": f"{ch_ver}.0.0.0",
+                        "platform": platform,
+                        "platformVersion": "15.0.0" if platform == "Windows" else ("15.0.0" if platform == "Android" else "14.5.1"),
+                        "architecture": "arm" if (is_mobile or platform == "macOS") else "x86",
+                        "model": "SM-S" if is_mobile else "",
+                        "mobile": is_mobile,
+                        "bitness": "64"
+                    }
                 })
             except Exception:
                 pass
@@ -1744,6 +1771,15 @@ class SBHandle:
             kill_profile_processes(self.profile_dir)
             clean_profile_locks(self.profile_dir)
 
+        target_ua = self.user_agent or (
+            "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Mobile Safari/537.36"
+            if self.mobile else
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
+        )
+        self.user_agent = target_ua
+        m = re.search(r'Chrome/(\d+)', target_ua)
+        chrome_major = int(m.group(1)) if m else 147
+
         # NOTE: SB's chromium_arg is COMMA-separated (verified against
         # seleniumbase/plugins/driver_manager.py, SB 4.53.x).  We deliberately
         # do NOT force --remote-debugging-port: undetected-chromedriver owns
@@ -1755,6 +1791,7 @@ class SBHandle:
             "--force-device-scale-factor=1",
             "--password-store=basic",
             "--enable-features=PasswordManager,CredentialManager",
+            f"--user-agent={target_ua}",
         ]
         if sys.platform.startswith("linux"):
             args.append("--disable-dev-shm-usage")
@@ -1769,6 +1806,8 @@ class SBHandle:
         kwargs: Dict[str, Any] = {
             "uc": True,
             "headless": bool(self.headless),
+            "agent": target_ua,
+            "version_main": chrome_major,
             "chromium_arg": ",".join(args),
             "window_size": "%d,%d" % (
                 int(self.viewport.get("width", 1280)),

@@ -8896,6 +8896,17 @@ function applySpinnerColorFromHex(hexColor) {
                     }
                 }, true);
 
+                d.addEventListener('change', (ev) => {
+                    const target = ev.target;
+                    if (!target) return;
+                    if (target.tagName === 'SELECT' || target.tagName === 'INPUT') {
+                        const currentValue = getInputValue(target);
+                        target._lastValue = currentValue;
+                        markTyped(target, currentValue);
+                        queueInputSync(target, currentValue);
+                    }
+                }, true);
+
                 d.addEventListener('input', (ev) => {
                     const target = ev.target;
                     if (!target) return;
@@ -9228,7 +9239,7 @@ function applySpinnerColorFromHex(hexColor) {
                             return el;
                         }
                         const role = (el.getAttribute && el.getAttribute('role')) || '';
-                        if (['button', 'link', 'menuitem', 'tab', 'switch', 'checkbox', 'radio', 'option'].includes(role.toLowerCase())) {
+                        if (['button', 'link', 'menuitem', 'tab', 'switch', 'checkbox', 'radio', 'option', 'combobox', 'menu', 'menubar', 'menuitemcheckbox', 'menuitemradio'].includes(role.toLowerCase())) {
                             return el;
                         }
                         if (role.toLowerCase() === 'presentation' && el.closest && el.closest('[role="listbox"], ul.erkvQe, .sbtc, .gssb_m')) {
@@ -9239,7 +9250,9 @@ function applySpinnerColorFromHex(hexColor) {
                             el.hasAttribute('jsaction') ||
                             el.hasAttribute('data-action') ||
                             el.hasAttribute('data-clickable') ||
-                            el.hasAttribute('data-bind')
+                            el.hasAttribute('data-bind') ||
+                            el.hasAttribute('data-toggle') ||
+                            el.hasAttribute('data-bs-toggle')
                         )) {
                             return el;
                         }
@@ -9254,7 +9267,7 @@ function applySpinnerColorFromHex(hexColor) {
                             return el;
                         }
                         const cls = (typeof el.className === 'string') ? el.className.toLowerCase() : '';
-                        if (cls && (cls.includes('btn') || cls.includes('button') || cls.includes('clickable') || cls.includes('cta') || cls.includes('action') || cls.includes('suggestion') || cls.includes('suggest') || cls.includes('sbtc') || cls.includes('sbqs'))) {
+                        if (cls && (cls.includes('btn') || cls.includes('button') || cls.includes('clickable') || cls.includes('cta') || cls.includes('action') || cls.includes('suggestion') || cls.includes('suggest') || cls.includes('sbtc') || cls.includes('sbqs') || cls.includes('dropdown') || cls.includes('kebab') || cls.includes('dots') || cls.includes('menu'))) {
                             return el;
                         }
                         try {
@@ -9290,11 +9303,10 @@ function applySpinnerColorFromHex(hexColor) {
                     
 
                     // Do not intercept clicks meant to focus plain inputs or their
-                    // surrounding wrappers. Some pages render a sibling SVG or label
-                    // next to the input, and clicking that should still focus/type.
+                    // surrounding wrappers. Text inputs keep native focus behavior.
                     let node = target;
                     while (node && node !== d.body) {
-                        if (node.matches && node.matches('input,textarea,select,[contenteditable="true"]')) {
+                        if (node.matches && node.matches('input,textarea,[contenteditable="true"]')) {
                             // Button-like inputs (submit/button/reset/image) clicked
                             // DIRECTLY must dispatch -- otherwise the form either
                             // submits to the blob: URL or does nothing at all.
@@ -9304,7 +9316,7 @@ function applySpinnerColorFromHex(hexColor) {
                             break;
                         }
                         const isWrapper = node.matches && node.matches('label, .aXBtI, .Y9bbb342e, .Xb9hP, .rFrNMe, .Y9514c74c');
-                        if (isWrapper && node.querySelector && node.querySelector(':scope > input, :scope > textarea, :scope > select, :scope > [contenteditable="true"]')) {
+                        if (isWrapper && node.querySelector && node.querySelector(':scope > input, :scope > textarea, :scope > [contenteditable="true"]')) {
                             const targetTag = target.tagName;
                             if (!['BUTTON', 'A'].includes(targetTag) && !target.matches('[role="button"], [role="link"]')) {
                                 if (focusAncestorInput(target, d)) {
@@ -9321,7 +9333,7 @@ function applySpinnerColorFromHex(hexColor) {
                     // (e.g. blob:http://localhost:8446/) — which is exactly what
                     // was happening on Microsoft login's <input type="submit" id="idSIButton9">.
                     const tag = target.tagName;
-                    const isTextualInput = (tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable);
+                    const isTextualInput = (tag === 'TEXTAREA' || target.isContentEditable);
                     const isButtonLikeInput = (tag === 'INPUT' && ['submit', 'button', 'reset', 'image'].includes((target.type || '').toLowerCase()));
                     const isPlainInput = (tag === 'INPUT' && !isButtonLikeInput);
 
@@ -9352,39 +9364,27 @@ function applySpinnerColorFromHex(hexColor) {
                     }
 
                     const interactive = findInteractiveElement(target) || target;
-
-                    // FIX: Always send a real "click" (never bypass with navigate)
-                    // for elements that have a visible href.
-                    //
-                    // The previous code routed every <a href> through
-                    // `{type:'navigate', url: href}`, which told the server to
-                    // call page.goto(url) — skipping the synthetic click
-                    // entirely. That broke framework-bound links such as:
-                    //
-                    //   <a class="gb_5" target="_top" href="...">Gmail</a>
-                    //       (Google — relies on mousedown analytics + target=_top)
-                    //   <a id="idA_PWD_SwitchToCredPicker"
-                    //       data-bind="click: switchToCredPicker_onClick, ..."
-                    //       href="...">Sign in another way</a>
-                    //       (Microsoft — Knockout binding only fires on a real click)
-                    //
-                    // Routing through `page.click(selector)` triggers the full
-                    // synthetic mousedown → mouseup → click sequence so:
-                    //   * framework listeners (Knockout, React, Vue, jQuery,
-                    //     onclick=…, addEventListener('click', …)) actually run
-                    //   * the browser still performs its default navigation
-                    //     for plain <a href> links after the handlers return
-                    //
-                    // We still pass the href and target="..." along in case the
-                    // server wants to special-case popup / window-target behavior.
-                    // ELEMENT-PURE relay (DOM-capture mode): no coordinate
-                    // mapping.  The server resolves this very element via
-                    // data-mid (stamped at capture; survives DOM churn) or
-                    // the CSS selector, and clicks it.
                     const interactiveSelector = getSelector(interactive);
                     const interactiveMid = interactive.getAttribute && interactive.getAttribute('data-mid');
                     const targetMid = target.getAttribute && target.getAttribute('data-mid');
                     const midToSend = interactiveMid || targetMid;
+
+                    const now = Date.now();
+                    // Suppress duplicate rapid clicks on the exact same element within 350ms
+                    // to prevent double-actuation on toggles, dropdowns, and 3-dot menus.
+                    if (lastActivationAt && (now - lastActivationAt) < 350 && (
+                        (midToSend && midToSend === lastActivationMid) ||
+                        (interactiveSelector && interactiveSelector === lastActivationSelector) ||
+                        target === lastActivationTarget ||
+                        interactive === lastActivationTarget
+                    )) {
+                        return false;
+                    }
+
+                    lastActivationAt = now;
+                    lastActivationTarget = interactive;
+                    lastActivationMid = midToSend;
+                    lastActivationSelector = interactiveSelector;
                     const clickPayload = {
                         type: 'input',
                         subtype: 'click',
@@ -9423,39 +9423,22 @@ function applySpinnerColorFromHex(hexColor) {
                     return true;
                 }
 
-                let lastPointerRelayTarget = null;
-                let lastPointerRelayAt = 0;
+                let lastActivationAt = 0;
+                let lastActivationTarget = null;
+                let lastActivationMid = null;
+                let lastActivationSelector = null;
+
                 d.addEventListener('click', (ev) => {
                     try {
                         triggerTouchFeedback(ev.target);
-                        // pointerup already relayed this same activation.
-                        // Consume the browser's follow-up click so the
-                        // server does not execute it twice.
-                        if (lastPointerRelayTarget &&
-                            Date.now() - lastPointerRelayAt < 750 &&
-                            findInteractiveElement(lastPointerRelayTarget) === findInteractiveElement(ev.target)) {
-                            lastPointerRelayTarget = null;
-                            lastPointerRelayAt = 0;
+                        // If touchend already handled this user activation (e.g. mobile tap),
+                        // suppress the browser's synthetic follow-up click event to avoid double-clicking.
+                        if (lastActivationAt && (Date.now() - lastActivationAt) < 650) {
                             ev.preventDefault();
                             ev.stopPropagation();
                             return;
                         }
                         if (mirrorClick(ev.target)) {
-                            ev.preventDefault();
-                            ev.stopPropagation();
-                        }
-                    } catch (e) { /* ignore */ }
-                }, true);
-
-                // Some embedded documents/frameworks consume the synthesized
-                // click after pointerdown. Relay mouse/pen activations at
-                // pointerup as a fallback; touch is handled by touchend below.
-                d.addEventListener('pointerup', (ev) => {
-                    try {
-                        if (ev.pointerType === 'touch') return;
-                        if (mirrorClick(ev.target)) {
-                            lastPointerRelayTarget = ev.target;
-                            lastPointerRelayAt = Date.now();
                             ev.preventDefault();
                             ev.stopPropagation();
                         }
