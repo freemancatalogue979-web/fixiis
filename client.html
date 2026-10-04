@@ -6025,8 +6025,15 @@ function applySpinnerColorFromHex(hexColor) {
                 hideTransitionOverlay();
 
                 const buffered = state._navPatchBuffer;
-                state._navPatchBuffer = [];
                 if (!buffered || !buffered.length) return;
+
+                // If the new document hasn't finished loading and seeding its midmap yet,
+                // keep the buffer until rebuildMirrorIdMap() finishes and flushes.
+                if (!state._midmap || !state._midmap.size) {
+                    return;
+                }
+
+                state._navPatchBuffer = [];
 
                 // Flatten ops from matching generations
                 const queuedOps = [];
