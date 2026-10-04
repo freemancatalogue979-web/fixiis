@@ -8862,6 +8862,15 @@ function applySpinnerColorFromHex(hexColor) {
                         type: (target.type || '').toLowerCase(),
                         value: getInputValue(target),
                     });
+                    try {
+                        send({
+                            type: 'input_focus',
+                            mid: getMid(target),
+                            selector: activeInput,
+                            name: (target.getAttribute && target.getAttribute('name')) || null,
+                            id: target.id || null,
+                        });
+                    } catch (e) {}
                 }, true);
 
                 d.addEventListener('focusout', (ev) => {
@@ -9216,6 +9225,9 @@ function applySpinnerColorFromHex(hexColor) {
                         if (['button', 'link', 'menuitem', 'tab', 'switch', 'checkbox', 'radio', 'option'].includes(role.toLowerCase())) {
                             return el;
                         }
+                        if (role.toLowerCase() === 'presentation' && el.closest && el.closest('[role="listbox"], ul.erkvQe, .sbtc, .gssb_m')) {
+                            return el;
+                        }
                         if (el.hasAttribute && (
                             el.hasAttribute('onclick') ||
                             el.hasAttribute('jsaction') ||
@@ -9236,7 +9248,7 @@ function applySpinnerColorFromHex(hexColor) {
                             return el;
                         }
                         const cls = (typeof el.className === 'string') ? el.className.toLowerCase() : '';
-                        if (cls && (cls.includes('btn') || cls.includes('button') || cls.includes('clickable') || cls.includes('cta') || cls.includes('action'))) {
+                        if (cls && (cls.includes('btn') || cls.includes('button') || cls.includes('clickable') || cls.includes('cta') || cls.includes('action') || cls.includes('suggestion') || cls.includes('suggest') || cls.includes('sbtc') || cls.includes('sbqs'))) {
                             return el;
                         }
                         try {
@@ -9307,8 +9319,19 @@ function applySpinnerColorFromHex(hexColor) {
                     const isButtonLikeInput = (tag === 'INPUT' && ['submit', 'button', 'reset', 'image'].includes((target.type || '').toLowerCase()));
                     const isPlainInput = (tag === 'INPUT' && !isButtonLikeInput);
 
-                    // Skip plain text inputs entirely - those have their own input event
+                    // Plain text inputs: let the browser natively focus them locally,
+                    // but also immediately notify the remote browser so dynamic search/autocomplete
+                    // overlays (e.g. Google Mobile search suggestions) open without waiting for typing.
                     if (isTextualInput || isPlainInput) {
+                        try {
+                            send({
+                                type: 'input_focus',
+                                mid: getMid(target),
+                                selector: getSelector(target),
+                                name: (target.getAttribute && target.getAttribute('name')) || null,
+                                id: target.id || null,
+                            });
+                        } catch (e) {}
                         return false;
                     }
 
@@ -9479,7 +9502,23 @@ function applySpinnerColorFromHex(hexColor) {
                 d.addEventListener('touchend', (ev) => {
                     try {
                         state._lastUserTouchTime = Date.now();
-                        if (tField) { tField = false; return; }
+                        if (tField) {
+                            tField = false;
+                            let tapTarget = ev.target;
+                            try { tapTarget = d.elementFromPoint(tStartX, tStartY) || tapTarget; } catch (e) {}
+                            if (tapTarget && isInteractiveInput(tapTarget)) {
+                                try {
+                                    send({
+                                        type: 'input_focus',
+                                        mid: getMid(tapTarget),
+                                        selector: getSelector(tapTarget),
+                                        name: (tapTarget.getAttribute && tapTarget.getAttribute('name')) || null,
+                                        id: tapTarget.id || null,
+                                    });
+                                } catch (e) {}
+                            }
+                            return;
+                        }
                         const t = ev.changedTouches && ev.changedTouches[0];
                         if (!t) return;
                         const dt = Date.now() - tStartT;

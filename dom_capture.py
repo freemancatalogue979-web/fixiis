@@ -2886,7 +2886,20 @@ _DELTA_OBSERVER_JS = r"""
     if (tag === 'textarea') { out.push(escText(el.value == null ? '' : el.value), '</textarea>'); return; }
     if (tag === 'script' || tag === 'style') {
       let raw = el.textContent || '';
-      if (tag === 'script') raw = raw.replace(/<\/script/gi, '<\\/script');
+      if (tag === 'style') {
+        try {
+          if (el.sheet && el.sheet.cssRules && el.sheet.cssRules.length) {
+            let css = '';
+            for (let i = 0; i < el.sheet.cssRules.length; i++) {
+              css += el.sheet.cssRules[i].cssText + '\n';
+            }
+            if (css) raw = css;
+          }
+        } catch (e) {}
+        raw = raw.replace(/<\//g, '<\\/');
+      } else if (tag === 'script') {
+        raw = raw.replace(/<\/script/gi, '<\\/script');
+      }
       out.push(raw, '</', tag, '>');
       return;
     }

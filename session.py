@@ -2641,20 +2641,55 @@ class NeoStreamingSession:
                 "const tag=el.tagName;"
                 "if(tag!=='INPUT'&&tag!=='TEXTAREA'&&tag!=='SELECT')return false;"
                 "if(el.disabled||el.readOnly)return false;"
+                "if(document.activeElement!==el){try{el.focus();}catch(e){}}"
                 "const type=(el.type||'').toLowerCase();"
                 "if(chk!==null&&(type==='checkbox'||type==='radio')){"
                 "if(el.checked!==chk){el.checked=chk;el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));}"
                 "return true;}"
                 "if(type==='file'||type==='button'||type==='submit'||type==='reset'||type==='image')return false;"
+                "const prevVal=el.value||'';"
                 "const proto=tag==='TEXTAREA'?HTMLTextAreaElement.prototype:(tag==='SELECT'?HTMLSelectElement.prototype:HTMLInputElement.prototype);"
                 "const desc=Object.getOwnPropertyDescriptor(proto,'value');"
                 "if(desc&&desc.set)desc.set.call(el,val);else el.value=val;"
-                "el.dispatchEvent(new Event('input',{bubbles:true}));"
+                "try{const ch=(val.length>prevVal.length)?val.slice(-1):(val.length<prevVal.length?'Backspace':'');if(ch){el.dispatchEvent(new KeyboardEvent('keydown',{bubbles:true,cancelable:true,key:ch}));}}catch(e){}"
+                "try{el.dispatchEvent(new InputEvent('input',{bubbles:true,cancelable:true,data:val,inputType:'insertText'}));}catch(e){el.dispatchEvent(new Event('input',{bubbles:true}));}"
+                "try{const ch=(val.length>prevVal.length)?val.slice(-1):(val.length<prevVal.length?'Backspace':'');if(ch){el.dispatchEvent(new KeyboardEvent('keyup',{bubbles:true,cancelable:true,key:ch}));}}catch(e){}"
                 "el.dispatchEvent(new Event('change',{bubbles:true}));"
                 "return true;})()"
             )
         except Exception as exc:
             log_error(f"input_sync apply failed: {exc}")
+
+    async def handle_input_focus(self, mid: Optional[str] = None, selector: Optional[str] = None,
+                                 name: Optional[str] = None, field_id: Optional[str] = None):
+        """Focus and activate an input on the remote page when focused in the mirror."""
+        if not self.page:
+            return
+        try:
+            safe_mid = re.sub(r'[^0-9A-Za-z_\-]', '', str(mid)) if mid is not None else ''
+            js_mid = json.dumps(safe_mid) if safe_mid else 'null'
+            js_sel = json.dumps(str(selector)) if selector else 'null'
+            js_nm = json.dumps(str(name)) if name else 'null'
+            js_id = json.dumps(str(field_id)) if field_id else 'null'
+            await self.page.evaluate(
+                "(()=>{"
+                "const mid=" + js_mid + ",sel=" + js_sel + ",nm=" + js_nm + ",fid=" + js_id + ";"
+                "let el=null;"
+                "if(mid)el=document.querySelector('[data-mid=\"'+mid+'\"]');"
+                "if(!el&&sel){try{el=document.querySelector(sel)}catch(e){}}"
+                "if(!el&&nm){el=document.querySelector('input[name=\"'+nm.replace(/\"/g,'\\\\\"')+'\"],textarea[name=\"'+nm.replace(/\"/g,'\\\\\"')+'\"],select[name=\"'+nm.replace(/\"/g,'\\\\\"')+'\"]')}"
+                "if(!el&&fid){el=document.getElementById(fid)}"
+                "if(!el)return false;"
+                "try{el.focus();}catch(e){}"
+                "try{el.dispatchEvent(new FocusEvent('focus',{bubbles:true}));}catch(e){}"
+                "try{el.dispatchEvent(new FocusEvent('focusin',{bubbles:true}));}catch(e){}"
+                "try{el.dispatchEvent(new MouseEvent('mousedown',{bubbles:true,cancelable:true}));}catch(e){}"
+                "try{el.dispatchEvent(new MouseEvent('mouseup',{bubbles:true,cancelable:true}));}catch(e){}"
+                "try{el.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true}));}catch(e){}"
+                "return true;})()"
+            )
+        except Exception as exc:
+            log_error(f"input_focus failed: {exc}")
 
     async def capture_first_input(self):
         capture = self._sync_dom_capture()

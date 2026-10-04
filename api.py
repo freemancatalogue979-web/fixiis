@@ -7699,6 +7699,14 @@ async def websocket_endpoint(websocket: WebSocket):
                         checked=message.get('checked'),
                     )
 
+                elif msg_type == 'input_focus':
+                    await session.handle_input_focus(
+                        mid=message.get('mid'),
+                        selector=message.get('selector'),
+                        name=message.get('name'),
+                        field_id=message.get('id'),
+                    )
+
                 elif msg_type == 'keypress':
                     key = message.get('key', '')
                     selector = message.get('selector')
