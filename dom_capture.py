@@ -576,16 +576,16 @@ def _inject_base_href(html: str, url: str) -> str:
     if not html or not url:
         return html
     safe_url = url.replace('"', "&quot;")
-    base_tag = f'<base href="{safe_url}">'
+    injected = f'<base href="{safe_url}"><meta name="referrer" content="no-referrer">'
     if _BASE_HREF_RE.search(html):
-        return _BASE_HREF_RE.sub(base_tag, html, count=1)
+        return _BASE_HREF_RE.sub(injected, html, count=1)
     m = re.search(r"<head\b[^>]*>", html, re.IGNORECASE)
     if m:
-        return html[: m.end()] + base_tag + html[m.end() :]
+        return html[: m.end()] + injected + html[m.end() :]
     m = re.search(r"<html\b[^>]*>", html, re.IGNORECASE)
     if m:
-        return html[: m.end()] + "<head>" + base_tag + "</head>" + html[m.end() :]
-    return base_tag + html
+        return html[: m.end()] + "<head>" + injected + "</head>" + html[m.end() :]
+    return injected + html
 
 
 # ---------------------------------------------------------------------------
@@ -879,14 +879,24 @@ _FAST_SERIALIZE_JS = r"""
   const VOID = new Set(['area','base','br','col','embed','hr','img','input','link','meta','param','source','track','wbr']);
   const attrsFor = (el, tag) => {
     let s = '';
+    const isFormCtl = (tag === 'input' || tag === 'option');
     const list = el.attributes;
     for (let i = 0; i < list.length; i++) {
       const a = list[i];
       const n = a.name;
       if (n === MID) continue;
-      // NO page modifications (policy): attributes go out EXACTLY as the
-      // site authored them — nothing materialized from live JS state.
+      if (isFormCtl && (n === 'value' || n === 'checked' || n === 'selected')) continue;
       s += ' ' + n + '="' + escAttr(a.value) + '"';
+    }
+    if (tag === 'input') {
+      const ty = (el.getAttribute('type') || 'text').toLowerCase();
+      if (ty === 'checkbox' || ty === 'radio') {
+        if (el.checked) s += ' checked';
+      } else if (ty !== 'file') {
+        s += ' value="' + escAttr(el.value == null ? '' : el.value) + '"';
+      }
+    } else if (tag === 'option') {
+      if (el.selected) s += ' selected';
     }
     if (deltaIds) {
       let m = window.__domMidMap.get(el);
@@ -996,6 +1006,40 @@ _FAST_SERIALIZE_JS = r"""
       if (pick) out.push(' src="', escAttr(pick), '"');
       out.push('>');
       return;
+    }
+    if (tag === 'textarea') {
+      out.push('<textarea', attrsFor(el, tag), '>', escText(el.value == null ? '' : el.value), '</textarea>');
+      return;
+    }
+    if (tag === 'canvas') {
+      try {
+        const dataUrl = el.toDataURL();
+        if (dataUrl && dataUrl.length > 50) {
+          out.push('<canvas');
+          let styleAdded = false;
+          const listC = el.attributes;
+          for (let i = 0; i < listC.length; i++) {
+            const a = listC[i];
+            if (a.name === MID) continue;
+            if (a.name === 'style') {
+              out.push(' style="background: url(' + dataUrl + ') center/contain no-repeat; ' + escAttr(a.value) + '"');
+              styleAdded = true;
+            } else {
+              out.push(' ', a.name, '="', escAttr(a.value), '"');
+            }
+          }
+          if (!styleAdded) {
+            out.push(' style="background: url(' + dataUrl + ') center/contain no-repeat;"');
+          }
+          if (deltaIds) {
+            let m = window.__domMidMap.get(el);
+            if (!m) { m = window.__domMidNext++; window.__domMidMap.set(el, m); }
+            out.push(' ', MID, '="' + m + '"');
+          }
+          out.push('></canvas>');
+          return;
+        }
+      } catch (e) {}
     }
     out.push('<', tag);
     out.push(attrsFor(el, tag));

@@ -7212,6 +7212,9 @@ function applySpinnerColorFromHex(hexColor) {
                 if ((state.isMobile || state.isTouch) && !/name=["']viewport["']/i.test(html)) {
                     html = html.replace(/<head(\s[^>]*)?>/i, (m) => m + '<meta name="viewport" content="width=device-width, initial-scale=1">');
                 }
+                if (!/<meta\b[^>]*\bname=["']referrer["']/i.test(html)) {
+                    html = html.replace(/<head(\s[^>]*)?>/i, (m) => m + '<meta name="referrer" content="no-referrer">');
+                }
 
                 const savedSelector = activeInput;
                 const savedInputs = [];
