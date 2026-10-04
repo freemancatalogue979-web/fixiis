@@ -4558,19 +4558,8 @@ function applySpinnerColorFromHex(hexColor) {
 
             // DOM-only mode: frame polling and binary frame handling removed
 
-            // Chromium can't run a headed window narrower than ~500 CSS px
-            // (it self-enforces that minimum on --window-size). For MOBILE
-            // clients whose real viewport is narrower, REPORT the minimum:
-            // the server then sizes the page exactly 500 wide (killing the
-            // white strip at the source - no clamped-window gap).
-            const MOBILE_MIN_SERVER_VIEWPORT_W = 500;
             function viewportForServer() {
-                let w = window.innerWidth;
-                const h = window.innerHeight;
-                if (CONFIG.isMobile && w < MOBILE_MIN_SERVER_VIEWPORT_W) {
-                    w = MOBILE_MIN_SERVER_VIEWPORT_W;
-                }
-                return { width: w, height: h };
+                return { width: window.innerWidth, height: window.innerHeight };
             }
 
             function initializeViewportState() {
