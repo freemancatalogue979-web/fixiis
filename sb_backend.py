@@ -1289,9 +1289,11 @@ class SBPage:
                 pass
 
     async def set_viewport_size(self, size: Dict[str, Any]) -> None:
+        default_w = 390 if self._mobile else 1280
+        default_h = 844 if self._mobile else 720
         await self._session.send("Emulation.setDeviceMetricsOverride", {
-            "width": int(size.get("width", 1280)),
-            "height": int(size.get("height", 720)),
+            "width": int(size.get("width") or default_w),
+            "height": int(size.get("height") or default_h),
             "deviceScaleFactor": float(size.get("deviceScaleFactor", self._ctx._pixel_ratio or 1)),
             "mobile": bool(self._mobile),
         })

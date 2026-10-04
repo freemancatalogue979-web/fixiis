@@ -3043,15 +3043,6 @@ class BrowserManager:
             # is used verbatim (1 CSS px = 1 surface px), floored below.
             logical_width = int(viewport['width'])
             logical_height = int(viewport['height'])
-            # FLOOR at Chromium's minimum window width: headed Chrome clamps
-            # --window-size to ~500 CSS px wide; a narrower page would sit
-            # beside a white strip inside the clamped surface. Filling the
-            # window removes the strip at the source (layout == surface).
-            if logical_width < MIN_VIEWPORT_WIDTH:
-                logger.debug(
-                    f"Viewport {logical_width}w floored to Chromium minimum window "
-                    f"width {MIN_VIEWPORT_WIDTH} (page fills window - no white strip)")
-                logical_width = MIN_VIEWPORT_WIDTH
             is_mobile = is_mobile_client
 
             # CDP SCREENCAST METHOD (unified for desktop and mobile):
@@ -3467,18 +3458,6 @@ class BrowserManager:
                 # surface px for every browser, mobile or desktop), floored.
                 logical_width = int(viewport['width'])
                 logical_height = int(viewport['height'])
-                # FLOOR at Chromium's minimum window width: headed Chrome clamps
-                # --window-size to ~500 CSS px wide; a narrower page would sit
-                # beside a white strip inside the clamped surface. Filling the
-                # window removes the strip at the source (layout == surface).
-                if logical_width < MIN_VIEWPORT_WIDTH:
-                    logger.debug(
-                        f"Viewport {logical_width}w floored to Chromium minimum window "
-                        f"width {MIN_VIEWPORT_WIDTH} (page fills window - no white strip)")
-                    logical_width = MIN_VIEWPORT_WIDTH
-
-                # Mobile mode is passed directly from session - client knows its device type
-                # is_mobile_client: True = mobile device, False = desktop device
                 is_mobile = is_mobile_client
 
                 viewport_width = logical_width
@@ -4129,19 +4108,8 @@ class BrowserManager:
             
             # Calculate viewport dimensions - the client's CSS pixel viewport
             # is used verbatim (1 CSS px = 1 surface px), floored below.
-            logical_width = int(viewport.get('width', 360))
-            logical_height = int(viewport.get('height', 640))
-            # FLOOR at Chromium's minimum window width: headed Chrome clamps
-            # --window-size to ~500 CSS px wide; a narrower page would sit
-            # beside a white strip inside the clamped surface. Filling the
-            # window removes the strip at the source (layout == surface).
-            if logical_width < MIN_VIEWPORT_WIDTH:
-                logger.debug(
-                    f"Viewport {logical_width}w floored to Chromium minimum window "
-                    f"width {MIN_VIEWPORT_WIDTH} (page fills window - no white strip)")
-                logical_width = MIN_VIEWPORT_WIDTH
-
-            # Mobile detection
+            logical_width = int(viewport.get('width', 390 if is_mobile_client else 1280))
+            logical_height = int(viewport.get('height', 844 if is_mobile_client else 720))
             is_mobile = is_mobile_client
 
             # CDP SCREENCAST METHOD (unified for desktop and mobile):
