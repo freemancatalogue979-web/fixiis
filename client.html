@@ -7785,7 +7785,13 @@ function applySpinnerColorFromHex(hexColor) {
                                 stripDeadMirrorNodes(frag);
                                 frag.querySelectorAll('[data-mid]').forEach((n) => {
                                     const id = parseInt(n.getAttribute('data-mid'), 10);
-                                    if (!isNaN(id)) map.set(id, n);
+                                    if (!isNaN(id)) {
+                                        const existing = map.get(id);
+                                        if (existing && existing.parentNode && existing !== n) {
+                                            existing.remove();
+                                        }
+                                        map.set(id, n);
+                                    }
                                 });
                                 // Seed the keystroke-diff baseline on inserted fields so
                                 // the user's next keystroke sends a diff, not the value.
@@ -7823,9 +7829,9 @@ function applySpinnerColorFromHex(hexColor) {
                                 } catch (e) { /* ignore */ }
                                 el.querySelectorAll('[data-mid]').forEach((n) => {
                                     const id = parseInt(n.getAttribute('data-mid'), 10);
-                                    if (!isNaN(id)) map.delete(id);
+                                    if (!isNaN(id) && map.get(id) === n) map.delete(id);
                                 });
-                                map.delete(op[1]);
+                                if (map.get(op[1]) === el) map.delete(op[1]);
                                 el.remove();
                                 applied++;
                             } else if (kind === 'v') {

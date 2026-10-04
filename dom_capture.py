@@ -900,7 +900,18 @@ _FAST_SERIALIZE_JS = r"""
     }
     if (deltaIds) {
       let m = window.__domMidMap.get(el);
-      if (!m) { m = window.__domMidNext++; window.__domMidMap.set(el, m); }
+      if (!m) {
+        if (el.getAttribute) {
+          const attr = el.getAttribute(MID);
+          if (attr) {
+            const parsed = parseInt(attr, 10);
+            if (parsed) m = parsed;
+          }
+        }
+        if (!m) m = window.__domMidNext++;
+        window.__domMidMap.set(el, m);
+      }
+      if (m >= window.__domMidNext) window.__domMidNext = m + 1;
       try { el.setAttribute(MID, String(m)); } catch (e) {}
       s += ' ' + MID + '="' + m + '"';
     }
@@ -2844,8 +2855,18 @@ _DELTA_OBSERVER_JS = r"""
     if (!el || el.nodeType !== 1) return 0;
     let m = window.__domMidMap.get(el);
     if (!m) {
-      m = window.__domMidNext++;
+      if (el.getAttribute) {
+        const attr = el.getAttribute(MID);
+        if (attr) {
+          const parsed = parseInt(attr, 10);
+          if (parsed) m = parsed;
+        }
+      }
+      if (!m) {
+        m = window.__domMidNext++;
+      }
       window.__domMidMap.set(el, m);
+      if (m >= window.__domMidNext) window.__domMidNext = m + 1;
       try { el.setAttribute(MID, String(m)); } catch (e) {}
     }
     return m;
@@ -2984,8 +3005,25 @@ _DELTA_OBSERVER_JS = r"""
         if (!pm) continue;
         for (const rem of r.removedNodes) {
           if (rem.nodeType !== 1) continue;
-          const m = window.__domMidMap.get(rem);
-          if (m) push(['r', m]);
+          let m = window.__domMidMap.get(rem);
+          if (!m && rem.getAttribute) {
+            const attr = rem.getAttribute(MID);
+            if (attr) {
+              const parsed = parseInt(attr, 10);
+              if (parsed) m = parsed;
+            }
+          }
+          if (m) {
+            push(['r', m]);
+          } else if (rem.querySelectorAll) {
+            try {
+              const children = rem.querySelectorAll('[' + MID + ']');
+              for (let i = 0; i < children.length; i++) {
+                const cm = parseInt(children[i].getAttribute(MID), 10);
+                if (cm) push(['r', cm]);
+              }
+            } catch (e) {}
+          }
         }
         for (const add of r.addedNodes) {
           let ref = r.nextSibling;
