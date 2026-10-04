@@ -712,14 +712,17 @@ class NeoStreamingSession:
 
             self.page = await self.context.new_page()
             self.dom_capture = DOMCaptureSession(page=self.page, websocket=self.websocket, client_id=self.session_id)
-            if self.is_mobile:
+            if self.viewport and self.viewport.get('width') and self.viewport.get('height'):
                 try:
+                    vp_w = int(self.viewport['width'])
+                    vp_h = int(self.viewport['height'])
                     await self.page.set_viewport_size({
-                        'width': self.viewport.get('width', 1920),
-                        'height': self.viewport.get('height', 1080)
+                        'width': vp_w,
+                        'height': vp_h
                     })
+                    logger.info(f"[STARTUP] Applied exact device viewport: {vp_w}x{vp_h} (mobile={self.is_mobile})")
                 except Exception as e:
-                    logger.warning(f"[STARTUP] Mobile viewport resize failed: {e}")
+                    logger.warning(f"[STARTUP] Viewport resize failed: {e}")
 
             # Initialize pages dict with the first page
             page_id = self._generate_page_id(self.page)
