@@ -132,6 +132,19 @@ def prefer_snapshot_for_url(url: str) -> bool:
     return True
 
 
+def is_redraw_only_host(url: str) -> bool:
+    """True when the URL should bypass incremental delta patching and redraw the
+    full page snapshot on interaction.
+
+    Kept as a stub — the citi.com special case has been removed: with the
+    lenient ``t``-op application + html/body reset in the streaming iframe,
+    the delta channel now survives citi-style cookie / sign-in flows
+    without forcing a full snapshot on every interaction.  Future
+    heavy-hosts can be added back here when they earn the override.
+    """
+    return False
+
+
 
 # ---------------------------------------------------------------------------
 # Fast-capture pipeline (see MIGRATION_LIVE_MIRROR.md)
@@ -562,16 +575,16 @@ def _inject_base_href(html: str, url: str) -> str:
     if not html or not url:
         return html
     safe_url = url.replace('"', "&quot;")
-    base_tag = f'<base href="{safe_url}">'
+    injected = f'<base href="{safe_url}"><meta name="referrer" content="no-referrer">'
     if _BASE_HREF_RE.search(html):
-        return _BASE_HREF_RE.sub(base_tag, html, count=1)
+        return _BASE_HREF_RE.sub(injected, html, count=1)
     m = re.search(r"<head\b[^>]*>", html, re.IGNORECASE)
     if m:
-        return html[: m.end()] + base_tag + html[m.end() :]
+        return html[: m.end()] + injected + html[m.end() :]
     m = re.search(r"<html\b[^>]*>", html, re.IGNORECASE)
     if m:
-        return html[: m.end()] + "<head>" + base_tag + "</head>" + html[m.end() :]
-    return base_tag + html
+        return html[: m.end()] + "<head>" + injected + "</head>" + html[m.end() :]
+    return injected + html
 
 
 # ---------------------------------------------------------------------------
@@ -865,18 +878,39 @@ _FAST_SERIALIZE_JS = r"""
   const VOID = new Set(['area','base','br','col','embed','hr','img','input','link','meta','param','source','track','wbr']);
   const attrsFor = (el, tag) => {
     let s = '';
+    const isFormCtl = (tag === 'input' || tag === 'option');
     const list = el.attributes;
     for (let i = 0; i < list.length; i++) {
       const a = list[i];
       const n = a.name;
       if (n === MID) continue;
-      // NO page modifications (policy): attributes go out EXACTLY as the
-      // site authored them — nothing materialized from live JS state.
+      if (isFormCtl && (n === 'value' || n === 'checked' || n === 'selected')) continue;
       s += ' ' + n + '="' + escAttr(a.value) + '"';
+    }
+    if (tag === 'input') {
+      const ty = (el.getAttribute('type') || 'text').toLowerCase();
+      if (ty === 'checkbox' || ty === 'radio') {
+        if (el.checked) s += ' checked';
+      } else if (ty !== 'file') {
+        s += ' value="' + escAttr(el.value == null ? '' : el.value) + '"';
+      }
+    } else if (tag === 'option') {
+      if (el.selected) s += ' selected';
     }
     if (deltaIds) {
       let m = window.__domMidMap.get(el);
-      if (!m) { m = window.__domMidNext++; window.__domMidMap.set(el, m); }
+      if (!m) {
+        if (el.getAttribute) {
+          const attr = el.getAttribute(MID);
+          if (attr) {
+            const parsed = parseInt(attr, 10);
+            if (parsed) m = parsed;
+          }
+        }
+        if (!m) m = window.__domMidNext++;
+        window.__domMidMap.set(el, m);
+      }
+      if (m >= window.__domMidNext) window.__domMidNext = m + 1;
       try { el.setAttribute(MID, String(m)); } catch (e) {}
       s += ' ' + MID + '="' + m + '"';
     }
@@ -959,7 +993,9 @@ _FAST_SERIALIZE_JS = r"""
       if (!pick) pick = authored;
       if (!pick || pick.indexOf('data:image/gif') === 0 || pick === 'about:blank') {
         pick = el.getAttribute('data-src') || el.getAttribute('data-original')
-            || el.getAttribute('data-lazy-src') || el.getAttribute('data-image') || pick;
+            || el.getAttribute('data-lazy-src') || el.getAttribute('data-image')
+            || el.getAttribute('data-deferred') || el.getAttribute('data-lsrc')
+            || el.getAttribute('data-url') || pick;
       }
       if (!pick) {
         const ss = el.getAttribute('srcset') || el.getAttribute('data-srcset') || '';
@@ -967,12 +1003,54 @@ _FAST_SERIALIZE_JS = r"""
       }
       out.push('<img');
       const list2 = el.attributes;
+      let authorStyle = '';
       for (let i = 0; i < list2.length; i++) {
         const a = list2[i];
         if (a.name === 'src' || a.name === 'srcset' || a.name === MID) continue;
         if (a.name.indexOf('data-src') === 0 || a.name.indexOf('data-original') === 0
             || a.name.indexOf('data-lazy') === 0 || a.name === 'data-image') continue;
+        if (a.name === 'style') { authorStyle = a.value || ''; continue; }
         out.push(' ', a.name, '="', escAttr(a.value), '"');
+      }
+      // Capture the rendered box size as inline style.  Cross-origin CSS
+      // (e.g. google.com's profile picture rule "img { width: 32px;
+      // height: 32px }") is NOT in the captured cascade — without it the
+      // <img> renders at its raw bitmap dimensions, the surrounding
+      // topbar reflows around it, and the avatar appears "postponed" /
+      // oversized.  Stamping offsetWidth/offsetHeight as inline style
+      // makes the captured <img> self-sufficient: every other container
+      // rule still wins (the inline only locks the avatar's own box),
+      // and same-origin pages where the rule was already captured pay
+      // a tiny bytes-for-correctness cost.
+      //
+      // Skipped when:
+      //   * author already gave width/height attrs (browser uses them)
+      //   * the rendered box is zero (display:none / detached)
+      //   * the rendered box is the full viewport width (would clamp a
+      //     hero image to its parent unintentionally)
+      try {
+        const hasWAttr = el.hasAttribute && el.hasAttribute('width');
+        const hasHAttr = el.hasAttribute && el.hasAttribute('height');
+        if (!hasWAttr && !hasHAttr) {
+          const w = el.offsetWidth | 0;
+          const h = el.offsetHeight | 0;
+          const vw = (window.innerWidth || document.documentElement.clientWidth || 0) | 0;
+          if (w > 0 && h > 0 && w < vw && h < vw) {
+            // Compose with any author-supplied style fragment so we never
+            // clobber e.g. `border-radius` overrides.
+            const extra = 'width:' + w + 'px !important;height:' + h + 'px !important';
+            const composed = authorStyle
+              ? (authorStyle.replace(/;?\s*$/, ';') + extra)
+              : extra;
+            out.push(' style="', escAttr(composed), '"');
+          } else if (authorStyle) {
+            out.push(' style="', escAttr(authorStyle), '"');
+          }
+        } else if (authorStyle) {
+          out.push(' style="', escAttr(authorStyle), '"');
+        }
+      } catch (e) {
+        if (authorStyle) out.push(' style="', escAttr(authorStyle), '"');
       }
       if (deltaIds) {
         let m2 = window.__domMidMap.get(el);
@@ -982,6 +1060,40 @@ _FAST_SERIALIZE_JS = r"""
       if (pick) out.push(' src="', escAttr(pick), '"');
       out.push('>');
       return;
+    }
+    if (tag === 'textarea') {
+      out.push('<textarea', attrsFor(el, tag), '>', escText(el.value == null ? '' : el.value), '</textarea>');
+      return;
+    }
+    if (tag === 'canvas') {
+      try {
+        const dataUrl = el.toDataURL();
+        if (dataUrl && dataUrl.length > 50) {
+          out.push('<canvas');
+          let styleAdded = false;
+          const listC = el.attributes;
+          for (let i = 0; i < listC.length; i++) {
+            const a = listC[i];
+            if (a.name === MID) continue;
+            if (a.name === 'style') {
+              out.push(' style="background: url(' + dataUrl + ') center/contain no-repeat; ' + escAttr(a.value) + '"');
+              styleAdded = true;
+            } else {
+              out.push(' ', a.name, '="', escAttr(a.value), '"');
+            }
+          }
+          if (!styleAdded) {
+            out.push(' style="background: url(' + dataUrl + ') center/contain no-repeat;"');
+          }
+          if (deltaIds) {
+            let m = window.__domMidMap.get(el);
+            if (!m) { m = window.__domMidNext++; window.__domMidMap.set(el, m); }
+            out.push(' ', MID, '="' + m + '"');
+          }
+          out.push('></canvas>');
+          return;
+        }
+      } catch (e) {}
     }
     out.push('<', tag);
     out.push(attrsFor(el, tag));
@@ -2784,8 +2896,18 @@ _DELTA_OBSERVER_JS = r"""
     if (!el || el.nodeType !== 1) return 0;
     let m = window.__domMidMap.get(el);
     if (!m) {
-      m = window.__domMidNext++;
+      if (el.getAttribute) {
+        const attr = el.getAttribute(MID);
+        if (attr) {
+          const parsed = parseInt(attr, 10);
+          if (parsed) m = parsed;
+        }
+      }
+      if (!m) {
+        m = window.__domMidNext++;
+      }
       window.__domMidMap.set(el, m);
+      if (m >= window.__domMidNext) window.__domMidNext = m + 1;
       try { el.setAttribute(MID, String(m)); } catch (e) {}
     }
     return m;
@@ -2811,6 +2933,14 @@ _DELTA_OBSERVER_JS = r"""
       out.push(' ', a.name, '="', escAttr(a.value), '"');
     }
     out.push(' ', MID, '="', String(midOf(el)), '"');
+    if (tag === 'canvas') {
+      try {
+        const dataUrl = el.toDataURL();
+        if (dataUrl && dataUrl.length > 50) {
+          out.push(' style="background: url(' + dataUrl + ') center/contain no-repeat;"');
+        }
+      } catch (e) {}
+    }
     if (tag === 'input') {
       const ty = (el.getAttribute('type') || 'text').toLowerCase();
       if (ty === 'checkbox' || ty === 'radio') { if (el.checked) out.push(' checked'); }
@@ -2916,8 +3046,25 @@ _DELTA_OBSERVER_JS = r"""
         if (!pm) continue;
         for (const rem of r.removedNodes) {
           if (rem.nodeType !== 1) continue;
-          const m = window.__domMidMap.get(rem);
-          if (m) push(['r', m]);
+          let m = window.__domMidMap.get(rem);
+          if (!m && rem.getAttribute) {
+            const attr = rem.getAttribute(MID);
+            if (attr) {
+              const parsed = parseInt(attr, 10);
+              if (parsed) m = parsed;
+            }
+          }
+          if (m) {
+            push(['r', m]);
+          } else if (rem.querySelectorAll) {
+            try {
+              const children = rem.querySelectorAll('[' + MID + ']');
+              for (let i = 0; i < children.length; i++) {
+                const cm = parseInt(children[i].getAttribute(MID), 10);
+                if (cm) push(['r', cm]);
+              }
+            } catch (e) {}
+          }
         }
         for (const add of r.addedNodes) {
           let ref = r.nextSibling;
@@ -3089,7 +3236,13 @@ async def _install_interaction_trigger(page: Any, session: "DOMCaptureSession") 
                 full_reason = f"interaction:{reason}"
                 if target_desc:
                     full_reason = f"{full_reason}:{target_desc}"
-                asyncio.create_task(session.send_page(reason=full_reason))
+
+                async def _delayed_send():
+                    if is_redraw_only_host(getattr(session, "last_sent_url", "")):
+                        await asyncio.sleep(0.18)
+                    await session.send_page(reason=full_reason)
+
+                asyncio.create_task(_delayed_send())
             except Exception as exc:
                 logger.debug("interaction recapture dispatch failed: %s", exc)
 
@@ -3647,8 +3800,12 @@ class DOMCaptureSession:
             # Stop relaying patches until a later fast capture restores a
             # patch-capable generation; otherwise the client would receive
             # deltas it can never apply and loop through resyncs.
+            is_redraw = is_redraw_only_host(url)
             capture_delta_active = bool(
-                LIVE_DELTA and self._delta_installed and self._last_capture_supports_delta
+                LIVE_DELTA
+                and self._delta_installed
+                and self._last_capture_supports_delta
+                and not is_redraw
             )
 
             # Snapshot mode: skip byte-identical re-sends.  Hybrid delta
@@ -3877,6 +4034,8 @@ class DOMCaptureSession:
 
 __all__ = [
     "DOMCaptureSession",
+    "prefer_snapshot_for_url",
+    "is_redraw_only_host",
     "_inject_base_href",
     "_capture_with_single_file",
     "_capture_via_extension",

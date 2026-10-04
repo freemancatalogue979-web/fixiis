@@ -1769,8 +1769,8 @@ class SBHandle:
             "headless": bool(self.headless),
             "chromium_arg": ",".join(args),
             "window_size": "%d,%d" % (
-                int(self.viewport.get("width", 1280)),
-                int(self.viewport.get("height", 720)),
+                max(500, int(self.viewport.get("width", 1280))),
+                max(500, int(self.viewport.get("height", 720))),
             ),
         }
         if _should_disable_sandbox():

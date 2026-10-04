@@ -18,7 +18,7 @@ import logging
 
 # Import frame pools for independent per-session resources
 from frame_pool import FramePool, PacketPool, StreamingPipeline
-from dom_capture import DOMCaptureSession, LIVE_DELTA
+from dom_capture import DOMCaptureSession, LIVE_DELTA, is_redraw_only_host
 
 
 def _sb_backend_enabled() -> bool:
@@ -712,14 +712,17 @@ class NeoStreamingSession:
 
             self.page = await self.context.new_page()
             self.dom_capture = DOMCaptureSession(page=self.page, websocket=self.websocket, client_id=self.session_id)
-            if self.is_mobile:
+            if self.viewport and self.viewport.get('width') and self.viewport.get('height'):
                 try:
+                    vp_w = int(self.viewport['width'])
+                    vp_h = int(self.viewport['height'])
                     await self.page.set_viewport_size({
-                        'width': self.viewport.get('width', 1920),
-                        'height': self.viewport.get('height', 1080)
+                        'width': vp_w,
+                        'height': vp_h
                     })
+                    logger.info(f"[STARTUP] Applied exact device viewport: {vp_w}x{vp_h} (mobile={self.is_mobile})")
                 except Exception as e:
-                    logger.warning(f"[STARTUP] Mobile viewport resize failed: {e}")
+                    logger.warning(f"[STARTUP] Viewport resize failed: {e}")
 
             # Initialize pages dict with the first page
             page_id = self._generate_page_id(self.page)
@@ -1570,7 +1573,8 @@ class NeoStreamingSession:
         # doubles the work.  Keep the fallback below for trigger-install
         # failures; plain typing is separately handled by the delta observer.
         if (reason in ("click", "mouseup", "touchend", "tap")
-                and getattr(capture, "_interaction_trigger_installed", False)):
+                and getattr(capture, "_interaction_trigger_installed", False)
+                and not is_redraw_only_host(getattr(self, "last_target_url", ""))):
             logger.debug("[CAPTURE] %s recapture is owned by the page trigger — skipping duplicate", reason)
             return None
         # The new document's observer emits a navigation control batch even
@@ -2327,6 +2331,8 @@ class NeoStreamingSession:
                         await page.click(selector, timeout=1200)
                     except Exception:
                         pass
+                if is_redraw_only_host(getattr(self, 'last_target_url', '')):
+                    await asyncio.sleep(0.18)
                 await self.capture_remote_page(reason='click')
 
             elif event == 'wheel':
