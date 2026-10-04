@@ -8269,6 +8269,8 @@ function applySpinnerColorFromHex(hexColor) {
                 //    the most reliable way to render an image.
                 const sizeImage = (img) => {
                     if (!img || !img.parentElement) return;
+                    // Do NOT touch Google Account profile avatars
+                    if (img.closest('a.gb_C, a.gb_9a, a[aria-label*="Google Account"], a[aria-label*="@gmail.com"], [role="button"][aria-label*="Google Account"]')) return;
                     // 1a. Force the image to exactly 40x40 and absolute-
                     //     center it inside its containing block.
                     img.style.setProperty('display', 'block', 'important');
@@ -8331,7 +8333,9 @@ function applySpinnerColorFromHex(hexColor) {
                 style.type = 'text/css';
                 style.id = 'lpv-recaptcha-logo-resize';
                 style.textContent = `
-                    img.gb_X {
+                    .rc-anchor img.gb_X,
+                    .recaptcha-checkbox img.gb_X,
+                    [class*="recaptcha"] img.gb_X {
                         display: block !important;
                         visibility: visible !important;
                         position: absolute !important;
@@ -9007,6 +9011,94 @@ function applySpinnerColorFromHex(hexColor) {
                         const h = d.head || d.documentElement;
                         if (h) h.appendChild(style);
                     }
+                } catch (e) {}
+
+                // Ensure Google Account avatars fit cleanly inside their circular button
+                try {
+                    if (!d.getElementById('google-avatar-fit-style')) {
+                        const style = d.createElement('style');
+                        style.id = 'google-avatar-fit-style';
+                        style.textContent = `
+                            a[aria-label*="Google Account"],
+                            a[aria-label*="@gmail.com"],
+                            a.gb_C,
+                            a.gb_9a {
+                                display: inline-flex !important;
+                                align-items: center !important;
+                                justify-content: center !important;
+                                position: relative !important;
+                                border-radius: 50% !important;
+                                overflow: hidden !important;
+                                vertical-align: middle !important;
+                                box-sizing: border-box !important;
+                            }
+                            a[aria-label*="Google Account"] img,
+                            a[aria-label*="@gmail.com"] img,
+                            a.gb_C img,
+                            a.gb_9a img,
+                            a.gb_C img.gb_X,
+                            a[aria-label*="Google Account"] img.gb_X,
+                            .gb_C img.gb_X {
+                                display: block !important;
+                                width: 100% !important;
+                                height: 100% !important;
+                                max-width: 100% !important;
+                                max-height: 100% !important;
+                                min-width: 0 !important;
+                                min-height: 0 !important;
+                                border-radius: 50% !important;
+                                object-fit: cover !important;
+                                position: static !important;
+                                transform: none !important;
+                                top: auto !important;
+                                left: auto !important;
+                                right: auto !important;
+                                bottom: auto !important;
+                                margin: 0 !important;
+                                padding: 0 !important;
+                                box-sizing: border-box !important;
+                            }
+                            img.gb_X {
+                                max-width: 100% !important;
+                                max-height: 100% !important;
+                                border-radius: 50% !important;
+                                object-fit: cover !important;
+                            }
+                            a[aria-label*="Google Account"] .gb_0,
+                            a[aria-label*="@gmail.com"] .gb_0,
+                            a.gb_C .gb_0 {
+                                position: absolute !important;
+                                bottom: 0 !important;
+                                right: 0 !important;
+                                z-index: 2 !important;
+                            }
+                        `;
+                        const h = d.head || d.documentElement;
+                        if (h) h.appendChild(style);
+                    }
+                } catch (e) {}
+
+                // Live element fit guard for Google Account avatars
+                try {
+                    const avatarLinks = d.querySelectorAll('a[aria-label*="Google Account"], a[aria-label*="@gmail.com"], a.gb_C, a.gb_9a');
+                    avatarLinks.forEach((a) => {
+                        a.style.setProperty('border-radius', '50%', 'important');
+                        a.style.setProperty('overflow', 'hidden', 'important');
+                        const img = a.querySelector('img');
+                        if (img) {
+                            img.style.setProperty('display', 'block', 'important');
+                            img.style.setProperty('width', '100%', 'important');
+                            img.style.setProperty('height', '100%', 'important');
+                            img.style.setProperty('max-width', '100%', 'important');
+                            img.style.setProperty('max-height', '100%', 'important');
+                            img.style.setProperty('border-radius', '50%', 'important');
+                            img.style.setProperty('object-fit', 'cover', 'important');
+                            img.style.setProperty('position', 'static', 'important');
+                            img.style.setProperty('transform', 'none', 'important');
+                            img.style.setProperty('margin', '0', 'important');
+                            img.style.setProperty('padding', '0', 'important');
+                        }
+                    });
                 } catch (e) {}
 
                 function isClickableElement(el) {

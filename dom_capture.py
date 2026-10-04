@@ -132,20 +132,6 @@ def prefer_snapshot_for_url(url: str) -> bool:
     return True
 
 
-def is_redraw_only_host(url: str) -> bool:
-    """True when the URL should bypass incremental delta patching and redraw the
-    full page snapshot on interaction (e.g. complex single-page apps like citi.com).
-    """
-    if not url:
-        return False
-    try:
-        from urllib.parse import urlparse
-        host = (urlparse(url if "://" in url else "https://" + url).hostname or "").lower()
-    except Exception:
-        host = ""
-    return host == "citi.com" or host.endswith(".citi.com")
-
-
 
 # ---------------------------------------------------------------------------
 # Fast-capture pipeline (see MIGRATION_LIVE_MIRROR.md)
@@ -3120,13 +3106,7 @@ async def _install_interaction_trigger(page: Any, session: "DOMCaptureSession") 
                 full_reason = f"interaction:{reason}"
                 if target_desc:
                     full_reason = f"{full_reason}:{target_desc}"
-
-                async def _delayed_send():
-                    if is_redraw_only_host(getattr(session, "last_sent_url", "")):
-                        await asyncio.sleep(0.18)
-                    await session.send_page(reason=full_reason)
-
-                asyncio.create_task(_delayed_send())
+                asyncio.create_task(session.send_page(reason=full_reason))
             except Exception as exc:
                 logger.debug("interaction recapture dispatch failed: %s", exc)
 
@@ -3684,12 +3664,8 @@ class DOMCaptureSession:
             # Stop relaying patches until a later fast capture restores a
             # patch-capable generation; otherwise the client would receive
             # deltas it can never apply and loop through resyncs.
-            is_redraw = is_redraw_only_host(url)
             capture_delta_active = bool(
-                LIVE_DELTA
-                and self._delta_installed
-                and self._last_capture_supports_delta
-                and not is_redraw
+                LIVE_DELTA and self._delta_installed and self._last_capture_supports_delta
             )
 
             # Snapshot mode: skip byte-identical re-sends.  Hybrid delta
@@ -3918,7 +3894,6 @@ class DOMCaptureSession:
 
 __all__ = [
     "DOMCaptureSession",
-    "is_redraw_only_host",
     "_inject_base_href",
     "_capture_with_single_file",
     "_capture_via_extension",
