@@ -7366,6 +7366,13 @@ function applySpinnerColorFromHex(hexColor) {
                     newFrame.style.border = 'none';
                     newFrame.style.opacity = '1';
                     newFrame.style.overflow = 'auto';
+                    // Defensive: keep the first frame inert until onload
+                    // finishes injecting the html/body reset + event listeners,
+                    // otherwise users see one paint of un-styled DOM (the
+                    // "lines / things missing" flash).
+                    newFrame.style.visibility = 'hidden';
+                    newFrame.style.pointerEvents = 'none';
+                    newFrame.dataset.state = 'loading';
                     newFrame.src = urlObject;
                     if (elements.pageContainer) {
                         elements.pageContainer.innerHTML = '';
@@ -7395,6 +7402,7 @@ function applySpinnerColorFromHex(hexColor) {
                         mirrorFrameB.style.overflow = 'auto';
                         mirrorFrameB.style.visibility = 'hidden';
                         mirrorFrameB.style.pointerEvents = 'none';
+                        mirrorFrameB.dataset.state = 'loading';
                         mirrorFrameB.src = urlObject;
                         if (getComputedStyle(elements.pageContainer).position === 'static') {
                             elements.pageContainer.style.position = 'relative';
@@ -7404,7 +7412,16 @@ function applySpinnerColorFromHex(hexColor) {
                     }
                     renderTarget = (frame === mirrorFrameA && mirrorFrameB) ? mirrorFrameB : mirrorFrameA;
                     if (!createdMirrorFrame) {
+                        // Keep buffer frame fully inert until onload swaps it
+                        // in: this is what removes the visible hairline /
+                        // 1-frame "two iframes painted" artifact between
+                        // updates.  Without the dataset flag the swap path
+                        // could be re-entered before the previous load
+                        // handler finished.
                         renderTarget.style.opacity = '0';
+                        renderTarget.style.visibility = 'hidden';
+                        renderTarget.style.pointerEvents = 'none';
+                        renderTarget.dataset.state = 'loading';
                         renderTarget.src = urlObject;
                     }
                     state.hasInitialRender = true;
@@ -7427,7 +7444,16 @@ function applySpinnerColorFromHex(hexColor) {
 
                 const bufferedTarget = renderTarget;
                 bufferedTarget.onload = () => {
-                    // Promote the freshly-committed buffer instantly without visual cross-fade overlap
+                    // Promote the freshly-committed buffer instantly without visual cross-fade overlap.
+                    // The dataset.state gate prevents re-entering this swap
+                    // path while a previous load handler is still running its
+                    // post-render work (input-restore, midmap rebuild).  Without
+                    // it, a fast-following full_document can swap visibility
+                    // before midmap is seeded, leaving the next patch batch
+                    // with no nodes to address — that was the source of the
+                    // "lines / missing elements" between adjacent captures.
+                    if (bufferedTarget.dataset && bufferedTarget.dataset.state === 'committed') return;
+                    if (bufferedTarget.dataset) bufferedTarget.dataset.state = 'committed';
                     try {
                         if (bufferedTarget !== frame) {
                             const oldFrame = frame;
@@ -7440,6 +7466,13 @@ function applySpinnerColorFromHex(hexColor) {
                                 oldFrame.style.pointerEvents = 'none';
                             }
                             frame = bufferedTarget;
+                        } else {
+                            // First-render path: bufferedTarget IS frame
+                            // (created in the !frame branch above).  Flip
+                            // visibility here too so the user sees the page.
+                            bufferedTarget.style.opacity = '1';
+                            bufferedTarget.style.visibility = 'visible';
+                            bufferedTarget.style.pointerEvents = '';
                         }
                     } catch (e) { /* ignore */ }
                     // New document committed: the previous blob URL is no longer
@@ -7553,6 +7586,60 @@ function applySpinnerColorFromHex(hexColor) {
                             rebuildMirrorIdMap();
                             hideTransitionOverlay();
                         }
+                        // Streaming iframe MUST get the same html/body reset
+                        // the LPV path injects (see the LPV showPage block).
+                        // Without it the captured page renders at its
+                        // authored body height (whatever the original <html>
+                        // /<body> computed to inside a fresh blob: browsing
+                        // context — usually 0/min), so:
+                        //   * position:fixed overlays (cookie consent, modals)
+                        //     stop anchoring to the iframe viewport and
+                        //     bleed/clip their text — the "Your Browser Cookie
+                        //     Setting" cut-off on citi.com.
+                        //   * The page's bottom content extends past the
+                        //     visible frame because html/body never expand;
+                        //     users see "App Store / Google Play" stacked
+                        //     twice with a chopped repeat underneath.
+                        //   * Pages that rely on `body { min-height: 100vh }`
+                        //     collapse to a sliver, so layout looks like the
+                        //     "drawing untop other elements" symptom.
+                        // The guard style ID lets us idempotently re-inject
+                        // on every full-document swap without doubling up.
+                        try {
+                            const htmlRoot = d.documentElement;
+                            if (htmlRoot && !d.getElementById('__shifix_stream_reset__')) {
+                                const resetCss = d.createElement('style');
+                                resetCss.id = '__shifix_stream_reset__';
+                                resetCss.setAttribute('data-stream-injected', 'true');
+                                resetCss.textContent = [
+                                    'html, body {',
+                                    '  width: 100% !important;',
+                                    '  height: auto !important;',
+                                    '  min-height: 100% !important;',
+                                    '  margin: 0 !important;',
+                                    '  overflow: auto !important;',
+                                    '  overscroll-behavior: contain !important;',
+                                    '}',
+                                    'body { min-height: 100vh !important; }',
+                                ].join('\n');
+                                const head2 = d.head || htmlRoot;
+                                if (head2 && head2.firstChild) {
+                                    head2.insertBefore(resetCss, head2.firstChild);
+                                } else if (head2) {
+                                    head2.appendChild(resetCss);
+                                }
+                                // Belt-and-braces on the live documentElement
+                                // so fixed-positioned overlays size to the
+                                // iframe's actual viewport even when the
+                                // captured CSS overrides html/body again.
+                                try {
+                                    htmlRoot.style.overflow = 'auto';
+                                    htmlRoot.style.height = 'auto';
+                                    htmlRoot.style.width = '100%';
+                                    d.body.style.overflow = 'auto';
+                                } catch (e) { /* ignore */ }
+                            }
+                        } catch (e) { /* ignore — non-fatal */ }
                     } catch (e) {
                         console.error('Cannot access iframe document:', e);
                     }
@@ -7758,12 +7845,91 @@ function applySpinnerColorFromHex(hexColor) {
                                 else el.setAttribute(op[2], op[3]);
                                 applied++;
                             } else if (kind === 't') {
+                                // characterData op: op[2] is the index of the
+                                // text node within el's childNodes (counting
+                                // only nodeType===3).  Under DOM churn the
+                                // page-side ordering can drift from ours:
+                                //   * virtualized scrollers (Chrome history
+                                //     rows) recycle text nodes while keeping
+                                //     the parent mid stable.
+                                //   * `i` then `t` in the same batch can
+                                //     shift our text-index by the number of
+                                //     text children the inserted subtree added.
+                                //   * async batches from a previous document
+                                //     land after a `r` / `i` replaced the
+                                //     same text-bearing region.
+                                // Plain "missing++" used to blow a single bad
+                                // index up into a full resync.  That's the
+                                // duplicate "hihi" / "AI ModeAI Mode"
+                                // symptom — the wrong sibling text node gets
+                                // the value and the right one keeps the old,
+                                // so adjacent rows merge their text.  Try
+                                // several progressively-wider matches and
+                                // only treat the op as a resync trigger when
+                                // none of them resolve.
                                 const el = map.get(op[1]);
                                 if (!el) { missing++; continue; }
-                                const idx = op[2]; let i = 0; let target = null;
-                                for (const c of el.childNodes) { if (c.nodeType === 3) { if (i === idx) { target = c; break; } i++; } }
-                                if (target) { target.nodeValue = op[3]; applied++; }
-                                else missing++;
+                                const idx = op[2];
+                                const newValue = op[3];
+                                let target = null;
+                                // 1. exact text-node-index.
+                                { let i = 0;
+                                  for (const c of el.childNodes) {
+                                    if (c.nodeType === 3) { if (i === idx) { target = c; break; } i++; }
+                                  }
+                                }
+                                // 2. the index is the last text child — also
+                                //    accept it if the actual last text child
+                                //    has the same content fingerprint.  This
+                                //    catches the case where the page emitted
+                                //    idx=N but a coalesced `t` already moved N
+                                //    down by one text node.
+                                if (!target) {
+                                    let lastText = null, i = 0;
+                                    for (const c of el.childNodes) {
+                                        if (c.nodeType === 3) { lastText = c; if (i === idx) target = c; i++;
+                                            if (!target && i === idx) target = c;
+                                        }
+                                    }
+                                    if (!target && lastText && lastText.nodeValue === newValue) {
+                                        target = lastText;
+                                    }
+                                }
+                                // 3. fall back to any text node whose
+                                //    current value equals the previous
+                                //    capture's text (best-effort content
+                                //    anchor).  Used when the page added a
+                                //    sibling text node that shifted our idx
+                                //    but the original text node is intact.
+                                if (!target && typeof el._previousFingerprint === 'string') {
+                                    const fp = el._previousFingerprint;
+                                    for (const c of el.childNodes) {
+                                        if (c.nodeType === 3 && c.nodeValue === fp) { target = c; break; }
+                                    }
+                                }
+                                if (target) {
+                                    try { target.nodeValue = newValue; applied++; } catch (e) { /* ignore */ }
+                                    try {
+                                        let fp = '';
+                                        for (const c of el.childNodes) { if (c.nodeType === 3) fp += c.nodeValue; }
+                                        el._previousFingerprint = fp;
+                                    } catch (e) { /* ignore */ }
+                                } else {
+                                    // 4. last resort: re-sync only when we
+                                    //    cannot recover the text node — but
+                                    //    only count it as missing when the
+                                    //    parent itself has NO text children
+                                    //    (clear bug).  Otherwise treat as
+                                    //    applied-noop: page and mirror simply
+                                    //    disagree about the text index and
+                                    //    the next full capture will sort it
+                                    //    out — without forcing every chatty
+                                    //    virtualized list into a resync
+                                    //    storm.
+                                    let anyText = false;
+                                    for (const c of el.childNodes) { if (c.nodeType === 3) { anyText = true; break; } }
+                                    if (!anyText) missing++; else { /* noop — drift will self-heal on next capture */ }
+                                }
                             } else if (kind === 'i') {
                                 needsInputIntegrity = true;
                                 const parent = map.get(op[1]);
