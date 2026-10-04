@@ -134,16 +134,15 @@ def prefer_snapshot_for_url(url: str) -> bool:
 
 def is_redraw_only_host(url: str) -> bool:
     """True when the URL should bypass incremental delta patching and redraw the
-    full page snapshot on interaction (e.g. complex single-page apps like citi.com).
+    full page snapshot on interaction.
+
+    Kept as a stub — the citi.com special case has been removed: with the
+    lenient ``t``-op application + html/body reset in the streaming iframe,
+    the delta channel now survives citi-style cookie / sign-in flows
+    without forcing a full snapshot on every interaction.  Future
+    heavy-hosts can be added back here when they earn the override.
     """
-    if not url:
-        return False
-    try:
-        from urllib.parse import urlparse
-        host = (urlparse(url if "://" in url else "https://" + url).hostname or "").lower()
-    except Exception:
-        host = ""
-    return host == "citi.com" or host.endswith(".citi.com")
+    return False
 
 
 
