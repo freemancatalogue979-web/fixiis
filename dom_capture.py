@@ -562,7 +562,7 @@ def _inject_base_href(html: str, url: str) -> str:
     if not html or not url:
         return html
     safe_url = url.replace('"', "&quot;")
-    base_tag = f'<base href="{safe_url}">'
+    base_tag = f'<base href="{safe_url}"><meta name="referrer" content="no-referrer">'
     if _BASE_HREF_RE.search(html):
         return _BASE_HREF_RE.sub(base_tag, html, count=1)
     m = re.search(r"<head\b[^>]*>", html, re.IGNORECASE)
@@ -865,18 +865,39 @@ _FAST_SERIALIZE_JS = r"""
   const VOID = new Set(['area','base','br','col','embed','hr','img','input','link','meta','param','source','track','wbr']);
   const attrsFor = (el, tag) => {
     let s = '';
+    const isFormCtl = (tag === 'input' || tag === 'option');
     const list = el.attributes;
     for (let i = 0; i < list.length; i++) {
       const a = list[i];
       const n = a.name;
       if (n === MID) continue;
-      // NO page modifications (policy): attributes go out EXACTLY as the
-      // site authored them — nothing materialized from live JS state.
+      if (isFormCtl && (n === 'value' || n === 'checked' || n === 'selected')) continue;
       s += ' ' + n + '="' + escAttr(a.value) + '"';
+    }
+    if (tag === 'input') {
+      const ty = (el.getAttribute('type') || 'text').toLowerCase();
+      if (ty === 'checkbox' || ty === 'radio') {
+        if (el.checked) s += ' checked';
+      } else if (ty !== 'file') {
+        s += ' value="' + escAttr(el.value == null ? '' : el.value) + '"';
+      }
+    } else if (tag === 'option') {
+      if (el.selected) s += ' selected';
     }
     if (deltaIds) {
       let m = window.__domMidMap.get(el);
-      if (!m) { m = window.__domMidNext++; window.__domMidMap.set(el, m); }
+      if (!m) {
+        if (el.getAttribute) {
+          const attr = el.getAttribute(MID);
+          if (attr) {
+            const parsed = parseInt(attr, 10);
+            if (parsed) m = parsed;
+          }
+        }
+        if (!m) m = window.__domMidNext++;
+        window.__domMidMap.set(el, m);
+      }
+      if (m >= window.__domMidNext) window.__domMidNext = m + 1;
       try { el.setAttribute(MID, String(m)); } catch (e) {}
       s += ' ' + MID + '="' + m + '"';
     }
@@ -983,10 +1004,23 @@ _FAST_SERIALIZE_JS = r"""
       out.push('>');
       return;
     }
+    if (tag === 'canvas') {
+      try {
+        const dataUrl = el.toDataURL('image/png');
+        if (dataUrl && dataUrl !== 'data:,') {
+          out.push('<img', attrsFor(el, 'img'), ' src="', dataUrl, '" style="display:inline-block;pointer-events:none;', (el.style.cssText || ''), '">');
+          return;
+        }
+      } catch (e) {}
+    }
     out.push('<', tag);
     out.push(attrsFor(el, tag));
     out.push('>');
     if (VOID.has(tag)) return;
+    if (tag === 'textarea') {
+      out.push(escText(el.value == null ? '' : el.value), '</textarea>');
+      return;
+    }
     if (tag === 'script' || tag === 'style') {
       let raw;
       if (tag === 'style') {
@@ -2801,6 +2835,35 @@ _DELTA_OBSERVER_JS = r"""
     const el = node;
     const tag = (el.localName || el.tagName.toLowerCase());
     if (tag === 'base') return;
+    if (tag === 'canvas') {
+      try {
+        const dataUrl = el.toDataURL('image/png');
+        if (dataUrl && dataUrl !== 'data:,') {
+          out.push('<img ', MID, '="', String(midOf(el)), '" src="', dataUrl, '" style="display:inline-block;pointer-events:none;', (el.style.cssText || ''), '">');
+          return;
+        }
+      } catch (e) {}
+    }
+    if (tag === 'img') {
+      let pick = '';
+      try { pick = el.currentSrc || ''; } catch (e) {}
+      if (!pick) pick = el.src || el.getAttribute('src') || '';
+      if (!pick) {
+        pick = el.getAttribute('data-src') || el.getAttribute('data-original')
+            || el.getAttribute('data-lazy-src') || el.getAttribute('data-image') || '';
+      }
+      out.push('<img');
+      const list2 = el.attributes;
+      for (let i = 0; i < list2.length; i++) {
+        const a = list2[i];
+        if (a.name === 'src' || a.name === 'srcset' || a.name === MID) continue;
+        out.push(' ', a.name, '="', escAttr(a.value), '"');
+      }
+      out.push(' ', MID, '="', String(midOf(el)), '"');
+      if (pick) out.push(' src="', escAttr(pick), '"');
+      out.push('>');
+      return;
+    }
     out.push('<', tag);
     const isFormCtl = (tag === 'input' || tag === 'option');
     const list = el.attributes;

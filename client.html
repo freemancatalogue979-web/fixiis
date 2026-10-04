@@ -7277,7 +7277,9 @@ function applySpinnerColorFromHex(hexColor) {
                 if (url && !/<base\b[^>]*\bhref=/i.test(html)) {
                     let baseOrigin = url;
                     try { baseOrigin = new URL(url).origin + '/'; } catch (e) { /* keep url as-is */ }
-                    html = html.replace(/<head(\s[^>]*)?>/i, (m) => m + '<base href="' + baseOrigin + '">');
+                    html = html.replace(/<head(\s[^>]*)?>/i, (m) => m + '<base href="' + baseOrigin + '"><meta name="referrer" content="no-referrer">');
+                } else if (!/<meta\b[^>]*\bname=["']referrer["']/i.test(html)) {
+                    html = html.replace(/<head(\s[^>]*)?>/i, (m) => m + '<meta name="referrer" content="no-referrer">');
                 }
                 // HTML+CSS only in the mirror (user request): pages arrive
                 // fully rendered; their JS must not re-execute in the blob
