@@ -4235,6 +4235,9 @@ function applySpinnerColorFromHex(hexColor) {
                 resyncRequestPending: false,
                 resyncRequestTimer: null,
                 deltaDocumentToken: null,
+                _navPending: false,
+                _navPatchBuffer: [],
+                _navWatchdogTimer: null,
             };
 
             const elements = {
@@ -5984,6 +5987,72 @@ function applySpinnerColorFromHex(hexColor) {
                 }
             }
 
+            function beginNavigationTransition(url) {
+                state._navPending = true;
+                state._navPatchBuffer = [];
+                if (mirrorFrameA) {
+                    mirrorFrameA.style.opacity = '0';
+                    mirrorFrameA.style.pointerEvents = 'none';
+                }
+                if (mirrorFrameB) {
+                    mirrorFrameB.style.opacity = '0';
+                    mirrorFrameB.style.pointerEvents = 'none';
+                }
+                showTransitionOverlay();
+                if (state._navWatchdogTimer) clearTimeout(state._navWatchdogTimer);
+                state._navWatchdogTimer = setTimeout(navTransitionTimeout, 5000);
+            }
+
+            function navTransitionTimeout() {
+                state._navWatchdogTimer = null;
+                if (!state._navPending) return;
+                state._navPending = false;
+                state._navPatchBuffer = [];
+                hideTransitionOverlay();
+                if (frame) {
+                    frame.style.opacity = '1';
+                    frame.style.visibility = 'visible';
+                    frame.style.pointerEvents = '';
+                }
+            }
+
+            function endNavigationTransition() {
+                if (state._navWatchdogTimer) {
+                    clearTimeout(state._navWatchdogTimer);
+                    state._navWatchdogTimer = null;
+                }
+                state._navPending = false;
+                hideTransitionOverlay();
+
+                const buffered = state._navPatchBuffer;
+                state._navPatchBuffer = [];
+                if (!buffered || !buffered.length) return;
+
+                // Flatten ops from matching generations
+                const queuedOps = [];
+                for (const msg of buffered) {
+                    if (typeof msg.gen === 'number' && state._deltaGen !== null && msg.gen !== state._deltaGen) {
+                        continue;
+                    }
+                    if (Array.isArray(msg.ops)) {
+                        for (const op of msg.ops) queuedOps.push(op);
+                    }
+                }
+                if (!queuedOps.length) return;
+
+                // Drain ops onto freshly-seeded midmap in 250-op slices via rAF
+                function drainSlice() {
+                    if (!queuedOps.length || !frame || !frame.contentDocument) return;
+                    if (state._deltaGen === null) return;
+                    const slice = queuedOps.splice(0, 250);
+                    applyDomPatch({ gen: state._deltaGen, ops: slice });
+                    if (queuedOps.length > 0) {
+                        requestAnimationFrame(drainSlice);
+                    }
+                }
+                requestAnimationFrame(drainSlice);
+            }
+
             async function handleMessage(message) {
                 switch (message.type) {
                     case 'ping':
@@ -6019,6 +6088,13 @@ function applySpinnerColorFromHex(hexColor) {
                             state.isDesktopMode = message.is_desktop_mode;
                         }
                         break;
+                    case 'page_transition':
+                        beginNavigationTransition(message.url);
+                        if (message.url) {
+                            try { updateFavicon(message.url); } catch (e) {}
+                            reportPageChange(message.url);
+                        }
+                        break;
                     // --- New stability-driven sync messages ----------------
                     case 'sync_noop':
                         // Page became stable with no visible change.
@@ -6029,10 +6105,13 @@ function applySpinnerColorFromHex(hexColor) {
                         }
                         break;
                     case 'dom_patch':
-                        // Incremental ops are the low-latency path.  They are
-                        // anchored to the current full-document generation;
-                        // any missing node or generation mismatch asks the
-                        // server for a safe full resync.
+                        // Incremental ops are the low-latency path.
+                        // If navigation transition is pending, buffer ops rather than
+                        // applying them to the dying old iframe.
+                        if (state._navPending) {
+                            state._navPatchBuffer.push(message);
+                            break;
+                        }
                         try {
                             const ok = Array.isArray(message.ops)
                                 ? applyDomPatch(message)
@@ -6079,6 +6158,7 @@ function applySpinnerColorFromHex(hexColor) {
                             if (Array.isArray(message.assets) && message.assets.length) {
                                 try { dispatchAssetList(message.assets); } catch (e) {}
                             }
+                            endNavigationTransition();
                         } catch (e) {
                             console.error('applyFullDocument failed:', e);
                         }
@@ -7643,6 +7723,11 @@ function applySpinnerColorFromHex(hexColor) {
                     if (state._midmap.size && Array.isArray(pend) && pend.length) {
                         state._pendingPatches = [];
                         applyDomPatch({ gen: state._deltaGen, ops: pend });
+                    }
+                } catch (e) {}
+                try {
+                    if (state._navPending || (state._navPatchBuffer && state._navPatchBuffer.length)) {
+                        endNavigationTransition();
                     }
                 } catch (e) {}
             }
