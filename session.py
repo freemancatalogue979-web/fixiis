@@ -2353,6 +2353,14 @@ class NeoStreamingSession:
                 await page.mouse.move(x, y)
                 await page.mouse.wheel(int(round(delta_x)), int(round(delta_y)))
 
+            elif event == 'scroll_sync':
+                scroll_x = int(input_data.get('scrollX', 0))
+                scroll_y = int(input_data.get('scrollY', 0))
+                try:
+                    await page.evaluate(f"window.scrollTo({scroll_x}, {scroll_y});")
+                except Exception:
+                    pass
+
             elif event == 'text':
                 text = input_data.get('text', '')
                 if text:

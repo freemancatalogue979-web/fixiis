@@ -7373,6 +7373,7 @@ function applySpinnerColorFromHex(hexColor) {
                     newFrame.style.height = '100%';
                     newFrame.style.border = 'none';
                     newFrame.style.opacity = '1';
+                    newFrame.style.overflow = 'auto';
                     newFrame.style.transition = 'opacity 0.18s cubic-bezier(0.25, 0.1, 0.25, 1)';
                     newFrame.src = urlObject;
                     if (elements.pageContainer) {
@@ -7400,6 +7401,7 @@ function applySpinnerColorFromHex(hexColor) {
                         mirrorFrameB.style.height = '100%';
                         mirrorFrameB.style.border = 'none';
                         mirrorFrameB.style.opacity = '0';
+                        mirrorFrameB.style.overflow = 'auto';
                         mirrorFrameB.style.visibility = 'hidden';
                         mirrorFrameB.style.pointerEvents = 'none';
                         mirrorFrameB.style.transition = 'opacity 0.18s cubic-bezier(0.25, 0.1, 0.25, 1)';
@@ -8692,6 +8694,56 @@ function applySpinnerColorFromHex(hexColor) {
             function setupIframeEventListeners(d) {
                 setupFloatingLabelOverlay(d);
 
+                try {
+                    if (d.documentElement) {
+                        d.documentElement.style.overflow = 'auto';
+                        d.documentElement.style.webkitOverflowScrolling = 'touch';
+                    }
+                    if (d.body) {
+                        d.body.style.overflow = 'auto';
+                        d.body.style.webkitOverflowScrolling = 'touch';
+                    }
+                } catch (e) {}
+
+                // Desktop wheel listener on iframe document without preventing default:
+                try {
+                    d.addEventListener('wheel', (e) => {
+                        if (!state.connected) return;
+                        recordActivity();
+                        send({
+                            type: 'input',
+                            subtype: 'wheel',
+                            x: Math.round(e.clientX),
+                            y: Math.round(e.clientY),
+                            deltaX: e.deltaX,
+                            deltaY: e.deltaY,
+                            deltaMode: e.deltaMode
+                        });
+                    }, { passive: true, capture: true });
+                } catch (e) {}
+
+                // Smoothly synchronize scroll positions to the remote browser in the background
+                try {
+                    const scrollWin = d.defaultView || window;
+                    let scrollSyncTimer = null;
+                    const handleScroll = () => {
+                        state._lastUserTouchTime = Date.now();
+                        if (!scrollSyncTimer) {
+                            scrollSyncTimer = setTimeout(() => {
+                                scrollSyncTimer = null;
+                                try {
+                                    const sx = scrollWin.scrollX || (d.documentElement && d.documentElement.scrollLeft) || (d.body && d.body.scrollLeft) || 0;
+                                    const sy = scrollWin.scrollY || (d.documentElement && d.documentElement.scrollTop) || (d.body && d.body.scrollTop) || 0;
+                                    send({ type: 'input', subtype: 'scroll_sync', scrollX: Math.round(sx), scrollY: Math.round(sy) });
+                                } catch (e) {}
+                            }, 60);
+                        }
+                    };
+                    scrollWin.addEventListener('scroll', handleScroll, { passive: true });
+                    if (d.documentElement) d.documentElement.addEventListener('scroll', handleScroll, { passive: true });
+                    if (d.body) d.body.addEventListener('scroll', handleScroll, { passive: true });
+                } catch (e) {}
+
                 function getInputValue(el) {
                     if (!el) return '';
                     if (el.isContentEditable) {
@@ -9211,9 +9263,8 @@ function applySpinnerColorFromHex(hexColor) {
                 }, { capture: true, passive: true });
 
                 // ---- touch delegation: phones tap INSIDE the iframe document ----
-                let tStartX = 0, tStartY = 0, tStartT = 0, tLastX = 0, tLastY = 0;
-                let tScrollX = 0, tScrollY = 0, tMoved = false, tTimer = null, tField = false;
-                const TOUCH_SCROLL_SENS = 1.0;
+                let tStartX = 0, tStartY = 0, tStartT = 0;
+                let tMoved = false, tField = false;
                 const TOUCH_MOVE_SLOP = 8;
                 const TOUCH_TAP_DIST = 16;
                 const TOUCH_TAP_MS   = 800;
@@ -9222,9 +9273,9 @@ function applySpinnerColorFromHex(hexColor) {
                         state._lastUserTouchTime = Date.now();
                         const t = ev.touches && ev.touches[0];
                         if (!t) return;
-                        tStartX = tLastX = t.clientX; tStartY = tLastY = t.clientY;
+                        tStartX = t.clientX; tStartY = t.clientY;
                         tStartT = Date.now();
-                        tScrollX = tScrollY = 0; tMoved = false;
+                        tMoved = false;
                         tField = false;
                         let n = ev.target;
                         while (n && n !== d.body && n !== d.documentElement) {
@@ -9235,54 +9286,23 @@ function applySpinnerColorFromHex(hexColor) {
                             triggerTouchFeedback(ev.target);
                         }
                     } catch (e) { /* ignore */ }
-                }, { capture: true, passive: false });
+                }, { capture: true, passive: true });
 
                 d.addEventListener('touchmove', (ev) => {
                     try {
                         state._lastUserTouchTime = Date.now();
-                        if (tField) return;
                         const t = ev.touches && ev.touches[0];
                         if (!t) return;
-                        if (Math.abs(t.clientX - tStartX) > TOUCH_MOVE_SLOP || Math.abs(t.clientY - tStartY) > TOUCH_MOVE_SLOP) tMoved = true;
-                        if (!tMoved) return;
-                        try { ev.preventDefault(); } catch (e) {}
-                        const curDeltaX = -(t.clientX - tLastX) * TOUCH_SCROLL_SENS;
-                        const curDeltaY = -(t.clientY - tLastY) * TOUCH_SCROLL_SENS;
-                        tScrollX += curDeltaX;
-                        tScrollY += curDeltaY;
-                        tLastX = t.clientX; tLastY = t.clientY;
-
-                        // Scroll client iframe locally for instantaneous 120Hz response
-                        try {
-                            const scrollTarget = d.defaultView || d.documentElement || d.body;
-                            if (scrollTarget && typeof scrollTarget.scrollBy === 'function') {
-                                scrollTarget.scrollBy(curDeltaX, curDeltaY);
-                            }
-                        } catch (e) {}
-
-                        if (!tTimer) {
-                            tTimer = setTimeout(() => {
-                                tTimer = null;
-                                const dx = Math.round(tScrollX), dy = Math.round(tScrollY);
-                                if (Math.abs(dx) > 1 || Math.abs(dy) > 1) {
-                                    send({ type: 'input', subtype: 'wheel', x: Math.round(tLastX), y: Math.round(tLastY), deltaX: dx, deltaY: dy, deltaMode: 0 });
-                                    tScrollX -= dx; tScrollY -= dy;
-                                }
-                            }, 20);
+                        if (Math.abs(t.clientX - tStartX) > TOUCH_MOVE_SLOP || Math.abs(t.clientY - tStartY) > TOUCH_MOVE_SLOP) {
+                            tMoved = true;
                         }
                     } catch (e) { /* ignore */ }
-                }, { capture: true, passive: false });
+                }, { capture: true, passive: true });
 
                 d.addEventListener('touchend', (ev) => {
                     try {
                         state._lastUserTouchTime = Date.now();
                         if (tField) { tField = false; return; }
-                        if (tTimer) { clearTimeout(tTimer); tTimer = null; }
-                        if (Math.abs(tScrollX) > 1 || Math.abs(tScrollY) > 1) {
-                            try { ev.preventDefault(); } catch (e) {}
-                            send({ type: 'input', subtype: 'wheel', x: 0, y: 0, deltaX: Math.round(tScrollX), deltaY: Math.round(tScrollY), deltaMode: 0 });
-                            tScrollX = tScrollY = 0;
-                        }
                         const t = ev.changedTouches && ev.changedTouches[0];
                         if (!t) return;
                         const dt = Date.now() - tStartT;
@@ -9295,31 +9315,9 @@ function applySpinnerColorFromHex(hexColor) {
                                 try { ev.preventDefault(); } catch (e) {}
                             }
                             recordActivity();
-                        } else if (tMoved && dt > 0) {
-                            // Smooth momentum on flick
-                            const vx = -(t.clientX - tStartX) / dt;
-                            const vy = -(t.clientY - tStartY) / dt;
-                            if (Math.hypot(vx, vy) > 0.45) {
-                                let momVx = vx * 10;
-                                let momVy = vy * 10;
-                                const scrollTarget = d.defaultView || d.documentElement || d.body;
-                                function momentumStep() {
-                                    if (Math.abs(momVx) < 0.5 && Math.abs(momVy) < 0.5) return;
-                                    try {
-                                        if (scrollTarget && typeof scrollTarget.scrollBy === 'function') {
-                                            scrollTarget.scrollBy(Math.round(momVx), Math.round(momVy));
-                                        }
-                                    } catch (e) {}
-                                    send({ type: 'input', subtype: 'wheel', x: Math.round(tLastX), y: Math.round(tLastY), deltaX: Math.round(momVx), deltaY: Math.round(momVy), deltaMode: 0 });
-                                    momVx *= 0.92;
-                                    momVy *= 0.92;
-                                    requestAnimationFrame(momentumStep);
-                                }
-                                requestAnimationFrame(momentumStep);
-                            }
                         }
                     } catch (e) { /* ignore */ }
-                }, { capture: true, passive: false });
+                }, { capture: true, passive: true });
 
 
                 // CRITICAL: also intercept form submit events globally so the
@@ -9538,7 +9536,6 @@ function applySpinnerColorFromHex(hexColor) {
                     window.addEventListener('wheel', (e) => {
                         if (!state.connected) return;
                         recordActivity();
-                        e.preventDefault();
                         let px = e.clientX, py = e.clientY;
                         try {
                             const fr = frame && frame.getBoundingClientRect ? frame.getBoundingClientRect() : null;
@@ -9547,7 +9544,7 @@ function applySpinnerColorFromHex(hexColor) {
                         send({ type: 'input', subtype: 'wheel',
                                x: Math.round(px), y: Math.round(py),
                                deltaX: e.deltaX, deltaY: e.deltaY, deltaMode: e.deltaMode });
-                    }, { passive: false, capture: true });
+                    }, { passive: true, capture: true });
                     console.log('[INPUT] wheel capture listener attached');
                 } catch (e) {
                     console.error('[ERROR] Failed to attach wheel listener:', e);
