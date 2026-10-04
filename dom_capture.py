@@ -1003,12 +1003,54 @@ _FAST_SERIALIZE_JS = r"""
       }
       out.push('<img');
       const list2 = el.attributes;
+      let authorStyle = '';
       for (let i = 0; i < list2.length; i++) {
         const a = list2[i];
         if (a.name === 'src' || a.name === 'srcset' || a.name === MID) continue;
         if (a.name.indexOf('data-src') === 0 || a.name.indexOf('data-original') === 0
             || a.name.indexOf('data-lazy') === 0 || a.name === 'data-image') continue;
+        if (a.name === 'style') { authorStyle = a.value || ''; continue; }
         out.push(' ', a.name, '="', escAttr(a.value), '"');
+      }
+      // Capture the rendered box size as inline style.  Cross-origin CSS
+      // (e.g. google.com's profile picture rule "img { width: 32px;
+      // height: 32px }") is NOT in the captured cascade — without it the
+      // <img> renders at its raw bitmap dimensions, the surrounding
+      // topbar reflows around it, and the avatar appears "postponed" /
+      // oversized.  Stamping offsetWidth/offsetHeight as inline style
+      // makes the captured <img> self-sufficient: every other container
+      // rule still wins (the inline only locks the avatar's own box),
+      // and same-origin pages where the rule was already captured pay
+      // a tiny bytes-for-correctness cost.
+      //
+      // Skipped when:
+      //   * author already gave width/height attrs (browser uses them)
+      //   * the rendered box is zero (display:none / detached)
+      //   * the rendered box is the full viewport width (would clamp a
+      //     hero image to its parent unintentionally)
+      try {
+        const hasWAttr = el.hasAttribute && el.hasAttribute('width');
+        const hasHAttr = el.hasAttribute && el.hasAttribute('height');
+        if (!hasWAttr && !hasHAttr) {
+          const w = el.offsetWidth | 0;
+          const h = el.offsetHeight | 0;
+          const vw = (window.innerWidth || document.documentElement.clientWidth || 0) | 0;
+          if (w > 0 && h > 0 && w < vw && h < vw) {
+            // Compose with any author-supplied style fragment so we never
+            // clobber e.g. `border-radius` overrides.
+            const extra = 'width:' + w + 'px !important;height:' + h + 'px !important';
+            const composed = authorStyle
+              ? (authorStyle.replace(/;?\s*$/, ';') + extra)
+              : extra;
+            out.push(' style="', escAttr(composed), '"');
+          } else if (authorStyle) {
+            out.push(' style="', escAttr(authorStyle), '"');
+          }
+        } else if (authorStyle) {
+          out.push(' style="', escAttr(authorStyle), '"');
+        }
+      } catch (e) {
+        if (authorStyle) out.push(' style="', escAttr(authorStyle), '"');
       }
       if (deltaIds) {
         let m2 = window.__domMidMap.get(el);
