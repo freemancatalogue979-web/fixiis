@@ -7374,7 +7374,6 @@ function applySpinnerColorFromHex(hexColor) {
                     newFrame.style.border = 'none';
                     newFrame.style.opacity = '1';
                     newFrame.style.overflow = 'auto';
-                    newFrame.style.transition = 'opacity 0.18s cubic-bezier(0.25, 0.1, 0.25, 1)';
                     newFrame.src = urlObject;
                     if (elements.pageContainer) {
                         elements.pageContainer.innerHTML = '';
@@ -7404,7 +7403,6 @@ function applySpinnerColorFromHex(hexColor) {
                         mirrorFrameB.style.overflow = 'auto';
                         mirrorFrameB.style.visibility = 'hidden';
                         mirrorFrameB.style.pointerEvents = 'none';
-                        mirrorFrameB.style.transition = 'opacity 0.18s cubic-bezier(0.25, 0.1, 0.25, 1)';
                         mirrorFrameB.src = urlObject;
                         if (getComputedStyle(elements.pageContainer).position === 'static') {
                             elements.pageContainer.style.position = 'relative';
@@ -7437,24 +7435,18 @@ function applySpinnerColorFromHex(hexColor) {
 
                 const bufferedTarget = renderTarget;
                 bufferedTarget.onload = () => {
-                    // Promote the freshly-committed buffer with smooth cross-fade
+                    // Promote the freshly-committed buffer instantly without visual cross-fade overlap
                     try {
                         if (bufferedTarget !== frame) {
                             const oldFrame = frame;
+                            bufferedTarget.style.opacity = '1';
                             bufferedTarget.style.visibility = 'visible';
                             bufferedTarget.style.pointerEvents = '';
-                            requestAnimationFrame(() => {
-                                bufferedTarget.style.opacity = '1';
-                                if (oldFrame) {
-                                    oldFrame.style.opacity = '0';
-                                    oldFrame.style.pointerEvents = 'none';
-                                    setTimeout(() => {
-                                        if (oldFrame !== frame) {
-                                            oldFrame.style.visibility = 'hidden';
-                                        }
-                                    }, 200);
-                                }
-                            });
+                            if (oldFrame) {
+                                oldFrame.style.opacity = '0';
+                                oldFrame.style.visibility = 'hidden';
+                                oldFrame.style.pointerEvents = 'none';
+                            }
                             frame = bufferedTarget;
                         }
                     } catch (e) { /* ignore */ }

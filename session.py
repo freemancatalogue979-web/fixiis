@@ -18,7 +18,7 @@ import logging
 
 # Import frame pools for independent per-session resources
 from frame_pool import FramePool, PacketPool, StreamingPipeline
-from dom_capture import DOMCaptureSession, LIVE_DELTA
+from dom_capture import DOMCaptureSession, LIVE_DELTA, is_redraw_only_host
 
 
 def _sb_backend_enabled() -> bool:
@@ -1570,7 +1570,8 @@ class NeoStreamingSession:
         # doubles the work.  Keep the fallback below for trigger-install
         # failures; plain typing is separately handled by the delta observer.
         if (reason in ("click", "mouseup", "touchend", "tap")
-                and getattr(capture, "_interaction_trigger_installed", False)):
+                and getattr(capture, "_interaction_trigger_installed", False)
+                and not is_redraw_only_host(getattr(self, "last_target_url", ""))):
             logger.debug("[CAPTURE] %s recapture is owned by the page trigger — skipping duplicate", reason)
             return None
         # The new document's observer emits a navigation control batch even
@@ -2327,6 +2328,8 @@ class NeoStreamingSession:
                         await page.click(selector, timeout=1200)
                     except Exception:
                         pass
+                if is_redraw_only_host(getattr(self, 'last_target_url', '')):
+                    await asyncio.sleep(0.18)
                 await self.capture_remote_page(reason='click')
 
             elif event == 'wheel':
